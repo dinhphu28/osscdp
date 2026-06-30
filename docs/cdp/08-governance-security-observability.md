@@ -291,6 +291,23 @@ Export
 Mark as resolved
 ```
 
+## Implementation notes (Phase 9b — access governance)
+
+- **RBAC** — admin callers are role-bearing admin tokens (`admin_token` table, SHA-256 hash lookup).
+  The static `ADMIN_API_TOKEN` authenticates as `SUPER_ADMIN` (bootstrap to mint the first tokens).
+  `internal/rbac` defines the 6 roles, a permission set per role, and `Has(role, perm)`.
+- **Authorization** — `auth.Authenticate` resolves a `Principal{role, tenant_id}` into context;
+  `auth.Require(perm)` gates each route on the permission and, for `{tenantID}` routes, enforces that a
+  non-super principal matches that tenant (`403` otherwise). `POST /admin/v1/tenants` is super-admin only.
+- **Admin tokens** — `POST /admin/v1/admin-tokens` (perm `admin:write`): SUPER_ADMIN mints any
+  role/tenant; TENANT_ADMIN mints only non-super roles scoped to its own tenant. Plaintext returned once;
+  audited.
+- **PII masking** — profile/export responses mask `traits.email/phone/name` (`u***@x.com`,
+  `+8490****567`) unless the principal holds `pii:read` (SUPER_ADMIN/TENANT_ADMIN). Stored data is
+  untouched.
+- **Deferred:** user accounts / SSO / JWT, token expiry/rotation, per-field PII policy, raw-event
+  payload masking, row-level DB security.
+
 ## Implementation notes (Phase 9a — data governance)
 
 Phase 9 is split: **9a (data governance)** is implemented; **9b (access governance: RBAC + field-level

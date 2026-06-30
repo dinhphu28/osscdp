@@ -30,6 +30,9 @@ func BadRequest(w http.ResponseWriter, message string) {
 func Unauthorized(w http.ResponseWriter, message string) {
 	Write(w, http.StatusUnauthorized, "unauthorized", message)
 }
+func Forbidden(w http.ResponseWriter, message string) {
+	Write(w, http.StatusForbidden, "forbidden", message)
+}
 func Conflict(w http.ResponseWriter, message string) {
 	Write(w, http.StatusConflict, "conflict", message)
 }

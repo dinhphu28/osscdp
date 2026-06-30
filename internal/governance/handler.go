@@ -7,7 +7,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/dinhphu28/osscdp/internal/auth"
 	"github.com/dinhphu28/osscdp/internal/platform/httpx"
+	"github.com/dinhphu28/osscdp/internal/rbac"
 	"github.com/dinhphu28/osscdp/pkg/apierror"
 )
 
@@ -33,6 +35,9 @@ func (h *Handler) Export(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		apierror.Internal(w)
 		return
+	}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); !ok || !principal.Can(rbac.PermPIIRead) {
+		bundle.Profile.Traits = rbac.MaskTraits(bundle.Profile.Traits)
 	}
 	httpx.WriteJSON(w, http.StatusOK, bundle)
 }

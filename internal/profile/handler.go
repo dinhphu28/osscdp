@@ -7,9 +7,19 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/dinhphu28/osscdp/internal/auth"
 	"github.com/dinhphu28/osscdp/internal/platform/httpx"
+	"github.com/dinhphu28/osscdp/internal/rbac"
 	"github.com/dinhphu28/osscdp/pkg/apierror"
 )
+
+// maskTraits masks PII in a profile's traits unless the caller holds pii:read.
+func maskTraits(r *http.Request, p *Profile) {
+	if principal, ok := auth.PrincipalFromContext(r.Context()); ok && principal.Can(rbac.PermPIIRead) {
+		return
+	}
+	p.Traits = rbac.MaskTraits(p.Traits)
+}
 
 // Handler exposes the admin profile query endpoints.
 type Handler struct {
@@ -34,6 +44,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		apierror.Internal(w)
 		return
 	}
+	maskTraits(r, &p)
 	httpx.WriteJSON(w, http.StatusOK, p)
 }
 
@@ -59,6 +70,9 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		apierror.Internal(w)
 		return
+	}
+	for i := range profiles {
+		maskTraits(r, &profiles[i])
 	}
 	httpx.WriteJSON(w, http.StatusOK, listResponse{Profiles: profiles})
 }
