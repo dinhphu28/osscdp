@@ -19,6 +19,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/config"
 	"github.com/dinhphu28/osscdp/internal/consent"
 	"github.com/dinhphu28/osscdp/internal/crypto"
+	"github.com/dinhphu28/osscdp/internal/dlq"
 	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/governance"
 	"github.com/dinhphu28/osscdp/internal/platform/database"
@@ -26,6 +27,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
 	"github.com/dinhphu28/osscdp/internal/platform/migrate"
 	"github.com/dinhphu28/osscdp/internal/profile"
+	"github.com/dinhphu28/osscdp/internal/ratelimit"
 	"github.com/dinhphu28/osscdp/internal/rawevent"
 	"github.com/dinhphu28/osscdp/internal/rbac"
 	"github.com/dinhphu28/osscdp/internal/segment"
@@ -94,6 +96,9 @@ func run() error {
 	governanceHandler := governance.NewHandler(governance.NewService(pool, recorder))
 	rbacRepo := rbac.NewRepo(pool)
 	tokenHandler := auth.NewTokenHandler(rbacRepo, recorder)
+	dlqRepo := dlq.NewRepo(pool)
+	dlqHandler := dlq.NewHandler(dlqRepo, dlq.NewRetrier(dlqRepo, producer, bus.TopicEvents), recorder)
+	limiter := ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst)
 
 	r := httpx.NewRouter(base)
 	httpx.Health(r, pool)
@@ -132,12 +137,17 @@ func run() error {
 		admin.With(auth.Require(rbac.PermDestinationRead)).Get("/admin/v1/tenants/{tenantID}/destinations/{destinationID}", activationHandler.GetDestination)
 		admin.With(auth.Require(rbac.PermDestinationWrite)).Post("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions", activationHandler.CreateSubscription)
 		admin.With(auth.Require(rbac.PermActivationRead)).Get("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/deliveries", activationHandler.Deliveries)
+		// DLQ operations (Phase 10a).
+		admin.With(auth.Require(rbac.PermDLQRead)).Get("/admin/v1/tenants/{tenantID}/dlq", dlqHandler.List)
+		admin.With(auth.Require(rbac.PermDLQRetry)).Post("/admin/v1/tenants/{tenantID}/dlq/{id}/retry", dlqHandler.Retry)
+		admin.With(auth.Require(rbac.PermDLQRetry)).Post("/admin/v1/tenants/{tenantID}/dlq/{id}/discard", dlqHandler.Discard)
 	})
 
 	// Ingress API (API-key guard). Validates, normalizes, and enqueues to the
 	// outbox; no heavy processing in the request path.
 	r.Group(func(ingress chi.Router) {
 		ingress.Use(auth.APIKey(sourceSvc))
+		ingress.Use(limiter.Middleware)
 		ingress.Get("/v1/auth/whoami", whoami)
 		ingress.Post("/v1/events/track", eventsHandler.Track)
 		ingress.Post("/v1/events/batch", eventsHandler.Batch)

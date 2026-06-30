@@ -18,10 +18,17 @@ type Runner struct {
 	interval  time.Duration
 	logger    *slog.Logger
 
+	// Breaker, when set, pauses sending to a flapping destination.
+	breaker *Breaker
+
 	// Metric hooks (nil-safe).
-	OnSent   func()
-	OnFailed func()
+	OnSent        func()
+	OnFailed      func()
+	OnCircuitOpen func()
 }
+
+// WithBreaker attaches a destination circuit breaker.
+func (r *Runner) WithBreaker(b *Breaker) *Runner { r.breaker = b; return r }
 
 // NewRunner constructs a Runner. senders maps destination type → Sender.
 func NewRunner(pool *pgxpool.Pool, senders map[string]Sender, batchSize int, interval time.Duration, logger *slog.Logger) *Runner {
@@ -57,6 +64,16 @@ func (r *Runner) RunOnce(ctx context.Context) (int, error) {
 }
 
 func (r *Runner) process(ctx context.Context, task Task) {
+	// Circuit breaker: defer the task without sending while the destination is open.
+	if r.breaker != nil && !r.breaker.Allow(task.DestinationID) {
+		next := time.Now().UTC().Add(r.breaker.Cooldown())
+		_ = r.repo.MarkResult(ctx, task.ID, TaskFailedRetryable, task.AttemptCount, &next, "circuit_open")
+		if r.OnCircuitOpen != nil {
+			r.OnCircuitOpen()
+		}
+		return
+	}
+
 	attempt := task.AttemptCount + 1
 
 	dest, err := r.repo.GetDestination(ctx, task.TenantID, task.DestinationID)
@@ -69,7 +86,11 @@ func (r *Runner) process(ctx context.Context, task Task) {
 		r.finish(ctx, task, attempt, Outcome{ErrorMessage: "unknown destination type: " + dest.Type})
 		return
 	}
-	r.finish(ctx, task, attempt, sender.Send(ctx, dest, task))
+	outcome := sender.Send(ctx, dest, task)
+	if r.breaker != nil {
+		r.breaker.Record(task.DestinationID, outcome.Success)
+	}
+	r.finish(ctx, task, attempt, outcome)
 }
 
 func (r *Runner) finish(ctx context.Context, task Task, attempt int, out Outcome) {

@@ -144,9 +144,11 @@ func run() error {
 		activation.TypeWebhook: activation.NewWebhookSender(cipher),
 		activation.TypeKafka:   activation.NewKafkaSender(producer),
 	}
-	activationRunner := activation.NewRunner(pool, senders, cfg.ActivationBatchSize, cfg.ActivationPollInterval, logger)
+	activationRunner := activation.NewRunner(pool, senders, cfg.ActivationBatchSize, cfg.ActivationPollInterval, logger).
+		WithBreaker(activation.NewBreaker(cfg.CircuitThreshold, cfg.CircuitWindow, cfg.CircuitCooldown))
 	activationRunner.OnSent = m.ActivationSent.Inc
 	activationRunner.OnFailed = m.ActivationFailed.Inc
+	activationRunner.OnCircuitOpen = m.ActivationCircuitOpen.Inc
 
 	metricsSrv := &http.Server{
 		Addr:              cfg.MetricsAddr,

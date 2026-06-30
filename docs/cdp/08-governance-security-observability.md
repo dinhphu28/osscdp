@@ -291,6 +291,18 @@ Export
 Mark as resolved
 ```
 
+## Implementation notes (Phase 10a — resilience)
+
+- **DLQ admin API** — `GET /admin/v1/tenants/{tenantID}/dlq?status=` (`dlq:read`);
+  `POST …/dlq/{id}/retry` republishes `original_payload` to `cdp.events` and marks the row `retried`
+  (`dlq:retry`); `POST …/dlq/{id}/discard` marks it `discarded`. Retry/discard are audited. A still-poison
+  payload simply re-dead-letters.
+- **Ingress rate limiting** — per-source in-memory token bucket (`RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`);
+  exceeding it returns `429` with `Retry-After`. Per-instance; Redis is the multi-instance upgrade.
+- **Destination circuit breaker** — opens after `CIRCUIT_THRESHOLD` failures within `CIRCUIT_WINDOW`,
+  stays open for `CIRCUIT_COOLDOWN`, then a half-open trial; while open the sender defers tasks
+  (reschedules `next_attempt_at`, no HTTP call). Metric `activation_circuit_open_total`. See doc 07.
+
 ## Implementation notes (Phase 9b — access governance)
 
 - **RBAC** — admin callers are role-bearing admin tokens (`admin_token` table, SHA-256 hash lookup).

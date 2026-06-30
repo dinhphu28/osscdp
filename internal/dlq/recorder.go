@@ -13,7 +13,9 @@ import (
 
 // Status values for a DLQ row.
 const (
-	StatusOpen = "open"
+	StatusOpen      = "open"
+	StatusRetried   = "retried"
+	StatusDiscarded = "discarded"
 )
 
 // Entry describes a dead-lettered event with enough context to debug and retry.

@@ -27,6 +27,12 @@ type Config struct {
 
 	ActivationPollInterval time.Duration
 	ActivationBatchSize    int
+
+	RateLimitRPS     float64
+	RateLimitBurst   int
+	CircuitThreshold int
+	CircuitWindow    time.Duration
+	CircuitCooldown  time.Duration
 }
 
 // Load reads configuration from environment variables, applies defaults, and
@@ -47,6 +53,12 @@ func Load() (Config, error) {
 
 		ActivationPollInterval: getEnvDuration("ACTIVATION_POLL_INTERVAL", 2*time.Second),
 		ActivationBatchSize:    getEnvInt("ACTIVATION_BATCH_SIZE", 50),
+
+		RateLimitRPS:     getEnvFloat("RATE_LIMIT_RPS", 50),
+		RateLimitBurst:   getEnvInt("RATE_LIMIT_BURST", 100),
+		CircuitThreshold: getEnvInt("CIRCUIT_THRESHOLD", 5),
+		CircuitWindow:    getEnvDuration("CIRCUIT_WINDOW", time.Minute),
+		CircuitCooldown:  getEnvDuration("CIRCUIT_COOLDOWN", 30*time.Second),
 	}
 
 	var missing []string
@@ -69,6 +81,15 @@ func Load() (Config, error) {
 func getEnvDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getEnvFloat(key string, fallback float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
 	}
 	return fallback
 }

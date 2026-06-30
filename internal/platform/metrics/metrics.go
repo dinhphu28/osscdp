@@ -12,20 +12,21 @@ import (
 type Metrics struct {
 	reg *prometheus.Registry
 
-	EventsPublished     prometheus.Counter
-	EventsConsumed      prometheus.Counter
-	ProcessingRetries   prometheus.Counter
-	DLQTotal            prometheus.Counter
-	KafkaPublishFailed  prometheus.Counter
-	ProcessingLagSecond prometheus.Histogram
-	IdentityResolved    prometheus.Counter
-	IdentityMerge       prometheus.Counter
-	ProfileUpdated      prometheus.Counter
-	SegmentEvaluated    prometheus.Counter
-	SegmentMatched      prometheus.Counter
-	ActivationSent      prometheus.Counter
-	ActivationFailed    prometheus.Counter
-	ActivationSkipped   prometheus.Counter
+	EventsPublished       prometheus.Counter
+	EventsConsumed        prometheus.Counter
+	ProcessingRetries     prometheus.Counter
+	DLQTotal              prometheus.Counter
+	KafkaPublishFailed    prometheus.Counter
+	ProcessingLagSecond   prometheus.Histogram
+	IdentityResolved      prometheus.Counter
+	IdentityMerge         prometheus.Counter
+	ProfileUpdated        prometheus.Counter
+	SegmentEvaluated      prometheus.Counter
+	SegmentMatched        prometheus.Counter
+	ActivationSent        prometheus.Counter
+	ActivationFailed      prometheus.Counter
+	ActivationSkipped     prometheus.Counter
+	ActivationCircuitOpen prometheus.Counter
 }
 
 // New constructs and registers the collectors.
@@ -77,11 +78,14 @@ func New() *Metrics {
 		ActivationSkipped: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "activation_skipped_total", Help: "Activations skipped due to denied consent.",
 		}),
+		ActivationCircuitOpen: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "activation_circuit_open_total", Help: "Activation sends deferred by an open circuit breaker.",
+		}),
 	}
 	reg.MustRegister(m.EventsPublished, m.EventsConsumed, m.ProcessingRetries,
 		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond, m.IdentityResolved, m.IdentityMerge,
 		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.ActivationSent, m.ActivationFailed,
-		m.ActivationSkipped)
+		m.ActivationSkipped, m.ActivationCircuitOpen)
 	return m
 }
 
