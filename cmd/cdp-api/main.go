@@ -23,6 +23,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/platform/migrate"
 	"github.com/dinhphu28/osscdp/internal/profile"
 	"github.com/dinhphu28/osscdp/internal/rawevent"
+	"github.com/dinhphu28/osscdp/internal/segment"
 	"github.com/dinhphu28/osscdp/internal/source"
 	"github.com/dinhphu28/osscdp/internal/tenant"
 )
@@ -77,6 +78,7 @@ func run() error {
 	rawRepo := rawevent.NewRepo(pool)
 	rawHandler := rawevent.NewHandler(rawRepo, rawevent.NewReplayer(rawRepo, producer, bus.TopicEvents, logger))
 	profileHandler := profile.NewHandler(profile.NewRepo(pool))
+	segmentHandler := segment.NewHandler(segment.NewRepo(pool))
 
 	r := httpx.NewRouter(base)
 	httpx.Health(r, pool)
@@ -94,6 +96,11 @@ func run() error {
 		// Customer profile query (Phase 6).
 		admin.Get("/admin/v1/tenants/{tenantID}/profiles", profileHandler.List)
 		admin.Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}", profileHandler.Get)
+		// Segment management (Phase 7).
+		admin.Post("/admin/v1/tenants/{tenantID}/segments", segmentHandler.Create)
+		admin.Put("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Update)
+		admin.Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Get)
+		admin.Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/members", segmentHandler.Members)
 	})
 
 	// Ingress API (API-key guard). Validates, normalizes, and enqueues to the

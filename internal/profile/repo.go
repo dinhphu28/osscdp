@@ -145,6 +145,20 @@ func (r *Repo) GetByCanonical(ctx context.Context, tenantID uuid.UUID, canonical
 	return p, nil
 }
 
+// GetByID loads a profile by its id (read-only), tenant-scoped.
+func (r *Repo) GetByID(ctx context.Context, tenantID, id uuid.UUID) (Profile, error) {
+	row := r.pool.QueryRow(ctx,
+		`SELECT `+profileCols+` FROM customer_profile WHERE tenant_id=$1 AND id=$2`, tenantID, id)
+	p, err := scanProfile(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Profile{}, ErrNotFound
+	}
+	if err != nil {
+		return Profile{}, fmt.Errorf("get profile by id: %w", err)
+	}
+	return p, nil
+}
+
 // ListByTrait returns profiles whose traits_json[key] equals value.
 func (r *Repo) ListByTrait(ctx context.Context, tenantID uuid.UUID, key, value string) ([]Profile, error) {
 	rows, err := r.pool.Query(ctx,
