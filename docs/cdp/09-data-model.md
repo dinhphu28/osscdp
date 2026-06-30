@@ -61,6 +61,44 @@ CREATE TABLE schema_definition (
 );
 ```
 
+## Event outbox (ingress, Phase 2)
+
+Ingress writes each normalized event here in one transaction (transactional
+outbox). It is idempotent on `(tenant_id, event_id)`. A Phase 3 relay drains
+`status = 'pending'` rows to the event bus and marks them `published`. Columns
+mirror `raw_event` so the Phase 4 raw-event store can reuse them.
+
+```sql
+CREATE TABLE event_outbox (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenant(id),
+    source_id UUID NOT NULL REFERENCES source(id),
+    event_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    event_name TEXT,
+    identifier_key TEXT,
+    partition_key TEXT NOT NULL,
+    payload_json JSONB NOT NULL,
+    payload_hash TEXT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    published_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, event_id)
+);
+
+-- Drives the Phase 3 relay drain (oldest pending first).
+CREATE INDEX idx_event_outbox_status_created
+    ON event_outbox (status, created_at);
+```
+
+`payload_hash` is computed over client-meaningful content only (it excludes the
+server-set `received_at` and a server-generated `event_id`) so a legitimate retry
+of the same event hashes identically. A second event with the same
+`(tenant_id, event_id)` but a different hash is a conflict (rejected with `409`;
+conflict-DLQ routing arrives in Phase 3).
+
 ## Raw event
 
 ```sql

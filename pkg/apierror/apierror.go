@@ -24,8 +24,21 @@ func Write(w http.ResponseWriter, status int, code, message string) {
 }
 
 // Common helpers.
-func BadRequest(w http.ResponseWriter, message string)   { Write(w, http.StatusBadRequest, "bad_request", message) }
-func Unauthorized(w http.ResponseWriter, message string) { Write(w, http.StatusUnauthorized, "unauthorized", message) }
-func Conflict(w http.ResponseWriter, message string)     { Write(w, http.StatusConflict, "conflict", message) }
-func Internal(w http.ResponseWriter)                      { Write(w, http.StatusInternalServerError, "internal_error", "internal server error") }
-func NotFound(w http.ResponseWriter, message string)     { Write(w, http.StatusNotFound, "not_found", message) }
+func BadRequest(w http.ResponseWriter, message string) {
+	Write(w, http.StatusBadRequest, "bad_request", message)
+}
+func Unauthorized(w http.ResponseWriter, message string) {
+	Write(w, http.StatusUnauthorized, "unauthorized", message)
+}
+func Conflict(w http.ResponseWriter, message string) {
+	Write(w, http.StatusConflict, "conflict", message)
+}
+func Internal(w http.ResponseWriter) {
+	Write(w, http.StatusInternalServerError, "internal_error", "internal server error")
+}
+func NotFound(w http.ResponseWriter, message string) {
+	Write(w, http.StatusNotFound, "not_found", message)
+}
+func PayloadTooLarge(w http.ResponseWriter, message string) {
+	Write(w, http.StatusRequestEntityTooLarge, "payload_too_large", message)
+}
