@@ -18,6 +18,8 @@ type Metrics struct {
 	DLQTotal            prometheus.Counter
 	KafkaPublishFailed  prometheus.Counter
 	ProcessingLagSecond prometheus.Histogram
+	IdentityResolved    prometheus.Counter
+	IdentityMerge       prometheus.Counter
 }
 
 // New constructs and registers the collectors.
@@ -45,9 +47,15 @@ func New() *Metrics {
 			Help:    "Seconds between event received_at and worker processing.",
 			Buckets: prometheus.ExponentialBuckets(0.05, 3, 10),
 		}),
+		IdentityResolved: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "identity_resolved_total", Help: "Events resolved to an identity cluster.",
+		}),
+		IdentityMerge: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "identity_merge_total", Help: "Identity cluster merges performed.",
+		}),
 	}
 	reg.MustRegister(m.EventsPublished, m.EventsConsumed, m.ProcessingRetries,
-		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond)
+		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond, m.IdentityResolved, m.IdentityMerge)
 	return m
 }
 

@@ -21,6 +21,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/config"
 	"github.com/dinhphu28/osscdp/internal/dlq"
 	"github.com/dinhphu28/osscdp/internal/events"
+	"github.com/dinhphu28/osscdp/internal/identity"
 	"github.com/dinhphu28/osscdp/internal/platform/database"
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
 	"github.com/dinhphu28/osscdp/internal/platform/metrics"
@@ -57,7 +58,7 @@ func run() error {
 	}
 	defer pool.Close()
 
-	if err := bus.EnsureTopics(ctx, cfg.KafkaBrokers, eventTopicPartitions, bus.TopicEvents); err != nil {
+	if err := bus.EnsureTopics(ctx, cfg.KafkaBrokers, eventTopicPartitions, bus.TopicEvents, bus.TopicIdentityResolved); err != nil {
 		return err
 	}
 	logger.Info("topics ensured", "brokers", cfg.KafkaBrokers)
@@ -86,6 +87,17 @@ func run() error {
 	handler := makeHandler(rawRepo, m, logger)
 	deadLetter := makeDeadLetter(dlqRec, m, logger)
 
+	// Identity resolution: a second, independent consumer group on cdp.events.
+	identitySvc := identity.NewService(pool, producer, bus.TopicIdentityResolved)
+	identitySvc.OnResolved = m.IdentityResolved.Inc
+	identitySvc.OnMerge = m.IdentityMerge.Inc
+	identityConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-identity", []string{bus.TopicEvents}, cfg.MaxRetries, logger)
+	if err != nil {
+		return err
+	}
+	identityConsumer.OnRetry = m.ProcessingRetries.Inc
+	identityHandler := makeIdentityHandler(identitySvc)
+
 	metricsSrv := &http.Server{
 		Addr:              cfg.MetricsAddr,
 		Handler:           metricsMux(m),
@@ -93,12 +105,18 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
 	go func() {
 		defer wg.Done()
 		if err := consumer.Run(ctx, handler, deadLetter); err != nil {
 			logger.Error("consumer stopped", "error", err.Error())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := identityConsumer.Run(ctx, identityHandler, deadLetter); err != nil {
+			logger.Error("identity consumer stopped", "error", err.Error())
 		}
 	}()
 	go func() {
@@ -142,6 +160,18 @@ func makeHandler(repo *rawevent.Repo, m *metrics.Metrics, _ *slog.Logger) bus.Ha
 		m.EventsConsumed.Inc()
 		m.ProcessingLagSecond.Observe(time.Since(env.ReceivedAt).Seconds())
 		return nil
+	}
+}
+
+// makeIdentityHandler unmarshals the event and resolves its identity. A
+// malformed payload returns an error so it is retried and dead-lettered.
+func makeIdentityHandler(svc *identity.Service) bus.Handler {
+	return func(ctx context.Context, r bus.Record) error {
+		var env events.Envelope
+		if err := json.Unmarshal(r.Value, &env); err != nil {
+			return err
+		}
+		return svc.Resolve(ctx, env)
 	}
 }
 
