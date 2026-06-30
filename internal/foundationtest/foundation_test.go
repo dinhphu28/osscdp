@@ -18,6 +18,7 @@ import (
 
 	"github.com/dinhphu28/osscdp/internal/audit"
 	"github.com/dinhphu28/osscdp/internal/auth"
+	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/platform/migrate"
 	"github.com/dinhphu28/osscdp/internal/source"
 	"github.com/dinhphu28/osscdp/internal/tenant"
@@ -36,6 +37,7 @@ type fixture struct {
 	pool      *pgxpool.Pool
 	tenantSvc *tenant.Service
 	sourceSvc *source.Service
+	eventsSvc *events.Service
 }
 
 func setup(t *testing.T) fixture {
@@ -67,6 +69,7 @@ func setup(t *testing.T) fixture {
 		pool:      pool,
 		tenantSvc: tenant.NewService(tenant.NewRepository(pool), recorder),
 		sourceSvc: source.NewService(source.NewRepository(pool), recorder),
+		eventsSvc: events.NewService(events.NewRepository(pool)),
 	}
 }
 

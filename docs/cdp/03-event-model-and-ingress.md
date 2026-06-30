@@ -200,6 +200,16 @@ Behavior:
 - If same `tenant_id + event_id` already exists, return success but do not duplicate side effects.
 - If same `tenant_id + event_id` exists with different payload hash, reject or send to conflict DLQ.
 
+## Ingress durability: transactional outbox (Phase 2)
+
+To make ingress durable and idempotent without a dual-write to the event bus,
+Phase 2 writes each normalized event to an `event_outbox` table in one
+transaction, keyed `UNIQUE (tenant_id, event_id)` (see
+`09-data-model.md`). Ingress returns `202` once the row is committed. A Phase 3
+relay drains `status = 'pending'` rows to the topics below and marks them
+`published`. This keeps the HTTP path fast (no bus round-trip) and guarantees no
+event is lost between accept and publish.
+
 ## Event bus topics
 
 Simple first version:

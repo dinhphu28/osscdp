@@ -15,6 +15,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/audit"
 	"github.com/dinhphu28/osscdp/internal/auth"
 	"github.com/dinhphu28/osscdp/internal/config"
+	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/platform/database"
 	"github.com/dinhphu28/osscdp/internal/platform/httpx"
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
@@ -61,6 +62,7 @@ func run() error {
 	sourceSvc := source.NewService(source.NewRepository(pool), recorder)
 	tenantHandler := tenant.NewHandler(tenantSvc)
 	sourceHandler := source.NewHandler(sourceSvc)
+	eventsHandler := events.NewHandler(events.NewService(events.NewRepository(pool)))
 
 	r := httpx.NewRouter(base)
 	httpx.Health(r, pool)
@@ -72,10 +74,15 @@ func run() error {
 		admin.Post("/admin/v1/tenants/{tenantID}/sources", sourceHandler.Create)
 	})
 
-	// Ingress auth probe (API-key guard).
+	// Ingress API (API-key guard). Validates, normalizes, and enqueues to the
+	// outbox; no heavy processing in the request path.
 	r.Group(func(ingress chi.Router) {
 		ingress.Use(auth.APIKey(sourceSvc))
 		ingress.Get("/v1/auth/whoami", whoami)
+		ingress.Post("/v1/events/track", eventsHandler.Track)
+		ingress.Post("/v1/events/batch", eventsHandler.Batch)
+		ingress.Post("/v1/identify", eventsHandler.Identify)
+		ingress.Post("/v1/alias", eventsHandler.Alias)
 	})
 
 	srv := &http.Server{
