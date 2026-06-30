@@ -45,3 +45,6 @@ func NotFound(w http.ResponseWriter, message string) {
 func PayloadTooLarge(w http.ResponseWriter, message string) {
 	Write(w, http.StatusRequestEntityTooLarge, "payload_too_large", message)
 }
+func TooManyRequests(w http.ResponseWriter, message string) {
+	Write(w, http.StatusTooManyRequests, "rate_limited", message)
+}
