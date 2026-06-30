@@ -71,7 +71,7 @@ func TestWebhookSender_Classification(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			s := NewWebhookSender()
+			s := NewWebhookSender(nil)
 			task := Task{IdempotencyKey: "key123", TenantID: uuid.New(), DestinationID: uuid.New(), Payload: json.RawMessage(`{}`)}
 			out := s.Send(context.Background(), webhookDest(t, srv.URL), task)
 
@@ -89,7 +89,7 @@ func TestWebhookSender_Classification(t *testing.T) {
 }
 
 func TestWebhookSender_NetworkErrorRetryable(t *testing.T) {
-	s := NewWebhookSender()
+	s := NewWebhookSender(nil)
 	// Unroutable URL → connection error → retryable.
 	out := s.Send(context.Background(), webhookDest(t, "http://127.0.0.1:1"), Task{Payload: json.RawMessage(`{}`)})
 	if out.Success || !out.Retryable {
@@ -98,7 +98,7 @@ func TestWebhookSender_NetworkErrorRetryable(t *testing.T) {
 }
 
 func TestWebhookSender_MissingURLPermanent(t *testing.T) {
-	s := NewWebhookSender()
+	s := NewWebhookSender(nil)
 	dest := Destination{Type: TypeWebhook, Config: json.RawMessage(`{}`)}
 	out := s.Send(context.Background(), dest, Task{Payload: json.RawMessage(`{}`)})
 	if out.Success || out.Retryable {

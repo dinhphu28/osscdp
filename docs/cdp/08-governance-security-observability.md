@@ -291,6 +291,26 @@ Export
 Mark as resolved
 ```
 
+## Implementation notes (Phase 9a — data governance)
+
+Phase 9 is split: **9a (data governance)** is implemented; **9b (access governance: RBAC + field-level
+PII masking)** is deferred.
+
+- **Encryption at rest** — `internal/crypto` AES-256-GCM keyed by `CDP_ENCRYPTION_KEY` (base64 32
+  bytes). Destination secrets are encrypted into `destination.secret_ref` (never returned by the API).
+- **Webhook signing** — when a destination has a secret, the sender adds
+  `X-CDP-Signature: sha256=<hmac(secret, body)>`.
+- **Consent** — `customer_consent` (channel/purpose/status). Activation checks consent for the
+  destination's channel/purpose; `denied` → the task is recorded `skipped` (`consent_denied`, never
+  sent); `granted`/`unknown` proceed. Admin: `PUT/GET …/profiles/{cuid}/consent`.
+- **API-key rotation** — `POST …/sources/{id}/rotate-key`; old key invalid immediately; audited.
+- **Export/delete** — `GET …/profiles/{cuid}/export` (profile + identity + memberships + consent);
+  `DELETE …/profiles/{cuid}` erases customer-scoped rows in one transaction (raw_event retained,
+  retention-governed). Both audited.
+- **Deferred (9b/later):** RBAC (the admin API still uses a single static token), field-level PII
+  masking in responses, retention enforcement, KMS/envelope encryption, key-rotation grace period,
+  raw-event erasure.
+
 ## Acceptance criteria
 
 - [ ] Tenant isolation enforced in code and database queries.

@@ -84,7 +84,7 @@ func setupActivation(t *testing.T, f fixture, status int) (uuid.UUID, uuid.UUID,
 
 func newRunner(f fixture) *activation.Runner {
 	return activation.NewRunner(f.pool, map[string]activation.Sender{
-		activation.TypeWebhook: activation.NewWebhookSender(),
+		activation.TypeWebhook: activation.NewWebhookSender(nil),
 	}, 50, time.Second, testLogger())
 }
 
@@ -93,7 +93,7 @@ func TestActivation_EnterDeliversAndIdempotent(t *testing.T) {
 	ctx := context.Background()
 	tid, segID, sink, _ := setupActivation(t, f, 200)
 	pid := profileIDFor(t, f, tid)
-	svc := activation.NewService(f.pool, profile.NewRepo(f.pool))
+	svc := activation.NewService(f.pool, profile.NewRepo(f.pool), nil)
 
 	require.NoError(t, svc.OnMembershipChanged(ctx, mc(tid, segID, pid, "entered")))
 	require.Equal(t, 1, taskCount(t, f, tid))
@@ -121,7 +121,7 @@ func TestActivation_RetryableSchedulesRetry(t *testing.T) {
 	ctx := context.Background()
 	tid, segID, _, _ := setupActivation(t, f, 500)
 	pid := profileIDFor(t, f, tid)
-	svc := activation.NewService(f.pool, profile.NewRepo(f.pool))
+	svc := activation.NewService(f.pool, profile.NewRepo(f.pool), nil)
 	require.NoError(t, svc.OnMembershipChanged(ctx, mc(tid, segID, pid, "entered")))
 
 	_, err := newRunner(f).RunOnce(ctx)
@@ -139,7 +139,7 @@ func TestActivation_PermanentFailsImmediately(t *testing.T) {
 	ctx := context.Background()
 	tid, segID, _, _ := setupActivation(t, f, 400)
 	pid := profileIDFor(t, f, tid)
-	svc := activation.NewService(f.pool, profile.NewRepo(f.pool))
+	svc := activation.NewService(f.pool, profile.NewRepo(f.pool), nil)
 	require.NoError(t, svc.OnMembershipChanged(ctx, mc(tid, segID, pid, "entered")))
 
 	_, err := newRunner(f).RunOnce(ctx)
@@ -154,7 +154,7 @@ func TestActivation_ExhaustionToPermanent(t *testing.T) {
 	ctx := context.Background()
 	tid, segID, _, _ := setupActivation(t, f, 500)
 	pid := profileIDFor(t, f, tid)
-	svc := activation.NewService(f.pool, profile.NewRepo(f.pool))
+	svc := activation.NewService(f.pool, profile.NewRepo(f.pool), nil)
 	require.NoError(t, svc.OnMembershipChanged(ctx, mc(tid, segID, pid, "entered")))
 	// Simulate 4 prior attempts so the next one exhausts (max 5).
 	_, err := f.pool.Exec(ctx, `UPDATE activation_task SET attempt_count=4, next_attempt_at=now() WHERE tenant_id=$1`, tid)
@@ -180,7 +180,7 @@ func TestActivation_DisabledDestinationNoTask(t *testing.T) {
 	_, err := arepo.UpdateDestination(ctx, tid, destID, activation.StatusDisabled, nil)
 	require.NoError(t, err)
 
-	svc := activation.NewService(f.pool, profile.NewRepo(f.pool))
+	svc := activation.NewService(f.pool, profile.NewRepo(f.pool), nil)
 	require.NoError(t, svc.OnMembershipChanged(ctx, mc(tid, segID, pid, "entered")))
 	require.Equal(t, 0, taskCount(t, f, tid))
 }
@@ -191,7 +191,7 @@ func TestActivation_TenantIsolation(t *testing.T) {
 	tidA, segID, _, _ := setupActivation(t, f, 200)
 	tidB, _ := mkTenant(t, f, "tenant-b")
 	pidA := profileIDFor(t, f, tidA)
-	svc := activation.NewService(f.pool, profile.NewRepo(f.pool))
+	svc := activation.NewService(f.pool, profile.NewRepo(f.pool), nil)
 
 	// A membership change for tenant B referencing A's segment id → no subs in B.
 	require.NoError(t, svc.OnMembershipChanged(ctx, mc(tidB, segID, pidA, "entered")))
@@ -228,7 +228,7 @@ func TestActivation_KafkaDestination(t *testing.T) {
 		_ = consumer.Run(runCtx, func(_ context.Context, r bus.Record) error { sink.add(r); return nil }, nil)
 	}()
 
-	svc := activation.NewService(f.pool, profile.NewRepo(f.pool))
+	svc := activation.NewService(f.pool, profile.NewRepo(f.pool), nil)
 	require.NoError(t, svc.OnMembershipChanged(ctx, mc(tid, segID, pu.CustomerProfileID, "entered")))
 
 	runner := activation.NewRunner(f.pool, map[string]activation.Sender{

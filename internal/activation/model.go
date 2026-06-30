@@ -34,6 +34,7 @@ const (
 	TaskSucceeded       = "succeeded"
 	TaskFailedRetryable = "failed_retryable"
 	TaskFailedPermanent = "failed_permanent"
+	TaskSkipped         = "skipped"
 )
 
 // Delivery statuses.
@@ -50,7 +51,7 @@ type Destination struct {
 	Name      string          `json:"name"`
 	Status    string          `json:"status"`
 	Config    json.RawMessage `json:"config"`
-	SecretRef *string         `json:"secret_ref,omitempty"`
+	SecretRef *string         `json:"-"` // ciphertext; never serialized to clients
 	CreatedAt time.Time       `json:"created_at"`
 	UpdatedAt time.Time       `json:"updated_at"`
 }
@@ -92,4 +93,25 @@ type WebhookConfig struct {
 // KafkaConfig is the parsed config for a kafka destination.
 type KafkaConfig struct {
 	Topic string `json:"topic"`
+}
+
+// ConsentTarget is the consent channel + purpose an activation maps to,
+// parsed from a destination's config (with defaults).
+type ConsentTarget struct {
+	Channel string `json:"channel"`
+	Purpose string `json:"purpose"`
+}
+
+// ConsentTargetFor returns the consent channel/purpose for a destination,
+// defaulting channel to the destination type and purpose to "marketing".
+func ConsentTargetFor(d Destination) ConsentTarget {
+	var ct ConsentTarget
+	_ = json.Unmarshal(d.Config, &ct)
+	if ct.Channel == "" {
+		ct.Channel = d.Type
+	}
+	if ct.Purpose == "" {
+		ct.Purpose = "marketing"
+	}
+	return ct
 }

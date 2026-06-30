@@ -17,7 +17,10 @@ import (
 	"github.com/dinhphu28/osscdp/internal/auth"
 	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/config"
+	"github.com/dinhphu28/osscdp/internal/consent"
+	"github.com/dinhphu28/osscdp/internal/crypto"
 	"github.com/dinhphu28/osscdp/internal/events"
+	"github.com/dinhphu28/osscdp/internal/governance"
 	"github.com/dinhphu28/osscdp/internal/platform/database"
 	"github.com/dinhphu28/osscdp/internal/platform/httpx"
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
@@ -61,6 +64,11 @@ func run() error {
 	defer pool.Close()
 	logger.Info("database connected")
 
+	cipher, err := crypto.New(cfg.EncryptionKey)
+	if err != nil {
+		return err
+	}
+
 	// Wire dependencies.
 	recorder := audit.NewRecorder(pool)
 	tenantSvc := tenant.NewService(tenant.NewRepository(pool), recorder)
@@ -80,7 +88,9 @@ func run() error {
 	rawHandler := rawevent.NewHandler(rawRepo, rawevent.NewReplayer(rawRepo, producer, bus.TopicEvents, logger))
 	profileHandler := profile.NewHandler(profile.NewRepo(pool))
 	segmentHandler := segment.NewHandler(segment.NewRepo(pool))
-	activationHandler := activation.NewHandler(activation.NewRepo(pool))
+	activationHandler := activation.NewHandler(activation.NewRepo(pool), cipher)
+	consentHandler := consent.NewHandler(consent.NewRepo(pool), profile.NewRepo(pool))
+	governanceHandler := governance.NewHandler(governance.NewService(pool, recorder))
 
 	r := httpx.NewRouter(base)
 	httpx.Health(r, pool)
@@ -90,6 +100,7 @@ func run() error {
 		admin.Use(auth.AdminToken(cfg.AdminAPIToken))
 		admin.Post("/admin/v1/tenants", tenantHandler.Create)
 		admin.Post("/admin/v1/tenants/{tenantID}/sources", sourceHandler.Create)
+		admin.Post("/admin/v1/tenants/{tenantID}/sources/{sourceID}/rotate-key", sourceHandler.RotateKey)
 		// Raw event query + replay (Phase 4).
 		admin.Get("/admin/v1/tenants/{tenantID}/events", rawHandler.List)
 		admin.Get("/admin/v1/tenants/{tenantID}/events/{eventID}", rawHandler.Get)
@@ -98,6 +109,11 @@ func run() error {
 		// Customer profile query (Phase 6).
 		admin.Get("/admin/v1/tenants/{tenantID}/profiles", profileHandler.List)
 		admin.Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}", profileHandler.Get)
+		// Consent + data governance (Phase 9a).
+		admin.Put("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/consent", consentHandler.Set)
+		admin.Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/consent", consentHandler.List)
+		admin.Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/export", governanceHandler.Export)
+		admin.Delete("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}", governanceHandler.Delete)
 		// Segment management (Phase 7).
 		admin.Post("/admin/v1/tenants/{tenantID}/segments", segmentHandler.Create)
 		admin.Put("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Update)

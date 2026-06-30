@@ -13,6 +13,7 @@ import (
 type Config struct {
 	DatabaseURL   string
 	AdminAPIToken string
+	EncryptionKey string
 	HTTPAddr      string
 	LogLevel      string
 
@@ -34,6 +35,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		DatabaseURL:        os.Getenv("DATABASE_URL"),
 		AdminAPIToken:      os.Getenv("ADMIN_API_TOKEN"),
+		EncryptionKey:      os.Getenv("CDP_ENCRYPTION_KEY"),
 		HTTPAddr:           getEnvDefault("HTTP_ADDR", ":8080"),
 		LogLevel:           getEnvDefault("LOG_LEVEL", "info"),
 		KafkaBrokers:       splitCSV(getEnvDefault("KAFKA_BROKERS", "localhost:9092")),
@@ -53,6 +55,9 @@ func Load() (Config, error) {
 	}
 	if cfg.AdminAPIToken == "" {
 		missing = append(missing, "ADMIN_API_TOKEN")
+	}
+	if cfg.EncryptionKey == "" {
+		missing = append(missing, "CDP_ENCRYPTION_KEY")
 	}
 	if len(missing) > 0 {
 		return Config{}, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))

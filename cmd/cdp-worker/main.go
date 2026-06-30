@@ -20,6 +20,8 @@ import (
 	"github.com/dinhphu28/osscdp/internal/activation"
 	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/config"
+	"github.com/dinhphu28/osscdp/internal/consent"
+	"github.com/dinhphu28/osscdp/internal/crypto"
 	"github.com/dinhphu28/osscdp/internal/dlq"
 	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/identity"
@@ -65,6 +67,11 @@ func run() error {
 		return err
 	}
 	logger.Info("topics ensured", "brokers", cfg.KafkaBrokers)
+
+	cipher, err := crypto.New(cfg.EncryptionKey)
+	if err != nil {
+		return err
+	}
 
 	m := metrics.New()
 
@@ -123,8 +130,9 @@ func run() error {
 	segmentHandler := makeSegmentHandler(segmentSvc)
 
 	// Activation: consumes segment_membership_changed → creates tasks; a sender
-	// loop delivers them with retry/backoff.
-	activationSvc := activation.NewService(pool, profile.NewRepo(pool))
+	// loop delivers them with retry/backoff. The consent gate skips denied sends.
+	activationSvc := activation.NewService(pool, profile.NewRepo(pool), consent.NewRepo(pool))
+	activationSvc.OnSkipped = m.ActivationSkipped.Inc
 	activationConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-activation", []string{bus.TopicSegmentMembershipChanged}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err
@@ -133,7 +141,7 @@ func run() error {
 	activationHandler := makeActivationHandler(activationSvc)
 
 	senders := map[string]activation.Sender{
-		activation.TypeWebhook: activation.NewWebhookSender(),
+		activation.TypeWebhook: activation.NewWebhookSender(cipher),
 		activation.TypeKafka:   activation.NewKafkaSender(producer),
 	}
 	activationRunner := activation.NewRunner(pool, senders, cfg.ActivationBatchSize, cfg.ActivationPollInterval, logger)
