@@ -27,6 +27,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/platform/migrate"
 	"github.com/dinhphu28/osscdp/internal/profile"
 	"github.com/dinhphu28/osscdp/internal/rawevent"
+	"github.com/dinhphu28/osscdp/internal/rbac"
 	"github.com/dinhphu28/osscdp/internal/segment"
 	"github.com/dinhphu28/osscdp/internal/source"
 	"github.com/dinhphu28/osscdp/internal/tenant"
@@ -91,40 +92,46 @@ func run() error {
 	activationHandler := activation.NewHandler(activation.NewRepo(pool), cipher)
 	consentHandler := consent.NewHandler(consent.NewRepo(pool), profile.NewRepo(pool))
 	governanceHandler := governance.NewHandler(governance.NewService(pool, recorder))
+	rbacRepo := rbac.NewRepo(pool)
+	tokenHandler := auth.NewTokenHandler(rbacRepo, recorder)
 
 	r := httpx.NewRouter(base)
 	httpx.Health(r, pool)
 
-	// Admin API (static token guard; RBAC in Phase 9).
+	// Admin API: authenticate (static token = SUPER_ADMIN, else admin_token) then
+	// authorize per-route by permission + tenant scope (RBAC, Phase 9b).
 	r.Group(func(admin chi.Router) {
-		admin.Use(auth.AdminToken(cfg.AdminAPIToken))
-		admin.Post("/admin/v1/tenants", tenantHandler.Create)
-		admin.Post("/admin/v1/tenants/{tenantID}/sources", sourceHandler.Create)
-		admin.Post("/admin/v1/tenants/{tenantID}/sources/{sourceID}/rotate-key", sourceHandler.RotateKey)
+		admin.Use(auth.Authenticate(cfg.AdminAPIToken, rbacRepo))
+
+		admin.With(auth.RequireSuperAdmin()).Post("/admin/v1/tenants", tenantHandler.Create)
+		admin.With(auth.Require(rbac.PermAdminWrite)).Post("/admin/v1/admin-tokens", tokenHandler.Create)
+
+		admin.With(auth.Require(rbac.PermSourceWrite)).Post("/admin/v1/tenants/{tenantID}/sources", sourceHandler.Create)
+		admin.With(auth.Require(rbac.PermSourceWrite)).Post("/admin/v1/tenants/{tenantID}/sources/{sourceID}/rotate-key", sourceHandler.RotateKey)
 		// Raw event query + replay (Phase 4).
-		admin.Get("/admin/v1/tenants/{tenantID}/events", rawHandler.List)
-		admin.Get("/admin/v1/tenants/{tenantID}/events/{eventID}", rawHandler.Get)
-		admin.Post("/admin/v1/tenants/{tenantID}/events/{eventID}/replay", rawHandler.ReplayOne)
-		admin.Post("/admin/v1/tenants/{tenantID}/replay", rawHandler.ReplayByIdentifier)
+		admin.With(auth.Require(rbac.PermEventRead)).Get("/admin/v1/tenants/{tenantID}/events", rawHandler.List)
+		admin.With(auth.Require(rbac.PermEventRead)).Get("/admin/v1/tenants/{tenantID}/events/{eventID}", rawHandler.Get)
+		admin.With(auth.Require(rbac.PermEventReplay)).Post("/admin/v1/tenants/{tenantID}/events/{eventID}/replay", rawHandler.ReplayOne)
+		admin.With(auth.Require(rbac.PermEventReplay)).Post("/admin/v1/tenants/{tenantID}/replay", rawHandler.ReplayByIdentifier)
 		// Customer profile query (Phase 6).
-		admin.Get("/admin/v1/tenants/{tenantID}/profiles", profileHandler.List)
-		admin.Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}", profileHandler.Get)
+		admin.With(auth.Require(rbac.PermProfileRead)).Get("/admin/v1/tenants/{tenantID}/profiles", profileHandler.List)
+		admin.With(auth.Require(rbac.PermProfileRead)).Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}", profileHandler.Get)
 		// Consent + data governance (Phase 9a).
-		admin.Put("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/consent", consentHandler.Set)
-		admin.Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/consent", consentHandler.List)
-		admin.Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/export", governanceHandler.Export)
-		admin.Delete("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}", governanceHandler.Delete)
+		admin.With(auth.Require(rbac.PermConsentWrite)).Put("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/consent", consentHandler.Set)
+		admin.With(auth.Require(rbac.PermProfileRead)).Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/consent", consentHandler.List)
+		admin.With(auth.Require(rbac.PermProfileRead)).Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/export", governanceHandler.Export)
+		admin.With(auth.Require(rbac.PermProfileDelete)).Delete("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}", governanceHandler.Delete)
 		// Segment management (Phase 7).
-		admin.Post("/admin/v1/tenants/{tenantID}/segments", segmentHandler.Create)
-		admin.Put("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Update)
-		admin.Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Get)
-		admin.Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/members", segmentHandler.Members)
+		admin.With(auth.Require(rbac.PermSegmentWrite)).Post("/admin/v1/tenants/{tenantID}/segments", segmentHandler.Create)
+		admin.With(auth.Require(rbac.PermSegmentWrite)).Put("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Update)
+		admin.With(auth.Require(rbac.PermSegmentRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Get)
+		admin.With(auth.Require(rbac.PermSegmentRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/members", segmentHandler.Members)
 		// Activation: destinations, subscriptions, delivery log (Phase 8).
-		admin.Post("/admin/v1/tenants/{tenantID}/destinations", activationHandler.CreateDestination)
-		admin.Put("/admin/v1/tenants/{tenantID}/destinations/{destinationID}", activationHandler.UpdateDestination)
-		admin.Get("/admin/v1/tenants/{tenantID}/destinations/{destinationID}", activationHandler.GetDestination)
-		admin.Post("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions", activationHandler.CreateSubscription)
-		admin.Get("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/deliveries", activationHandler.Deliveries)
+		admin.With(auth.Require(rbac.PermDestinationWrite)).Post("/admin/v1/tenants/{tenantID}/destinations", activationHandler.CreateDestination)
+		admin.With(auth.Require(rbac.PermDestinationWrite)).Put("/admin/v1/tenants/{tenantID}/destinations/{destinationID}", activationHandler.UpdateDestination)
+		admin.With(auth.Require(rbac.PermDestinationRead)).Get("/admin/v1/tenants/{tenantID}/destinations/{destinationID}", activationHandler.GetDestination)
+		admin.With(auth.Require(rbac.PermDestinationWrite)).Post("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions", activationHandler.CreateSubscription)
+		admin.With(auth.Require(rbac.PermActivationRead)).Get("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/deliveries", activationHandler.Deliveries)
 	})
 
 	// Ingress API (API-key guard). Validates, normalizes, and enqueues to the
