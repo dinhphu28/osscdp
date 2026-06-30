@@ -16,6 +16,7 @@ import (
 // the phases that introduce them.
 const (
 	TopicEvents                   = "cdp.events"
+	TopicIdentityResolved         = "cdp.identity-resolved"
 	TopicProfileUpdated           = "cdp.profile-updated"
 	TopicSegmentMembershipChanged = "cdp.segment-membership-changed"
 	TopicActivation               = "cdp.activation"

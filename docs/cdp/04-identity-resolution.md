@@ -258,6 +258,23 @@ Identity Resolution should emit:
 }
 ```
 
+## Implementation notes (Phase 5)
+
+- Runs as a dedicated consumer group (`<group>-identity`) on `cdp.events`, separate from the
+  raw-event store consumer. Resolution is one transaction and is idempotent.
+- `value_hash = sha256(tenant_id|namespace|normalized_value)` — tenant-scoped, deterministic. HMAC
+  with a per-tenant secret and `value_encrypted` encryption are deferred to Phase 9; `value_encrypted`
+  is left NULL (the raw value remains recoverable from `raw_event`).
+- `identity_cluster_member` uses `PRIMARY KEY (tenant_id, identity_node_id)` (one active cluster per
+  node) rather than the draft `(tenant_id, cluster_id, identity_node_id)`. This enforces the
+  single-cluster invariant and makes merge a single `UPDATE cluster_id`.
+- `alias.previous_id` is treated as an `anonymous_id` (the dominant case) so it links with `user_id`.
+- `identity_resolved` is published to topic `cdp.identity-resolved` (key `tenant_id|canonical_user_id`)
+  with the original event envelope embedded, so the Phase 6 profile worker needs no second lookup.
+- Concurrency: the relay keys `cdp.events` by `partition_key`, so same-identifier events are
+  partition-serialized; cross-identifier merges are guarded by `SELECT … FOR UPDATE` on the candidate
+  clusters plus the member primary-key backstop.
+
 ## Acceptance criteria
 
 - [ ] Extract identifiers from `track`, `identify`, and `alias` events.
