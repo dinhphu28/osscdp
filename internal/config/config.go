@@ -23,6 +23,9 @@ type Config struct {
 	RelayPollInterval  time.Duration
 	RelayBatchSize     int
 	MaxRetries         int
+
+	ActivationPollInterval time.Duration
+	ActivationBatchSize    int
 }
 
 // Load reads configuration from environment variables, applies defaults, and
@@ -39,6 +42,9 @@ func Load() (Config, error) {
 		RelayPollInterval:  getEnvDuration("RELAY_POLL_INTERVAL", time.Second),
 		RelayBatchSize:     getEnvInt("RELAY_BATCH_SIZE", 100),
 		MaxRetries:         getEnvInt("MAX_RETRIES", 5),
+
+		ActivationPollInterval: getEnvDuration("ACTIVATION_POLL_INTERVAL", 2*time.Second),
+		ActivationBatchSize:    getEnvInt("ACTIVATION_BATCH_SIZE", 50),
 	}
 
 	var missing []string

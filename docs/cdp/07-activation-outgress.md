@@ -266,6 +266,22 @@ Record skipped reason
 
 Never send marketing activation if consent is denied.
 
+## Implementation notes (Phase 8)
+
+- A dedicated consumer group (`<group>-activation`) on `cdp.segment-membership-changed` creates one
+  `activation_task` per active subscription (idempotent on `(tenant_id, idempotency_key)`), snapshotting
+  the payload. A separate **sender loop** (relay-style, `FOR UPDATE SKIP LOCKED`) claims due tasks,
+  sends, and reschedules `next_attempt_at` with exponential backoff (10s→15min, max 5).
+- Webhook responses classify as success (2xx), retryable (408/429/5xx + network/timeout), or permanent
+  (other 4xx). Each attempt writes an `activation_delivery` row. Webhooks send `Idempotency-Key`,
+  `X-CDP-Tenant-Id`, `X-CDP-Event-Id`, `X-CDP-Destination-Id` headers.
+- Kafka destinations produce the payload to the configured `config.topic`.
+- Disabling a destination (status) stops new tasks (the subscription join requires both active).
+- **Deferred to Phase 9:** the consent gate (`customer_consent` + skip-on-denied), destination-secret
+  encryption, RBAC. Phase 8 stores `config_json`/`secret_ref` as-is and sends without a consent check.
+- Deferred to later: push/email/CRM/ads/warehouse destinations, event-triggered subscriptions,
+  circuit breaker, per-destination `max_retries` override.
+
 ## Acceptance criteria
 
 - [ ] Admin can create webhook destination.
