@@ -29,6 +29,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/profile"
 	"github.com/dinhphu28/osscdp/internal/rawevent"
 	"github.com/dinhphu28/osscdp/internal/relay"
+	"github.com/dinhphu28/osscdp/internal/segment"
 )
 
 const eventTopicPartitions = 6
@@ -59,7 +60,7 @@ func run() error {
 	}
 	defer pool.Close()
 
-	if err := bus.EnsureTopics(ctx, cfg.KafkaBrokers, eventTopicPartitions, bus.TopicEvents, bus.TopicIdentityResolved, bus.TopicProfileUpdated); err != nil {
+	if err := bus.EnsureTopics(ctx, cfg.KafkaBrokers, eventTopicPartitions, bus.TopicEvents, bus.TopicIdentityResolved, bus.TopicProfileUpdated, bus.TopicSegmentMembershipChanged); err != nil {
 		return err
 	}
 	logger.Info("topics ensured", "brokers", cfg.KafkaBrokers)
@@ -109,6 +110,17 @@ func run() error {
 	profileConsumer.OnRetry = m.ProcessingRetries.Inc
 	profileHandler := makeProfileHandler(profileSvc)
 
+	// Segmentation: consumes profile_updated, maintains segment membership.
+	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), producer, bus.TopicSegmentMembershipChanged)
+	segmentSvc.OnEvaluated = m.SegmentEvaluated.Inc
+	segmentSvc.OnMatched = m.SegmentMatched.Inc
+	segmentConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-segment", []string{bus.TopicProfileUpdated}, cfg.MaxRetries, logger)
+	if err != nil {
+		return err
+	}
+	segmentConsumer.OnRetry = m.ProcessingRetries.Inc
+	segmentHandler := makeSegmentHandler(segmentSvc)
+
 	metricsSrv := &http.Server{
 		Addr:              cfg.MetricsAddr,
 		Handler:           metricsMux(m),
@@ -116,7 +128,7 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(5)
+	wg.Add(6)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
 	go func() {
 		defer wg.Done()
@@ -134,6 +146,12 @@ func run() error {
 		defer wg.Done()
 		if err := profileConsumer.Run(ctx, profileHandler, deadLetter); err != nil {
 			logger.Error("profile consumer stopped", "error", err.Error())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := segmentConsumer.Run(ctx, segmentHandler, deadLetter); err != nil {
+			logger.Error("segment consumer stopped", "error", err.Error())
 		}
 	}()
 	go func() {
@@ -200,6 +218,17 @@ func makeProfileHandler(svc *profile.Service) bus.Handler {
 			return err
 		}
 		return svc.Update(ctx, ir.CanonicalUserID, ir.IdentityClusterID, ir.Event)
+	}
+}
+
+// makeSegmentHandler unmarshals profile_updated and updates segment membership.
+func makeSegmentHandler(svc *segment.Service) bus.Handler {
+	return func(ctx context.Context, r bus.Record) error {
+		var pu profile.ProfileUpdated
+		if err := json.Unmarshal(r.Value, &pu); err != nil {
+			return err
+		}
+		return svc.Evaluate(ctx, pu)
 	}
 }
 

@@ -246,6 +246,23 @@ When segment count grows:
 - Cache active segment definitions.
 - Evaluate only affected segments based on changed profile fields/event name.
 
+## Implementation notes (Phase 7)
+
+- Runs as a dedicated consumer group (`<group>-segment`) on `cdp.profile-updated`. To evaluate
+  Level-1 `event.*` fields, `profile_updated` now embeds the reason envelope (additive field).
+- Rules are validated (`internal/segment/dsl.go`) on create/edit before activation. Editing a segment
+  creates a new `segment_version` and repoints `segment.current_version_id`; membership records the
+  version that produced it.
+- The evaluator (`internal/segment/eval.go`) supports all v1 operators; field paths resolve over
+  `profile.traits.*`, `profile.computed_attributes.*`, `profile.{canonical_user_id,first_seen_at,
+  last_seen_at}`, and `event.{event_name,type,properties.*,context.*}`. Missing fields are false for
+  comparisons (only `not_exists` is true).
+- Membership transitions emit `segment_membership_changed` to `cdp.segment-membership-changed`
+  (key `tenant_id|canonical_user_id`) only on enter/exit; a re-delivered `profile_updated` converges
+  (idempotent, no duplicate emit). Per-customer updates are serialized by the partition key.
+- Phase 7 evaluates all active segments per event (fine for small segment counts). Admin API and
+  membership are returned raw; RBAC/PII masking are Phase 9.
+
 ## Acceptance criteria
 
 - [ ] Admin can create segment.

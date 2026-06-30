@@ -28,6 +28,9 @@ type ProfileUpdated struct {
 	ChangedFields     []string  `json:"changed_fields"`
 	ProfileVersion    int64     `json:"profile_version"`
 	UpdatedAt         time.Time `json:"updated_at"`
+	// Event is the reason envelope, embedded so the segment worker can evaluate
+	// event.* fields without a second lookup.
+	Event events.Envelope `json:"event"`
 }
 
 // Result summarizes an update. Applied is false on an idempotent no-op.
@@ -145,6 +148,7 @@ func (s *Service) emit(ctx context.Context, canonicalUserID string, clusterID uu
 		ChangedFields:     res.ChangedFields,
 		ProfileVersion:    res.Version,
 		UpdatedAt:         time.Now().UTC(),
+		Event:             env,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
