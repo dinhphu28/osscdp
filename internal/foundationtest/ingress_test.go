@@ -126,7 +126,7 @@ func TestIngestBatch_MixedResults(t *testing.T) {
 	require.NoError(t, err)
 
 	batch := []events.IncomingEvent{
-		{EventID: "e1", Type: events.TypeTrack, UserID: "u1", EventName: "product_viewed"}, // duplicate
+		{EventID: "e1", Type: events.TypeTrack, UserID: "u1", EventName: "product_viewed"},   // duplicate
 		{EventID: "e2", Type: events.TypeTrack, UserID: "u2", EventName: "checkout_started"}, // accepted
 		{EventID: "e3", Type: events.TypeTrack, UserID: "u3"},                                // rejected (no event_name)
 	}

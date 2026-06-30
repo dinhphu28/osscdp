@@ -1,33 +1,173 @@
-// Command cdp-worker is the asynchronous processing worker.
-//
-// Phase 1 is a stub: it boots, establishes structured logging and config, and
-// idles until interrupted. Kafka/Redpanda consumers arrive in Phase 3.
+// Command cdp-worker runs the event pipeline: it relays the outbox to the bus,
+// consumes events into the raw event store, dead-letters poison messages, and
+// exposes Prometheus metrics.
 package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/config"
+	"github.com/dinhphu28/osscdp/internal/dlq"
+	"github.com/dinhphu28/osscdp/internal/events"
+	"github.com/dinhphu28/osscdp/internal/platform/database"
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
+	"github.com/dinhphu28/osscdp/internal/platform/metrics"
+	"github.com/dinhphu28/osscdp/internal/platform/migrate"
+	"github.com/dinhphu28/osscdp/internal/rawevent"
+	"github.com/dinhphu28/osscdp/internal/relay"
 )
 
+const eventTopicPartitions = 6
+
 func main() {
-	cfg, err := config.Load()
-	if err != nil {
-		// No logger yet; write to stderr and exit.
-		println("config error:", err.Error())
+	if err := run(); err != nil {
+		println("fatal:", err.Error())
 		os.Exit(1)
 	}
+}
 
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
 	logger := logging.Component(logging.New(cfg.LogLevel), "cdp-worker")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	logger.Info("worker started", "note", "no consumers yet (Phase 3)")
+	if err := migrate.Up(cfg.DatabaseURL); err != nil {
+		return err
+	}
+	pool, err := database.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	if err := bus.EnsureTopics(ctx, cfg.KafkaBrokers, eventTopicPartitions, bus.TopicEvents); err != nil {
+		return err
+	}
+	logger.Info("topics ensured", "brokers", cfg.KafkaBrokers)
+
+	m := metrics.New()
+
+	producer, err := bus.NewProducer(cfg.KafkaBrokers)
+	if err != nil {
+		return err
+	}
+	defer producer.Close()
+
+	rel := relay.New(pool, producer, bus.TopicEvents, cfg.RelayBatchSize, cfg.RelayPollInterval, logger)
+	rel.OnPublished = m.EventsPublished.Inc
+	rel.OnPublishFail = m.KafkaPublishFailed.Inc
+
+	rawRepo := rawevent.NewRepo(pool)
+	dlqRec := dlq.NewRecorder(pool)
+
+	consumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup, []string{bus.TopicEvents}, cfg.MaxRetries, logger)
+	if err != nil {
+		return err
+	}
+	consumer.OnRetry = m.ProcessingRetries.Inc
+
+	handler := makeHandler(rawRepo, m, logger)
+	deadLetter := makeDeadLetter(dlqRec, m, logger)
+
+	metricsSrv := &http.Server{
+		Addr:              cfg.MetricsAddr,
+		Handler:           metricsMux(m),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); rel.Run(ctx) }()
+	go func() {
+		defer wg.Done()
+		if err := consumer.Run(ctx, handler, deadLetter); err != nil {
+			logger.Error("consumer stopped", "error", err.Error())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		logger.Info("metrics listening", "addr", cfg.MetricsAddr)
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metrics server error", "error", err.Error())
+			stop()
+		}
+	}()
+
+	logger.Info("worker started")
 	<-ctx.Done()
 	logger.Info("worker shutting down")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = metricsSrv.Shutdown(shutdownCtx)
+	wg.Wait()
+	return nil
+}
+
+func metricsMux(m *metrics.Metrics) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", m.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	return mux
+}
+
+// makeHandler stores each consumed event and records lag. A malformed payload
+// returns an error so it is retried and ultimately dead-lettered.
+func makeHandler(repo *rawevent.Repo, m *metrics.Metrics, _ *slog.Logger) bus.Handler {
+	return func(ctx context.Context, r bus.Record) error {
+		var env events.Envelope
+		if err := json.Unmarshal(r.Value, &env); err != nil {
+			return err
+		}
+		if err := repo.Store(ctx, env, r.Value); err != nil {
+			return err
+		}
+		m.EventsConsumed.Inc()
+		m.ProcessingLagSecond.Observe(time.Since(env.ReceivedAt).Seconds())
+		return nil
+	}
+}
+
+func makeDeadLetter(rec *dlq.Recorder, m *metrics.Metrics, logger *slog.Logger) bus.DeadLetter {
+	return func(ctx context.Context, r bus.Record, retries int, cause error) {
+		var tid, sid *uuid.UUID
+		var eventID string
+		var env events.Envelope
+		if json.Unmarshal(r.Value, &env) == nil {
+			t, s := env.TenantID, env.SourceID
+			tid, sid, eventID = &t, &s, env.EventID
+		}
+		entry := dlq.Entry{
+			TenantID:     tid,
+			SourceID:     sid,
+			EventID:      eventID,
+			Component:    "cdp-worker",
+			ErrorCode:    "processing_failed",
+			ErrorMessage: cause.Error(),
+			Payload:      r.Value,
+			RetryCount:   retries,
+			FailedAt:     time.Now().UTC(),
+		}
+		if err := rec.Record(ctx, entry); err != nil {
+			logger.Error("dlq record failed", "error", err.Error())
+		}
+		m.DLQTotal.Inc()
+	}
 }
