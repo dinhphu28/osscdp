@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/dinhphu28/osscdp/internal/activation"
 	"github.com/dinhphu28/osscdp/internal/audit"
 	"github.com/dinhphu28/osscdp/internal/auth"
 	"github.com/dinhphu28/osscdp/internal/bus"
@@ -79,6 +80,7 @@ func run() error {
 	rawHandler := rawevent.NewHandler(rawRepo, rawevent.NewReplayer(rawRepo, producer, bus.TopicEvents, logger))
 	profileHandler := profile.NewHandler(profile.NewRepo(pool))
 	segmentHandler := segment.NewHandler(segment.NewRepo(pool))
+	activationHandler := activation.NewHandler(activation.NewRepo(pool))
 
 	r := httpx.NewRouter(base)
 	httpx.Health(r, pool)
@@ -101,6 +103,12 @@ func run() error {
 		admin.Put("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Update)
 		admin.Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Get)
 		admin.Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/members", segmentHandler.Members)
+		// Activation: destinations, subscriptions, delivery log (Phase 8).
+		admin.Post("/admin/v1/tenants/{tenantID}/destinations", activationHandler.CreateDestination)
+		admin.Put("/admin/v1/tenants/{tenantID}/destinations/{destinationID}", activationHandler.UpdateDestination)
+		admin.Get("/admin/v1/tenants/{tenantID}/destinations/{destinationID}", activationHandler.GetDestination)
+		admin.Post("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions", activationHandler.CreateSubscription)
+		admin.Get("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/deliveries", activationHandler.Deliveries)
 	})
 
 	// Ingress API (API-key guard). Validates, normalizes, and enqueues to the

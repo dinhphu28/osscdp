@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/dinhphu28/osscdp/internal/activation"
 	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/config"
 	"github.com/dinhphu28/osscdp/internal/dlq"
@@ -121,6 +122,24 @@ func run() error {
 	segmentConsumer.OnRetry = m.ProcessingRetries.Inc
 	segmentHandler := makeSegmentHandler(segmentSvc)
 
+	// Activation: consumes segment_membership_changed → creates tasks; a sender
+	// loop delivers them with retry/backoff.
+	activationSvc := activation.NewService(pool, profile.NewRepo(pool))
+	activationConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-activation", []string{bus.TopicSegmentMembershipChanged}, cfg.MaxRetries, logger)
+	if err != nil {
+		return err
+	}
+	activationConsumer.OnRetry = m.ProcessingRetries.Inc
+	activationHandler := makeActivationHandler(activationSvc)
+
+	senders := map[string]activation.Sender{
+		activation.TypeWebhook: activation.NewWebhookSender(),
+		activation.TypeKafka:   activation.NewKafkaSender(producer),
+	}
+	activationRunner := activation.NewRunner(pool, senders, cfg.ActivationBatchSize, cfg.ActivationPollInterval, logger)
+	activationRunner.OnSent = m.ActivationSent.Inc
+	activationRunner.OnFailed = m.ActivationFailed.Inc
+
 	metricsSrv := &http.Server{
 		Addr:              cfg.MetricsAddr,
 		Handler:           metricsMux(m),
@@ -128,8 +147,9 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(6)
+	wg.Add(8)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
+	go func() { defer wg.Done(); activationRunner.Run(ctx) }()
 	go func() {
 		defer wg.Done()
 		if err := consumer.Run(ctx, handler, deadLetter); err != nil {
@@ -152,6 +172,12 @@ func run() error {
 		defer wg.Done()
 		if err := segmentConsumer.Run(ctx, segmentHandler, deadLetter); err != nil {
 			logger.Error("segment consumer stopped", "error", err.Error())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := activationConsumer.Run(ctx, activationHandler, deadLetter); err != nil {
+			logger.Error("activation consumer stopped", "error", err.Error())
 		}
 	}()
 	go func() {
@@ -229,6 +255,17 @@ func makeSegmentHandler(svc *segment.Service) bus.Handler {
 			return err
 		}
 		return svc.Evaluate(ctx, pu)
+	}
+}
+
+// makeActivationHandler unmarshals segment_membership_changed and creates tasks.
+func makeActivationHandler(svc *activation.Service) bus.Handler {
+	return func(ctx context.Context, r bus.Record) error {
+		var mc segment.MembershipChanged
+		if err := json.Unmarshal(r.Value, &mc); err != nil {
+			return err
+		}
+		return svc.OnMembershipChanged(ctx, mc)
 	}
 }
 

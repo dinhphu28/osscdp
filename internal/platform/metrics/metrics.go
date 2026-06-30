@@ -23,6 +23,8 @@ type Metrics struct {
 	ProfileUpdated      prometheus.Counter
 	SegmentEvaluated    prometheus.Counter
 	SegmentMatched      prometheus.Counter
+	ActivationSent      prometheus.Counter
+	ActivationFailed    prometheus.Counter
 }
 
 // New constructs and registers the collectors.
@@ -65,10 +67,16 @@ func New() *Metrics {
 		SegmentMatched: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "segment_matched_total", Help: "Segment rule evaluations that matched.",
 		}),
+		ActivationSent: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "activation_sent_total", Help: "Activation deliveries that succeeded.",
+		}),
+		ActivationFailed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "activation_failed_total", Help: "Activation delivery attempts that failed.",
+		}),
 	}
 	reg.MustRegister(m.EventsPublished, m.EventsConsumed, m.ProcessingRetries,
 		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond, m.IdentityResolved, m.IdentityMerge,
-		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched)
+		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.ActivationSent, m.ActivationFailed)
 	return m
 }
 
