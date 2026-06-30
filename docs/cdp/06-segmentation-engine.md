@@ -1,0 +1,260 @@
+# Segmentation Engine
+
+## Purpose
+
+Segmentation answers this question:
+
+```text
+Which customers belong to which audiences?
+```
+
+The segmentation engine evaluates rules against customer profiles and events, then updates segment membership.
+
+## Implementation strategy
+
+Build segmentation in levels.
+
+```text
+Level 1: Stateless segmentation
+Level 2: Profile-attribute segmentation
+Level 3: Stateful behavioral segmentation
+```
+
+Start with Level 1 and Level 2.
+
+Do not start with complex stateful segmentation.
+
+## Level 1 — Stateless segmentation
+
+Stateless segmentation evaluates a rule using:
+
+```text
+current event
+current profile
+segment definition
+```
+
+Example:
+
+```text
+profile.country = "VN"
+AND event.name = "product_viewed"
+AND event.properties.category = "phone"
+```
+
+Good for:
+
+- Real-time triggers.
+- Simple audiences.
+- Campaign targeting.
+- Webhook activation.
+- Push notification activation.
+
+## Level 2 — Profile-attribute segmentation
+
+Profile-attribute segmentation evaluates only profile fields.
+
+Example:
+
+```text
+profile.total_orders > 3
+AND profile.membership_tier = "gold"
+```
+
+Good for:
+
+- Saved audiences.
+- Batch export.
+- Campaign target lists.
+
+## Level 3 — Stateful behavioral segmentation
+
+Stateful segmentation evaluates behavior over time.
+
+Example:
+
+```text
+Viewed product at least 3 times in 7 days
+AND did not purchase within 24 hours
+```
+
+Defer this until the core CDP is stable.
+
+Possible future implementations:
+
+- Kafka Streams.
+- Flink.
+- Custom worker + Redis state.
+- ClickHouse materialized views.
+
+## Segment model
+
+```sql
+segment (
+  id,
+  tenant_id,
+  name,
+  description,
+  status,
+  current_version_id,
+  created_at,
+  updated_at
+)
+
+segment_version (
+  id,
+  tenant_id,
+  segment_id,
+  version,
+  rule_json,
+  status,
+  created_at
+)
+
+segment_membership (
+  tenant_id,
+  segment_id,
+  customer_profile_id,
+  status,
+  entered_at,
+  exited_at,
+  last_evaluated_at,
+  version
+)
+```
+
+## Rule DSL
+
+Use a JSON DSL first. It is easier for UI and AI agents to generate safely.
+
+Example:
+
+```json
+{
+  "operator": "and",
+  "conditions": [
+    {
+      "field": "profile.traits.country",
+      "op": "eq",
+      "value": "VN"
+    },
+    {
+      "field": "event.event_name",
+      "op": "eq",
+      "value": "product_viewed"
+    },
+    {
+      "field": "event.properties.category",
+      "op": "eq",
+      "value": "phone"
+    }
+  ]
+}
+```
+
+## Supported operators for version 1
+
+Comparison:
+
+```text
+eq
+neq
+gt
+gte
+lt
+lte
+contains
+not_contains
+in
+not_in
+exists
+not_exists
+```
+
+Logical:
+
+```text
+and
+or
+not
+```
+
+Temporal operators can be added later:
+
+```text
+within_last
+before
+after
+between
+```
+
+## Evaluation flow
+
+```mermaid
+flowchart TD
+    A[profile_updated event] --> B[Load active segment versions]
+    B --> C[Evaluate rule against profile/event]
+    C --> D{Matched?}
+    D -->|Yes and not member| E[Create membership entered]
+    D -->|Yes and already member| F[Update last_evaluated_at]
+    D -->|No and was member| G[Mark membership exited]
+    D -->|No and not member| H[No-op]
+    E --> I[Emit segment_membership_changed]
+    G --> I
+```
+
+## Segment membership event
+
+```json
+{
+  "event_type": "segment_membership_changed",
+  "tenant_id": "tenant_001",
+  "segment_id": "segment_001",
+  "segment_version_id": "segment_version_003",
+  "customer_profile_id": "profile_001",
+  "change": "entered",
+  "reason_event_id": "evt_001",
+  "changed_at": "2026-06-30T03:00:04Z"
+}
+```
+
+Possible changes:
+
+```text
+entered
+exited
+updated
+```
+
+## Segment versioning
+
+Rules:
+
+- Editing a segment creates a new segment version.
+- Membership should record the segment version that produced it.
+- Old segment versions should be kept for audit.
+- Activation should use the current active segment version unless configured otherwise.
+
+## Performance considerations
+
+Version 1 can load active segments and evaluate them in memory if the number of segments is small.
+
+When segment count grows:
+
+- Index segments by referenced fields.
+- Precompile segment rules.
+- Cache active segment definitions.
+- Evaluate only affected segments based on changed profile fields/event name.
+
+## Acceptance criteria
+
+- [ ] Admin can create segment.
+- [ ] Segment rules are versioned.
+- [ ] Rule JSON is validated before activation.
+- [ ] Evaluator supports version 1 operators.
+- [ ] Profile/event can be evaluated against active segments.
+- [ ] Segment membership is created on match.
+- [ ] Segment membership exits when rule no longer matches.
+- [ ] `segment_membership_changed` event is emitted.
+- [ ] Evaluation is idempotent.
+- [ ] Tests cover all operators.
