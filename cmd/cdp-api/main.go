@@ -21,6 +21,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/platform/httpx"
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
 	"github.com/dinhphu28/osscdp/internal/platform/migrate"
+	"github.com/dinhphu28/osscdp/internal/profile"
 	"github.com/dinhphu28/osscdp/internal/rawevent"
 	"github.com/dinhphu28/osscdp/internal/source"
 	"github.com/dinhphu28/osscdp/internal/tenant"
@@ -75,6 +76,7 @@ func run() error {
 	defer producer.Close()
 	rawRepo := rawevent.NewRepo(pool)
 	rawHandler := rawevent.NewHandler(rawRepo, rawevent.NewReplayer(rawRepo, producer, bus.TopicEvents, logger))
+	profileHandler := profile.NewHandler(profile.NewRepo(pool))
 
 	r := httpx.NewRouter(base)
 	httpx.Health(r, pool)
@@ -89,6 +91,9 @@ func run() error {
 		admin.Get("/admin/v1/tenants/{tenantID}/events/{eventID}", rawHandler.Get)
 		admin.Post("/admin/v1/tenants/{tenantID}/events/{eventID}/replay", rawHandler.ReplayOne)
 		admin.Post("/admin/v1/tenants/{tenantID}/replay", rawHandler.ReplayByIdentifier)
+		// Customer profile query (Phase 6).
+		admin.Get("/admin/v1/tenants/{tenantID}/profiles", profileHandler.List)
+		admin.Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}", profileHandler.Get)
 	})
 
 	// Ingress API (API-key guard). Validates, normalizes, and enqueues to the

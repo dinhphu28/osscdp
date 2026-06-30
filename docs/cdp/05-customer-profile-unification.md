@@ -200,6 +200,24 @@ Version 1 can implement manual rebuild for one customer.
 
 Future version can support bulk replay.
 
+## Implementation notes (Phase 6)
+
+- Runs as a dedicated consumer group (`<group>-profile`) on `cdp.identity-resolved`. The
+  `identity_resolved` event embeds the original envelope, so no second lookup is needed.
+- Concurrency uses a pessimistic row lock (`SELECT … FOR UPDATE` on the profile) plus the
+  partition-keyed `identity_resolved` topic (`tenant_id|canonical_user_id`), which serializes
+  per-customer updates. The `version` column is still bumped for the event/history (a belt-and-suspenders
+  optimistic check is applied on update).
+- Idempotency by `event_id` is enforced by `customer_profile_history` with
+  `UNIQUE (tenant_id, customer_profile_id, event_id)`; that table doubles as the change log
+  (before/after JSON). A re-delivered event is a no-op (no double-count, no re-emit).
+- `first_seen_at`/`last_seen_at` are profile columns; `total_events`, `total_orders`,
+  `last_event_name`, `last_source_id`, `last_page_url`, `last_product_viewed`, `last_order_at` live in
+  `computed_attributes_json`. Merge policy is in code (`internal/profile/merge.go`).
+- `profile_updated` is published to `cdp.profile-updated` (key `tenant_id|canonical_user_id`).
+- The profile query API returns traits as-is to admins; field-level PII masking and RBAC are Phase 9.
+  "verified" trait semantics are deferred (all values treated as latest-non-empty-wins).
+
 ## Acceptance criteria
 
 - [ ] Create profile from first resolved event.
