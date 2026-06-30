@@ -101,6 +101,9 @@ conflict-DLQ routing arrives in Phase 3).
 
 ## Raw event
 
+Created in Phase 3. `cdp-worker` writes a row per consumed event, idempotent on
+`(tenant_id, event_id)`, with `processing_status = 'stored'`.
+
 ```sql
 CREATE TABLE raw_event (
     id UUID PRIMARY KEY,
@@ -315,6 +318,10 @@ CREATE TABLE activation_delivery (
 ```
 
 ## DLQ
+
+Created in Phase 3. Implementation note: `tenant_id`/`source_id` are nullable
+(not FK-constrained) because a poison message may fail to parse before its tenant
+is known.
 
 ```sql
 CREATE TABLE dlq_event (

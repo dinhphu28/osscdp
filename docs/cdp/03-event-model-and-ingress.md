@@ -205,10 +205,13 @@ Behavior:
 To make ingress durable and idempotent without a dual-write to the event bus,
 Phase 2 writes each normalized event to an `event_outbox` table in one
 transaction, keyed `UNIQUE (tenant_id, event_id)` (see
-`09-data-model.md`). Ingress returns `202` once the row is committed. A Phase 3
-relay drains `status = 'pending'` rows to the topics below and marks them
-`published`. This keeps the HTTP path fast (no bus round-trip) and guarantees no
-event is lost between accept and publish.
+`09-data-model.md`). Ingress returns `202` once the row is committed. The Phase 3
+relay (in `cdp-worker`) drains `status = 'pending'` rows to `cdp.events` with the
+Kafka key set to `partition_key`, then marks them `published`. This keeps the
+HTTP path fast (no bus round-trip) and guarantees no event is lost between accept
+and publish. `cdp-worker` consumes `cdp.events` and persists each event to
+`raw_event` (idempotent); messages that exhaust retries are written to
+`dlq_event`. Delivery is at-least-once and every side effect is idempotent.
 
 ## Event bus topics
 
