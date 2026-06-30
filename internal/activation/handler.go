@@ -8,23 +8,29 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/dinhphu28/osscdp/internal/crypto"
 	"github.com/dinhphu28/osscdp/internal/platform/httpx"
 	"github.com/dinhphu28/osscdp/pkg/apierror"
 )
 
 // Handler exposes admin destination/subscription/delivery endpoints.
 type Handler struct {
-	repo *Repo
+	repo   *Repo
+	cipher *crypto.Cipher
 }
 
-// NewHandler constructs a Handler.
-func NewHandler(repo *Repo) *Handler { return &Handler{repo: repo} }
+// NewHandler constructs a Handler. cipher encrypts destination secrets at rest.
+func NewHandler(repo *Repo, cipher *crypto.Cipher) *Handler {
+	return &Handler{repo: repo, cipher: cipher}
+}
 
 type createDestinationRequest struct {
-	Type      string          `json:"type"`
-	Name      string          `json:"name"`
-	Config    json.RawMessage `json:"config"`
-	SecretRef string          `json:"secret_ref"`
+	Type    string          `json:"type"`
+	Name    string          `json:"name"`
+	Config  json.RawMessage `json:"config"`
+	Secret  string          `json:"secret"`
+	Channel string          `json:"channel"`
+	Purpose string          `json:"purpose"`
 }
 
 // CreateDestination handles POST /admin/v1/tenants/{tenantID}/destinations.
@@ -46,7 +52,24 @@ func (h *Handler) CreateDestination(w http.ResponseWriter, r *http.Request) {
 		apierror.BadRequest(w, err.Error())
 		return
 	}
-	dest, err := h.repo.CreateDestination(r.Context(), tenantID, req.Type, req.Name, req.Config, req.SecretRef)
+	config, err := mergeConsentTarget(req.Config, req.Channel, req.Purpose)
+	if err != nil {
+		apierror.BadRequest(w, "invalid config JSON")
+		return
+	}
+	secretRef := ""
+	if req.Secret != "" {
+		if h.cipher == nil {
+			apierror.Internal(w)
+			return
+		}
+		secretRef, err = h.cipher.Encrypt(req.Secret)
+		if err != nil {
+			apierror.Internal(w)
+			return
+		}
+	}
+	dest, err := h.repo.CreateDestination(r.Context(), tenantID, req.Type, req.Name, config, secretRef)
 	if errors.Is(err, ErrDuplicateName) {
 		apierror.Conflict(w, "destination name already exists for tenant")
 		return
@@ -56,6 +79,23 @@ func (h *Handler) CreateDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusCreated, dest)
+}
+
+// mergeConsentTarget injects channel/purpose into the config JSON when provided.
+func mergeConsentTarget(config json.RawMessage, channel, purpose string) (json.RawMessage, error) {
+	m := map[string]any{}
+	if len(config) > 0 {
+		if err := json.Unmarshal(config, &m); err != nil {
+			return nil, err
+		}
+	}
+	if channel != "" {
+		m["channel"] = channel
+	}
+	if purpose != "" {
+		m["purpose"] = purpose
+	}
+	return json.Marshal(m)
 }
 
 func validateConfig(typ string, config json.RawMessage) error {

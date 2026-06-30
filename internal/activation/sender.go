@@ -3,6 +3,7 @@ package activation
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/dinhphu28/osscdp/internal/crypto"
 )
 
 // Outcome is the result of a send attempt.
@@ -33,11 +36,12 @@ const defaultWebhookTimeoutMS = 5000
 // WebhookSender posts task payloads over HTTP.
 type WebhookSender struct {
 	client *http.Client
+	cipher *crypto.Cipher // optional; decrypts the destination secret for signing
 }
 
-// NewWebhookSender constructs a WebhookSender.
-func NewWebhookSender() *WebhookSender {
-	return &WebhookSender{client: &http.Client{}}
+// NewWebhookSender constructs a WebhookSender. cipher may be nil (no signing).
+func NewWebhookSender(cipher *crypto.Cipher) *WebhookSender {
+	return &WebhookSender{client: &http.Client{}, cipher: cipher}
 }
 
 // Send posts the payload and classifies the response.
@@ -67,6 +71,9 @@ func (s *WebhookSender) Send(ctx context.Context, dest Destination, task Task) O
 	req.Header.Set("X-CDP-Tenant-Id", task.TenantID.String())
 	req.Header.Set("X-CDP-Event-Id", task.SourceEventID)
 	req.Header.Set("X-CDP-Destination-Id", task.DestinationID.String())
+	if sig := s.signature(dest, task.Payload); sig != "" {
+		req.Header.Set("X-CDP-Signature", sig)
+	}
 	for k, v := range cfg.Headers {
 		req.Header.Set(k, v)
 	}
@@ -90,6 +97,21 @@ func (s *WebhookSender) Send(ctx context.Context, dest Destination, task Task) O
 		out.ErrorMessage = fmt.Sprintf("http %d", resp.StatusCode) // 4xx → permanent
 	}
 	return out
+}
+
+// signature returns "sha256=<hmac>" of the body using the destination's
+// decrypted secret, or "" when no secret/cipher is configured.
+func (s *WebhookSender) signature(dest Destination, body []byte) string {
+	if s.cipher == nil || dest.SecretRef == nil || *dest.SecretRef == "" {
+		return ""
+	}
+	secret, err := s.cipher.Decrypt(*dest.SecretRef)
+	if err != nil {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
 func retryableHTTP(code int) bool {

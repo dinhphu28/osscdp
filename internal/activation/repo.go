@@ -127,17 +127,18 @@ func (r *Repo) ActiveSubscriptionsForSegment(ctx context.Context, tenantID, segm
 	return out, rows.Err()
 }
 
-// CreateTask inserts a pending task idempotently. Returns false if a task with
-// the same idempotency key already exists.
-func (r *Repo) CreateTask(ctx context.Context, t Task) (bool, error) {
+// CreateTask inserts a task idempotently with the given status. Returns false if
+// a task with the same idempotency key already exists. A "skipped" task records a
+// consent denial; it is never claimed by the sender.
+func (r *Repo) CreateTask(ctx context.Context, t Task, status, lastError string) (bool, error) {
 	ct, err := r.pool.Exec(ctx, `
 		INSERT INTO activation_task
 			(id, tenant_id, destination_id, subscription_id, customer_profile_id,
-			 source_event_id, idempotency_key, payload_json, status, attempt_count, next_attempt_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0, now())
+			 source_event_id, idempotency_key, payload_json, status, attempt_count, next_attempt_at, last_error)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0, now(), $10)
 		ON CONFLICT (tenant_id, idempotency_key) DO NOTHING`,
 		uuid.New(), t.TenantID, t.DestinationID, t.SubscriptionID, t.CustomerProfileID,
-		nullString(t.SourceEventID), t.IdempotencyKey, t.Payload, TaskPending)
+		nullString(t.SourceEventID), t.IdempotencyKey, t.Payload, status, nullString(lastError))
 	if err != nil {
 		return false, fmt.Errorf("insert task: %w", err)
 	}

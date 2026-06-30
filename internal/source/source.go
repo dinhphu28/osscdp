@@ -71,6 +71,18 @@ func (r *Repository) Insert(ctx context.Context, s Source, apiKeyHash string) er
 	return nil
 }
 
+// UpdateAPIKeyHash sets a new API key hash for a source. Returns false if the
+// source does not exist for the tenant.
+func (r *Repository) UpdateAPIKeyHash(ctx context.Context, tenantID, sourceID uuid.UUID, apiKeyHash string) (bool, error) {
+	ct, err := r.pool.Exec(ctx,
+		`UPDATE source SET api_key_hash=$3, updated_at=now() WHERE tenant_id=$1 AND id=$2`,
+		tenantID, sourceID, apiKeyHash)
+	if err != nil {
+		return false, fmt.Errorf("update api key hash: %w", err)
+	}
+	return ct.RowsAffected() == 1, nil
+}
+
 // FindByAPIKeyHash resolves the source that owns the given key hash. Only active
 // sources are returned. The lookup is global-by-hash but each hash maps to
 // exactly one (tenant, source) row, so tenant scope is preserved by the result.
@@ -148,4 +160,30 @@ func (s *Service) Authenticate(ctx context.Context, plaintext string) (Source, e
 		return Source{}, ErrNotFound
 	}
 	return s.repo.FindByAPIKeyHash(ctx, HashAPIKey(plaintext))
+}
+
+// RotateKey generates a new API key for a source, invalidating the old one
+// immediately, and audits the rotation. Returns the new plaintext key once.
+func (s *Service) RotateKey(ctx context.Context, tenantID, sourceID uuid.UUID) (string, error) {
+	plaintext, hash, err := GenerateAPIKey()
+	if err != nil {
+		return "", err
+	}
+	found, err := s.repo.UpdateAPIKeyHash(ctx, tenantID, sourceID, hash)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", ErrNotFound
+	}
+	if err := s.audit.Record(ctx, audit.Entry{
+		TenantID:     &tenantID,
+		ActorType:    audit.ActorAdmin,
+		Action:       "rotate_key",
+		ResourceType: "source",
+		ResourceID:   sourceID.String(),
+	}); err != nil {
+		return "", fmt.Errorf("audit rotate key: %w", err)
+	}
+	return plaintext, nil
 }
