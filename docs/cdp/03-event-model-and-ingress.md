@@ -265,6 +265,23 @@ Purpose:
 - Analytics.
 - Profile rebuild.
 
+### Query + replay admin API (Phase 4)
+
+The `raw_event` store is reachable through admin-token-guarded endpoints on
+`cdp-api`:
+
+```http
+GET  /admin/v1/tenants/{tenantID}/events/{eventID}
+GET  /admin/v1/tenants/{tenantID}/events?identifier_key=&event_name=&limit=&cursor=
+POST /admin/v1/tenants/{tenantID}/events/{eventID}/replay
+POST /admin/v1/tenants/{tenantID}/replay?identifier_key=&max=
+```
+
+List uses keyset pagination (`received_at, id`) and returns `next_cursor`.
+Replay republishes the stored payload to `cdp.events` with the original
+`partition_key`; re-consumption is idempotent. Payloads are returned to admins
+as-is; field-level PII masking and RBAC arrive in Phase 9.
+
 Minimum fields:
 
 ```text
