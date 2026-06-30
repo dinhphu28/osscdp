@@ -26,6 +26,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
 	"github.com/dinhphu28/osscdp/internal/platform/metrics"
 	"github.com/dinhphu28/osscdp/internal/platform/migrate"
+	"github.com/dinhphu28/osscdp/internal/profile"
 	"github.com/dinhphu28/osscdp/internal/rawevent"
 	"github.com/dinhphu28/osscdp/internal/relay"
 )
@@ -58,7 +59,7 @@ func run() error {
 	}
 	defer pool.Close()
 
-	if err := bus.EnsureTopics(ctx, cfg.KafkaBrokers, eventTopicPartitions, bus.TopicEvents, bus.TopicIdentityResolved); err != nil {
+	if err := bus.EnsureTopics(ctx, cfg.KafkaBrokers, eventTopicPartitions, bus.TopicEvents, bus.TopicIdentityResolved, bus.TopicProfileUpdated); err != nil {
 		return err
 	}
 	logger.Info("topics ensured", "brokers", cfg.KafkaBrokers)
@@ -98,6 +99,16 @@ func run() error {
 	identityConsumer.OnRetry = m.ProcessingRetries.Inc
 	identityHandler := makeIdentityHandler(identitySvc)
 
+	// Profile unification: consumes identity_resolved, builds customer profiles.
+	profileSvc := profile.NewService(pool, producer, bus.TopicProfileUpdated)
+	profileSvc.OnUpdated = m.ProfileUpdated.Inc
+	profileConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-profile", []string{bus.TopicIdentityResolved}, cfg.MaxRetries, logger)
+	if err != nil {
+		return err
+	}
+	profileConsumer.OnRetry = m.ProcessingRetries.Inc
+	profileHandler := makeProfileHandler(profileSvc)
+
 	metricsSrv := &http.Server{
 		Addr:              cfg.MetricsAddr,
 		Handler:           metricsMux(m),
@@ -105,7 +116,7 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
 	go func() {
 		defer wg.Done()
@@ -117,6 +128,12 @@ func run() error {
 		defer wg.Done()
 		if err := identityConsumer.Run(ctx, identityHandler, deadLetter); err != nil {
 			logger.Error("identity consumer stopped", "error", err.Error())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := profileConsumer.Run(ctx, profileHandler, deadLetter); err != nil {
+			logger.Error("profile consumer stopped", "error", err.Error())
 		}
 	}()
 	go func() {
@@ -172,6 +189,17 @@ func makeIdentityHandler(svc *identity.Service) bus.Handler {
 			return err
 		}
 		return svc.Resolve(ctx, env)
+	}
+}
+
+// makeProfileHandler unmarshals identity_resolved and updates the customer profile.
+func makeProfileHandler(svc *profile.Service) bus.Handler {
+	return func(ctx context.Context, r bus.Record) error {
+		var ir identity.IdentityResolved
+		if err := json.Unmarshal(r.Value, &ir); err != nil {
+			return err
+		}
+		return svc.Update(ctx, ir.CanonicalUserID, ir.IdentityClusterID, ir.Event)
 	}
 }
 
