@@ -14,12 +14,14 @@ import (
 
 	"github.com/dinhphu28/osscdp/internal/audit"
 	"github.com/dinhphu28/osscdp/internal/auth"
+	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/config"
 	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/platform/database"
 	"github.com/dinhphu28/osscdp/internal/platform/httpx"
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
 	"github.com/dinhphu28/osscdp/internal/platform/migrate"
+	"github.com/dinhphu28/osscdp/internal/rawevent"
 	"github.com/dinhphu28/osscdp/internal/source"
 	"github.com/dinhphu28/osscdp/internal/tenant"
 )
@@ -64,6 +66,16 @@ func run() error {
 	sourceHandler := source.NewHandler(sourceSvc)
 	eventsHandler := events.NewHandler(events.NewService(events.NewRepository(pool)))
 
+	// Producer for replay (franz-go dials lazily, so cdp-api still starts if the
+	// bus is down — only replay fails in that case).
+	producer, err := bus.NewProducer(cfg.KafkaBrokers)
+	if err != nil {
+		return err
+	}
+	defer producer.Close()
+	rawRepo := rawevent.NewRepo(pool)
+	rawHandler := rawevent.NewHandler(rawRepo, rawevent.NewReplayer(rawRepo, producer, bus.TopicEvents, logger))
+
 	r := httpx.NewRouter(base)
 	httpx.Health(r, pool)
 
@@ -72,6 +84,11 @@ func run() error {
 		admin.Use(auth.AdminToken(cfg.AdminAPIToken))
 		admin.Post("/admin/v1/tenants", tenantHandler.Create)
 		admin.Post("/admin/v1/tenants/{tenantID}/sources", sourceHandler.Create)
+		// Raw event query + replay (Phase 4).
+		admin.Get("/admin/v1/tenants/{tenantID}/events", rawHandler.List)
+		admin.Get("/admin/v1/tenants/{tenantID}/events/{eventID}", rawHandler.Get)
+		admin.Post("/admin/v1/tenants/{tenantID}/events/{eventID}/replay", rawHandler.ReplayOne)
+		admin.Post("/admin/v1/tenants/{tenantID}/replay", rawHandler.ReplayByIdentifier)
 	})
 
 	// Ingress API (API-key guard). Validates, normalizes, and enqueues to the
