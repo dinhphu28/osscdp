@@ -45,6 +45,7 @@ flowchart LR
 | `11-ai-agent-instructions.md` | Rules and context for AI agents working inside this repository. |
 | `12-testing-and-release-checklist.md` | Testing strategy, CI/CD gates, and production release checklist. |
 | `13-operations.md` | Operations runbook: running the full stack, observability, load test, backup/restore, failure tests. |
+| `14-usage.md` | How-to usage guide: start the stack, auth, send events, segments, destinations, governance, DLQ — with `curl` examples. |
 
 ## Design principles
 
