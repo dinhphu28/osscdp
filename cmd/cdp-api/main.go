@@ -25,6 +25,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/platform/database"
 	"github.com/dinhphu28/osscdp/internal/platform/httpx"
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
+	"github.com/dinhphu28/osscdp/internal/platform/metrics"
 	"github.com/dinhphu28/osscdp/internal/platform/migrate"
 	"github.com/dinhphu28/osscdp/internal/profile"
 	"github.com/dinhphu28/osscdp/internal/ratelimit"
@@ -78,7 +79,11 @@ func run() error {
 	sourceSvc := source.NewService(source.NewRepository(pool), recorder)
 	tenantHandler := tenant.NewHandler(tenantSvc)
 	sourceHandler := source.NewHandler(sourceSvc)
+	m := metrics.New()
 	eventsHandler := events.NewHandler(events.NewService(events.NewRepository(pool)))
+	eventsHandler.OnReceived = m.EventsReceived.Inc
+	eventsHandler.OnAccepted = m.EventsValidated.Inc
+	eventsHandler.OnRejected = m.EventsRejected.Inc
 
 	// Producer for replay (franz-go dials lazily, so cdp-api still starts if the
 	// bus is down — only replay fails in that case).
@@ -99,9 +104,11 @@ func run() error {
 	dlqRepo := dlq.NewRepo(pool)
 	dlqHandler := dlq.NewHandler(dlqRepo, dlq.NewRetrier(dlqRepo, producer, bus.TopicEvents), recorder)
 	limiter := ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst)
+	limiter.OnLimited = m.EventsRateLimited.Inc
 
 	r := httpx.NewRouter(base)
 	httpx.Health(r, pool)
+	r.Handle("/metrics", m.Handler())
 
 	// Admin API: authenticate (static token = SUPER_ADMIN, else admin_token) then
 	// authorize per-route by permission + tenant scope (RBAC, Phase 9b).

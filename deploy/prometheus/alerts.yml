@@ -1,0 +1,46 @@
+groups:
+  - name: cdp
+    rules:
+      - alert: HighValidationFailureRate
+        expr: |
+          rate(events_rejected_total[5m])
+            / clamp_min(rate(events_received_total[5m]), 0.001) > 0.2
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Ingress validation failure rate >20%"
+
+      - alert: DLQGrowing
+        expr: increase(dlq_total[10m]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Events are being dead-lettered"
+
+      - alert: KafkaPublishFailing
+        expr: increase(kafka_publish_failed_total[5m]) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Outbox relay cannot publish to the bus"
+
+      - alert: HighProcessingLag
+        expr: histogram_quantile(0.95, rate(processing_lag_seconds_bucket[5m])) > 60
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 worker processing lag >60s"
+
+      - alert: ActivationFailures
+        expr: increase(activation_failed_total[10m]) > 10
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Activation delivery failures climbing"
+
+      - alert: CircuitBreakerOpen
+        expr: increase(activation_circuit_open_total[5m]) > 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "A destination circuit breaker is open"

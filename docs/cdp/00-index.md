@@ -44,6 +44,7 @@ flowchart LR
 | `10-implementation-roadmap.md` | Recommended build order from foundation to production hardening. |
 | `11-ai-agent-instructions.md` | Rules and context for AI agents working inside this repository. |
 | `12-testing-and-release-checklist.md` | Testing strategy, CI/CD gates, and production release checklist. |
+| `13-operations.md` | Operations runbook: running the full stack, observability, load test, backup/restore, failure tests. |
 
 ## Design principles
 

@@ -1,0 +1,10 @@
+# Minimal local config: all alerts go to a null receiver (visible in the
+# Alertmanager UI). Wire PagerDuty/Slack receivers for production.
+route:
+  receiver: "null"
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: "null"

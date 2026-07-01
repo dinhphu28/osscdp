@@ -1,4 +1,5 @@
-.PHONY: up down migrate-up migrate-down run-api run-worker test tidy build
+.PHONY: up down migrate-up migrate-down run-api run-worker test tidy build \
+	stack-up stack-down loadtest backup restore promtool
 
 # Load .env into the environment for app/migrate targets.
 ifneq (,$(wildcard .env))
@@ -34,3 +35,24 @@ test: ## Run all tests
 
 tidy: ## Tidy modules
 	go mod tidy
+
+stack-up: ## Start the full stack (apps + Postgres + Redpanda + Prometheus + Grafana + Alertmanager)
+	$(COMPOSE) --profile full up -d --build
+
+stack-down: ## Stop the full stack
+	$(COMPOSE) --profile full down
+
+loadtest: ## Run the k6 ingress load test (API_KEY=... [API_URL=http://localhost:18080])
+	docker run --rm -i --network host \
+		-e API_URL=$(or $(API_URL),http://localhost:18080) -e API_KEY=$(API_KEY) \
+		grafana/k6 run - < loadtest/track.js
+
+backup: ## pg_dump the database to ./backups
+	./scripts/backup.sh
+
+restore: ## Restore a dump into a scratch DB: make restore FILE=backups/cdp-....dump
+	./scripts/restore.sh $(FILE)
+
+promtool: ## Validate Prometheus alert rules
+	docker run --rm --entrypoint promtool -v $(PWD)/deploy/prometheus:/etc/prometheus \
+		prom/prometheus:v2.54.1 check rules /etc/prometheus/alerts.yml
