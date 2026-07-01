@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
@@ -26,8 +27,18 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 
 // NewRouter builds a chi router with request ID, panic recovery, and a JSON
 // access log that carries the request_id into the request context.
-func NewRouter(logger *slog.Logger) *chi.Mux {
+// NewRouter builds a chi router with CORS, request ID, panic recovery, and a
+// JSON access log. allowedOrigins is the CORS allowlist; pass nil or empty to
+// block all cross-origin browser requests.
+func NewRouter(logger *slog.Logger, allowedOrigins []string) *chi.Mux {
 	r := chi.NewRouter()
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   allowedOrigins,
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Api-Key"},
+		AllowCredentials: false,
+		MaxAge:           300,
+	}))
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 	r.Use(accessLog(logger))

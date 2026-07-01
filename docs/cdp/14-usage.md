@@ -3,7 +3,10 @@
 A task-oriented walkthrough of the CDP: start it, authenticate, send events, and drive the full flow
 through to a signed webhook delivery. Commands are copy-pasteable `curl`.
 
-For architecture see `01-architecture-overview.md`; for operations see `13-operations.md`.
+For architecture see `01-architecture-overview.md`; for operations see `13-operations.md`. For the
+full API reference, open **`/docs`** (interactive Redoc) on a running cdp-api, or read the OpenAPI
+spec at [`api/openapi.yaml`](../../api/openapi.yaml) (served at `/openapi.yaml`; usable with
+`openapi-generator` to produce client SDKs).
 
 ## 0. Concepts & mental model
 

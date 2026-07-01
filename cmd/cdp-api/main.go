@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	apidocs "github.com/dinhphu28/osscdp/api"
 	"github.com/dinhphu28/osscdp/internal/activation"
 	"github.com/dinhphu28/osscdp/internal/audit"
 	"github.com/dinhphu28/osscdp/internal/auth"
@@ -106,9 +107,12 @@ func run() error {
 	limiter := ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst)
 	limiter.OnLimited = m.EventsRateLimited.Inc
 
-	r := httpx.NewRouter(base)
+	r := httpx.NewRouter(base, cfg.CORSAllowedOrigins)
 	httpx.Health(r, pool)
 	r.Handle("/metrics", m.Handler())
+	// OpenAPI spec + Redoc viewer (unauthenticated).
+	r.Get("/openapi.yaml", apidocs.SpecHandler())
+	r.Get("/docs", apidocs.DocsHandler())
 
 	// Admin API: authenticate (static token = SUPER_ADMIN, else admin_token) then
 	// authorize per-route by permission + tenant scope (RBAC, Phase 9b).

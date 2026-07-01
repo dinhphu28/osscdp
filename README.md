@@ -20,6 +20,10 @@ make test                 # unit + integration (testcontainers)
 examples.** Operations: [docs/cdp/13-operations.md](docs/cdp/13-operations.md). Design:
 [docs/cdp/00-index.md](docs/cdp/00-index.md).
 
+**API reference:** interactive docs at `http://localhost:18080/docs` (Redoc); the OpenAPI 3 spec is
+[`api/openapi.yaml`](api/openapi.yaml) (also served at `/openapi.yaml` — generate client SDKs from it
+with `openapi-generator`).
+
 ## Documentation Pack
 
 Copy the `docs/cdp` directory into your repository.
