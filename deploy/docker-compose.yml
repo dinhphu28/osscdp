@@ -1,6 +1,9 @@
-# Local development stack for Phase 1.
-# Postgres backs all CDP state. Redpanda is included for infra parity with the
-# documented architecture; the app does not connect to it until Phase 3.
+# Local stack. Infra (postgres, redpanda) runs by default for host `go run` dev.
+# The `full` profile additionally runs the apps + observability in containers:
+#   docker compose --profile full up --build
+#
+# Redpanda advertises two listeners: localhost:9092 for host clients and
+# redpanda:29092 for in-compose services.
 
 services:
   postgres:
@@ -30,8 +33,8 @@ services:
       - --reserve-memory=0M
       - --node-id=0
       - --check=false
-      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+      - --kafka-addr=EXTERNAL://0.0.0.0:9092,INTERNAL://0.0.0.0:29092
+      - --advertise-kafka-addr=EXTERNAL://localhost:9092,INTERNAL://redpanda:29092
     ports:
       - "9092:9092"
     healthcheck:
@@ -39,6 +42,66 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  cdp-api:
+    profiles: ["full"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["/usr/local/bin/cdp-api"]
+    env_file: ../.env
+    environment:
+      DATABASE_URL: postgres://cdp:cdp@postgres:5432/cdp?sslmode=disable
+      KAFKA_BROKERS: redpanda:29092
+      HTTP_ADDR: ":8080"
+      METRICS_ADDR: ":9100"
+    ports:
+      - "18080:8080"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redpanda: {condition: service_healthy}
+
+  cdp-worker:
+    profiles: ["full"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["/usr/local/bin/cdp-worker"]
+    env_file: ../.env
+    environment:
+      DATABASE_URL: postgres://cdp:cdp@postgres:5432/cdp?sslmode=disable
+      KAFKA_BROKERS: redpanda:29092
+      METRICS_ADDR: ":9100"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redpanda: {condition: service_healthy}
+
+  prometheus:
+    profiles: ["full"]
+    build:
+      context: ./prometheus
+    ports:
+      - "9090:9090"
+    depends_on: [cdp-api, cdp-worker]
+
+  alertmanager:
+    profiles: ["full"]
+    build:
+      context: ./alertmanager
+    ports:
+      - "9093:9093"
+
+  grafana:
+    profiles: ["full"]
+    build:
+      context: ./grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
 
 volumes:
   pgdata:

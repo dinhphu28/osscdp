@@ -21,6 +21,9 @@ type Limiter struct {
 
 	mu      sync.Mutex
 	buckets map[string]*rate.Limiter
+
+	// OnLimited is a metric hook (nil-safe), called when a request is throttled.
+	OnLimited func()
 }
 
 // New constructs a Limiter with the given steady-state rate and burst.
@@ -50,6 +53,9 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 			return
 		}
 		if !l.allow(sourceID.String()) {
+			if l.OnLimited != nil {
+				l.OnLimited()
+			}
 			w.Header().Set("Retry-After", strconv.Itoa(1))
 			apierror.TooManyRequests(w, "rate limit exceeded for source")
 			return

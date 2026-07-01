@@ -27,6 +27,12 @@ type Metrics struct {
 	ActivationFailed      prometheus.Counter
 	ActivationSkipped     prometheus.Counter
 	ActivationCircuitOpen prometheus.Counter
+
+	// Ingress (cdp-api).
+	EventsReceived    prometheus.Counter
+	EventsValidated   prometheus.Counter
+	EventsRejected    prometheus.Counter
+	EventsRateLimited prometheus.Counter
 }
 
 // New constructs and registers the collectors.
@@ -81,11 +87,24 @@ func New() *Metrics {
 		ActivationCircuitOpen: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "activation_circuit_open_total", Help: "Activation sends deferred by an open circuit breaker.",
 		}),
+		EventsReceived: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "events_received_total", Help: "Events received by ingress.",
+		}),
+		EventsValidated: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "events_validated_total", Help: "Events accepted (valid) by ingress.",
+		}),
+		EventsRejected: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "events_rejected_total", Help: "Events rejected by ingress validation.",
+		}),
+		EventsRateLimited: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "events_rate_limited_total", Help: "Ingress requests rejected by rate limiting.",
+		}),
 	}
 	reg.MustRegister(m.EventsPublished, m.EventsConsumed, m.ProcessingRetries,
 		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond, m.IdentityResolved, m.IdentityMerge,
 		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.ActivationSent, m.ActivationFailed,
-		m.ActivationSkipped, m.ActivationCircuitOpen)
+		m.ActivationSkipped, m.ActivationCircuitOpen,
+		m.EventsReceived, m.EventsValidated, m.EventsRejected, m.EventsRateLimited)
 	return m
 }
 

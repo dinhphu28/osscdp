@@ -1,0 +1,70 @@
+{
+  "uid": "cdp-overview",
+  "title": "CDP Overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {"from": "now-15m", "to": "now"},
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Ingress (rate/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(events_received_total[1m])", "legendFormat": "received"},
+        {"refId": "B", "expr": "rate(events_validated_total[1m])", "legendFormat": "validated"},
+        {"refId": "C", "expr": "rate(events_rejected_total[1m])", "legendFormat": "rejected"},
+        {"refId": "D", "expr": "rate(events_rate_limited_total[1m])", "legendFormat": "rate_limited"}
+      ]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Pipeline throughput (rate/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(events_published_total[1m])", "legendFormat": "published"},
+        {"refId": "B", "expr": "rate(events_consumed_total[1m])", "legendFormat": "consumed"}
+      ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Processing lag p95 (s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, rate(processing_lag_seconds_bucket[5m]))", "legendFormat": "p95"}
+      ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "DLQ & retries (rate/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(dlq_total[1m])", "legendFormat": "dlq"},
+        {"refId": "B", "expr": "rate(processing_retries_total[1m])", "legendFormat": "retries"},
+        {"refId": "C", "expr": "rate(kafka_publish_failed_total[1m])", "legendFormat": "publish_failed"}
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Identity / Profile / Segment (rate/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(identity_resolved_total[1m])", "legendFormat": "identity_resolved"},
+        {"refId": "B", "expr": "rate(identity_merge_total[1m])", "legendFormat": "identity_merge"},
+        {"refId": "C", "expr": "rate(profile_updated_total[1m])", "legendFormat": "profile_updated"},
+        {"refId": "D", "expr": "rate(segment_matched_total[1m])", "legendFormat": "segment_matched"}
+      ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Activation (rate/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(activation_sent_total[1m])", "legendFormat": "sent"},
+        {"refId": "B", "expr": "rate(activation_failed_total[1m])", "legendFormat": "failed"},
+        {"refId": "C", "expr": "rate(activation_skipped_total[1m])", "legendFormat": "skipped(consent)"},
+        {"refId": "D", "expr": "rate(activation_circuit_open_total[1m])", "legendFormat": "circuit_open"}
+      ]
+    }
+  ]
+}

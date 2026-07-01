@@ -17,11 +17,28 @@ import (
 // Handler exposes the ingress endpoints.
 type Handler struct {
 	svc *Service
+
+	// Metric hooks (nil-safe).
+	OnReceived func()
+	OnAccepted func()
+	OnRejected func()
 }
 
 // NewHandler constructs a Handler.
 func NewHandler(svc *Service) *Handler {
 	return &Handler{svc: svc}
+}
+
+func call(fn func()) {
+	if fn != nil {
+		fn()
+	}
+}
+
+func callN(fn func(), n int) {
+	for i := 0; i < n; i++ {
+		call(fn)
+	}
 }
 
 // Track handles POST /v1/events/track.
@@ -41,16 +58,19 @@ func (h *Handler) ingestSingle(w http.ResponseWriter, r *http.Request, forcedTyp
 		apierror.Unauthorized(w, "missing authenticated source")
 		return
 	}
+	call(h.OnReceived)
 	r.Body = http.MaxBytesReader(w, r.Body, MaxEventBytes)
 
 	var in IncomingEvent
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		call(h.OnRejected)
 		writeDecodeError(w, err, "event exceeds size limit")
 		return
 	}
 
 	res, err := h.svc.Ingest(r.Context(), in, tenantID, sourceID, forcedType)
 	if err != nil {
+		call(h.OnRejected)
 		var ve *ValidationError
 		switch {
 		case errors.As(err, &ve):
@@ -63,6 +83,7 @@ func (h *Handler) ingestSingle(w http.ResponseWriter, r *http.Request, forcedTyp
 		return
 	}
 
+	call(h.OnAccepted)
 	logging.AddFields(r.Context(), slog.String("event_id", res.EventID))
 	httpx.WriteJSON(w, http.StatusAccepted, res)
 }
@@ -91,6 +112,9 @@ func (h *Handler) Batch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := h.svc.IngestBatch(r.Context(), req.Events, tenantID, sourceID)
+	callN(h.OnReceived, len(req.Events))
+	callN(h.OnAccepted, result.Accepted+result.Duplicate)
+	callN(h.OnRejected, result.Rejected)
 	httpx.WriteJSON(w, http.StatusAccepted, result)
 }
 
