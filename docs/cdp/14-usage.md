@@ -5,6 +5,98 @@ through to a signed webhook delivery. Commands are copy-pasteable `curl`.
 
 For architecture see `01-architecture-overview.md`; for operations see `13-operations.md`.
 
+## 0. Concepts & mental model
+
+Read this first — it's the model everything else assumes.
+
+**Core objects**
+- **Tenant** — the isolation boundary. Every object, query, and token is scoped to one tenant; nothing
+  crosses tenants.
+- **Source** — an authenticated origin of events (e.g. your web backend), with an **ingest API key**.
+- **Event** — `track` (a behavior; needs `event_name`), `identify` (attach traits like email/name),
+  `alias` (link two IDs), `batch` (many at once).
+- **Identity → `canonical_user_id`** — you send messy identifiers (`user_id`, `anonymous_id`, `email`…);
+  the CDP resolves them into one identity cluster with a stable `canonical_user_id` (`customer_…`) — the
+  real customer key that survives email/phone changes.
+- **Profile** — the unified customer: merged **traits** + **computed attributes** (`total_events`,
+  `total_orders`, `last_product_viewed`, …).
+- **Segment** — an audience defined by a JSON rule over `profile.*` / `event.*`; membership updates in
+  real time.
+- **Destination + subscription** — where a segment change is delivered (webhook or Kafka).
+- **Consent** — activation is skipped when consent is `denied` for the destination's channel/purpose.
+
+**Two kinds of auth (don't mix them)**
+- **Source API key** (`cdp_…`) → send events (`/v1/*`).
+- **Admin token** → manage everything (`/admin/*`). The static `ADMIN_API_TOKEN` is the bootstrap
+  `SUPER_ADMIN`; from it you mint role-scoped tokens (VIEWER, MARKETER, TENANT_ADMIN, …), each limited by
+  permission and tenant.
+
+**It is asynchronous.** Ingest returns `202` immediately and tells you nothing about the customer —
+identity → profile → segmentation → activation happen in the background (seconds later). After sending
+an event, **wait, then query**; don't expect an instant profile or membership. This keeps ingress fast
+and durable.
+
+**Rules that bite if you forget them**
+- `tenant_id`/`source_id` come from the API key — values in the request body are ignored.
+- **Idempotent by `event_id`**: same id + same payload → `duplicate`; same id + different payload →
+  `409`. Omit `event_id` and the server generates one. Retries are safe.
+- **Limits:** 64 KB/event, 500 events/batch; a per-source rate limit returns `429` + `Retry-After`.
+- **Secrets are shown once:** the source API key and minted admin tokens are returned exactly once —
+  store them (lost a source key? rotate it, §5). Destination secrets are encrypted at rest.
+- **PII masking:** profile `email`/`phone`/`name` are masked unless your token holds `pii:read`
+  (SUPER_ADMIN/TENANT_ADMIN).
+- **v1 scope:** identity matching is deterministic only (no fuzzy/ML); segmentation is
+  stateless/profile-attribute (no time-window rules yet).
+
+**Minimal first success:** create tenant → create source → `POST /v1/identify` → `POST /v1/events/track`
+→ wait ~5s → `GET /admin/v1/tenants/{tid}/profiles/{canonical_user_id}` → see the unified profile.
+
+## 0.5 Onboarding a new tenant (who does what)
+
+The CDP is an **API-only backend** (no self-serve UI yet) and onboarding has **two actors**.
+
+### Operator (you, running the platform) — provisions the tenant
+
+Tenant creation is `SUPER_ADMIN`-only; a client can't self-provision. Using the static
+`ADMIN_API_TOKEN`:
+
+1. Create the tenant → note its id.
+2. Mint a `TENANT_ADMIN` token for the client and hand it over securely (shown once):
+   `POST /admin/v1/admin-tokens {"name":"acme-admin","role":"TENANT_ADMIN","tenant_id":"<TID>"}`.
+
+The client now self-serves everything below with that token, scoped to just their tenant.
+
+### Client / tenant — configures ingress, audiences, and activation
+
+1. **Connect ingress.** Create a **source** (§5) → get the ingest API key (shown once). Then
+   **instrument your app** to POST events (`identify`/`track`/`alias`) with that key (§6). Choose an
+   identifier strategy: `user_id` when logged in, `anonymous_id` before login, `alias` to stitch the
+   two at login. *(Your engineering owns this — there's no SDK; it's plain HTTP/JSON.)*
+2. **Verify identity.** Send an `identify` + a `track`, wait a few seconds, then fetch the profile
+   (§8) — a unified customer with a `canonical_user_id` should appear.
+3. **Define an audience.** Write a JSON rule and create a **segment** (§9); membership updates in real
+   time as events arrive.
+4. **Connect a destination.** Create a **webhook** (or Kafka) destination with a signing `secret`, and
+   **subscribe** it to the segment (§10). Then **build a receiver** on your side that verifies the
+   `X-CDP-Signature` HMAC. *(The second integration you own.)* Watch `…/deliveries` for status.
+5. **Govern.** Set **consent** so you don't activate opted-out users (§11); handle export/delete for
+   privacy requests (§12); mint **scoped tokens** for teammates — `MARKETER`, `ANALYST`, `VIEWER`
+   (only admins see un-masked PII).
+6. **Operate.** Watch the dashboard/metrics; retry from the DLQ if something fails (§13–14).
+
+### Client checklist
+
+1. Get your tenant + `TENANT_ADMIN` token from the operator.
+2. Create a source; **send events from your app**.
+3. Confirm a profile forms.
+4. Define a segment.
+5. Create a destination + subscription; **build a signature-verifying webhook receiver**.
+6. Set consent; use scoped tokens for your team.
+
+> Two gaps to expect today: **no self-serve console** (everything is the admin API — curl or your own
+> tooling) and **no client SDK** (you POST JSON directly). A tenant sign-up UI and language SDKs are
+> the natural next additions.
+
 ## 1. Prerequisites & start
 
 Requirements: Docker (+ Compose), Go 1.24+.
