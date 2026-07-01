@@ -33,6 +33,11 @@ type Config struct {
 	CircuitThreshold int
 	CircuitWindow    time.Duration
 	CircuitCooldown  time.Duration
+
+	// CORSAllowedOrigins is the list of origins browsers are allowed to call
+	// from. Empty = no cross-origin requests. Set CORS_ALLOWED_ORIGINS=* only
+	// for a fully public, credential-free deployment.
+	CORSAllowedOrigins []string
 }
 
 // Load reads configuration from environment variables, applies defaults, and
@@ -54,11 +59,12 @@ func Load() (Config, error) {
 		ActivationPollInterval: getEnvDuration("ACTIVATION_POLL_INTERVAL", 2*time.Second),
 		ActivationBatchSize:    getEnvInt("ACTIVATION_BATCH_SIZE", 50),
 
-		RateLimitRPS:     getEnvFloat("RATE_LIMIT_RPS", 50),
-		RateLimitBurst:   getEnvInt("RATE_LIMIT_BURST", 100),
-		CircuitThreshold: getEnvInt("CIRCUIT_THRESHOLD", 5),
-		CircuitWindow:    getEnvDuration("CIRCUIT_WINDOW", time.Minute),
-		CircuitCooldown:  getEnvDuration("CIRCUIT_COOLDOWN", 30*time.Second),
+		RateLimitRPS:       getEnvFloat("RATE_LIMIT_RPS", 50),
+		RateLimitBurst:     getEnvInt("RATE_LIMIT_BURST", 100),
+		CircuitThreshold:   getEnvInt("CIRCUIT_THRESHOLD", 5),
+		CircuitWindow:      getEnvDuration("CIRCUIT_WINDOW", time.Minute),
+		CircuitCooldown:    getEnvDuration("CIRCUIT_COOLDOWN", 30*time.Second),
+		CORSAllowedOrigins: splitCSV(os.Getenv("CORS_ALLOWED_ORIGINS")),
 	}
 
 	var missing []string

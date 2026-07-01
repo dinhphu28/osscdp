@@ -1,0 +1,945 @@
+openapi: 3.0.3
+info:
+  title: osscdp — Customer Data Platform API
+  version: "1.0.0"
+  description: |
+    Ingress (`/v1/*`, authenticated by a **source API key**) and admin
+    (`/admin/*`, authenticated by an **admin token**) APIs. See `docs/cdp/14-usage.md`
+    for a walkthrough. Ingestion is asynchronous: `/v1/events/*` return `202` quickly
+    and processing (identity → profile → segmentation → activation) happens in the
+    background.
+
+servers:
+  - url: http://localhost:18080
+    description: Local dev
+
+tags:
+  - name: Ingress
+  - name: Tenants & Sources
+  - name: Admin Tokens
+  - name: Raw Events
+  - name: Profiles
+  - name: Consent
+  - name: Governance
+  - name: Segments
+  - name: Destinations
+  - name: DLQ
+
+security:
+  - AdminToken: []
+
+paths:
+  /healthz:
+    get:
+      tags: [Ingress]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200": {description: OK}
+
+  /v1/auth/whoami:
+    get:
+      tags: [Ingress]
+      summary: Resolve the authenticated source
+      security: [{SourceApiKey: []}]
+      responses:
+        "200":
+          description: The resolved tenant and source
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: {type: string, format: uuid}
+                  source_id: {type: string, format: uuid}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/events/track:
+    post:
+      tags: [Ingress]
+      summary: Track a behavior event
+      security: [{SourceApiKey: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/IncomingEvent"}
+      responses:
+        "202": {$ref: "#/components/responses/Ingested"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "413": {$ref: "#/components/responses/PayloadTooLarge"}
+        "429": {$ref: "#/components/responses/RateLimited"}
+
+  /v1/identify:
+    post:
+      tags: [Ingress]
+      summary: Attach traits/identifiers to a customer
+      security: [{SourceApiKey: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/IncomingEvent"}
+      responses:
+        "202": {$ref: "#/components/responses/Ingested"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /v1/alias:
+    post:
+      tags: [Ingress]
+      summary: Link two identifiers (previous_id + user_id)
+      security: [{SourceApiKey: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/IncomingEvent"}
+      responses:
+        "202": {$ref: "#/components/responses/Ingested"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/events/batch:
+    post:
+      tags: [Ingress]
+      summary: Ingest up to 500 events; each item is processed independently
+      security: [{SourceApiKey: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/BatchRequest"}
+      responses:
+        "202":
+          description: Per-item results
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BatchResult"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "413": {$ref: "#/components/responses/PayloadTooLarge"}
+        "429": {$ref: "#/components/responses/RateLimited"}
+
+  /admin/v1/tenants:
+    post:
+      tags: [Tenants & Sources]
+      summary: Create a tenant
+      description: "Requires: SUPER_ADMIN."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties: {name: {type: string}}
+      responses:
+        "201":
+          description: Created tenant
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Tenant"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+
+  /admin/v1/admin-tokens:
+    post:
+      tags: [Admin Tokens]
+      summary: Mint an admin token
+      description: |
+        Requires `admin:write`. SUPER_ADMIN may mint any role/tenant; TENANT_ADMIN
+        may mint only non-super roles scoped to its own tenant. Token returned once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, role]
+              properties:
+                name: {type: string}
+                role:
+                  type: string
+                  enum: [SUPER_ADMIN, TENANT_ADMIN, MARKETER, ANALYST, OPERATOR, VIEWER]
+                tenant_id: {type: string, format: uuid, description: Required for non-super roles}
+      responses:
+        "201":
+          description: Created token (plaintext shown once)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_token: {type: string}
+                  role: {type: string}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+
+  /admin/v1/tenants/{tenantID}/sources:
+    post:
+      tags: [Tenants & Sources]
+      summary: Create a source (returns the ingest API key once)
+      description: "Requires `source:write`."
+      parameters: [{$ref: "#/components/parameters/TenantID"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, type]
+              properties:
+                name: {type: string}
+                type: {type: string, example: server}
+      responses:
+        "201":
+          description: Created source with its API key
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SourceCreated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /admin/v1/tenants/{tenantID}/sources/{sourceID}/rotate-key:
+    post:
+      tags: [Tenants & Sources]
+      summary: Rotate a source's API key (old key invalidated immediately)
+      description: "Requires `source:write`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/SourceID"}
+      responses:
+        "200":
+          description: New API key
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {api_key: {type: string}}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{tenantID}/events:
+    get:
+      tags: [Raw Events]
+      summary: List stored events (keyset-paginated)
+      description: "Requires `event:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {name: identifier_key, in: query, schema: {type: string}, example: "user_id:u1"}
+        - {name: event_name, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, default: 50, maximum: 500}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        "200":
+          description: A page of events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events: {type: array, items: {$ref: "#/components/schemas/RawEvent"}}
+                  next_cursor: {type: string}
+        "403": {$ref: "#/components/responses/Forbidden"}
+
+  /admin/v1/tenants/{tenantID}/events/{eventID}:
+    get:
+      tags: [Raw Events]
+      summary: Get a stored event by id
+      description: "Requires `event:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {name: eventID, in: path, required: true, schema: {type: string}}
+      responses:
+        "200":
+          description: The event
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RawEvent"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{tenantID}/events/{eventID}/replay:
+    post:
+      tags: [Raw Events]
+      summary: Replay one event through the pipeline
+      description: "Requires `event:replay`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {name: eventID, in: path, required: true, schema: {type: string}}
+      responses:
+        "202":
+          description: Replayed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {event_id: {type: string}, status: {type: string}}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{tenantID}/replay:
+    post:
+      tags: [Raw Events]
+      summary: Replay all events for a customer identifier
+      description: "Requires `event:replay`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {name: identifier_key, in: query, required: true, schema: {type: string}}
+        - {name: max, in: query, schema: {type: integer, default: 1000}}
+      responses:
+        "202":
+          description: Number replayed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {identifier_key: {type: string}, replayed: {type: integer}}
+
+  /admin/v1/tenants/{tenantID}/profiles:
+    get:
+      tags: [Profiles]
+      summary: Look up profiles by email or phone
+      description: "Requires `profile:read`. PII masked unless caller holds `pii:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {name: email, in: query, schema: {type: string}}
+        - {name: phone, in: query, schema: {type: string}}
+      responses:
+        "200":
+          description: Matching profiles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profiles: {type: array, items: {$ref: "#/components/schemas/Profile"}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+
+  /admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}:
+    get:
+      tags: [Profiles]
+      summary: Get a customer profile
+      description: "Requires `profile:read`. PII masked unless caller holds `pii:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/CanonicalUserID"}
+      responses:
+        "200":
+          description: The profile
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Profile"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Governance]
+      summary: Delete / anonymize a customer (GDPR)
+      description: "Requires `profile:delete`. Transactional; raw_event retained per retention policy. Audited."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/CanonicalUserID"}
+      responses:
+        "200":
+          description: Deleted counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: object
+                    additionalProperties: {type: integer}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/consent:
+    put:
+      tags: [Consent]
+      summary: Set a consent record
+      description: "Requires `consent:write`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/CanonicalUserID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel, purpose, status]
+              properties:
+                channel: {type: string, enum: [email, sms, push, ads, webhook]}
+                purpose: {type: string, enum: [marketing, analytics, personalization, transactional]}
+                status: {type: string, enum: [granted, denied, unknown]}
+                source: {type: string}
+      responses:
+        "200": {description: OK}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    get:
+      tags: [Consent]
+      summary: List a customer's consent records
+      description: "Requires `profile:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/CanonicalUserID"}
+      responses:
+        "200":
+          description: Consent records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  consent:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        channel: {type: string}
+                        purpose: {type: string}
+                        status: {type: string}
+                        source: {type: string}
+                        updated_at: {type: string, format: date-time}
+
+  /admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/export:
+    get:
+      tags: [Governance]
+      summary: Export all data for a customer (GDPR)
+      description: "Requires `profile:read`. PII masked unless caller holds `pii:read`. Audited."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/CanonicalUserID"}
+      responses:
+        "200":
+          description: Export bundle
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profile: {$ref: "#/components/schemas/Profile"}
+                  identity_nodes:
+                    type: array
+                    items:
+                      type: object
+                      properties: {namespace: {type: string}, value_hash: {type: string}}
+                  segment_memberships:
+                    type: array
+                    items:
+                      type: object
+                      properties: {segment_id: {type: string}, status: {type: string}}
+                  consent: {type: array, items: {type: object}}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{tenantID}/segments:
+    post:
+      tags: [Segments]
+      summary: Create a segment (rule validated; version 1)
+      description: "Requires `segment:write`."
+      parameters: [{$ref: "#/components/parameters/TenantID"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, rule]
+              properties:
+                name: {type: string}
+                description: {type: string}
+                rule: {$ref: "#/components/schemas/Rule"}
+      responses:
+        "201":
+          description: Created segment
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Segment"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /admin/v1/tenants/{tenantID}/segments/{segmentID}:
+    put:
+      tags: [Segments]
+      summary: Edit a segment (creates a new version)
+      description: "Requires `segment:write`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/SegmentID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rule]
+              properties:
+                description: {type: string}
+                rule: {$ref: "#/components/schemas/Rule"}
+      responses:
+        "200":
+          description: Updated segment
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Segment"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    get:
+      tags: [Segments]
+      summary: Get a segment with its current rule
+      description: "Requires `segment:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/SegmentID"}
+      responses:
+        "200":
+          description: The segment
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Segment"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{tenantID}/segments/{segmentID}/members:
+    get:
+      tags: [Segments]
+      summary: List active members of a segment
+      description: "Requires `segment:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/SegmentID"}
+      responses:
+        "200":
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        segment_id: {type: string, format: uuid}
+                        customer_profile_id: {type: string, format: uuid}
+                        status: {type: string}
+                        entered_at: {type: string, format: date-time}
+
+  /admin/v1/tenants/{tenantID}/destinations:
+    post:
+      tags: [Destinations]
+      summary: Create a destination (webhook or kafka)
+      description: |
+        Requires `destination:write`. `secret` (optional) is encrypted at rest and used to
+        HMAC-sign webhook deliveries. `channel`/`purpose` drive the consent gate.
+      parameters: [{$ref: "#/components/parameters/TenantID"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, name, config]
+              properties:
+                type: {type: string, enum: [webhook, kafka]}
+                name: {type: string}
+                secret: {type: string, description: "Webhook signing secret (encrypted at rest)"}
+                channel: {type: string}
+                purpose: {type: string}
+                config:
+                  type: object
+                  description: "webhook: {url, method?, headers?, timeout_ms?}; kafka: {topic}"
+                  additionalProperties: true
+      responses:
+        "201":
+          description: Created destination
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Destination"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /admin/v1/tenants/{tenantID}/destinations/{destinationID}:
+    get:
+      tags: [Destinations]
+      summary: Get a destination
+      description: "Requires `destination:read`. The secret is never returned."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/DestinationID"}
+      responses:
+        "200":
+          description: The destination
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Destination"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Destinations]
+      summary: Update a destination (e.g. disable)
+      description: "Requires `destination:write`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/DestinationID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: {type: string, enum: [active, disabled]}
+                config: {type: object, additionalProperties: true}
+      responses:
+        "200":
+          description: Updated destination
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Destination"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions:
+    post:
+      tags: [Destinations]
+      summary: Subscribe a destination to a segment
+      description: "Requires `destination:write`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/DestinationID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [trigger_type, segment_id]
+              properties:
+                trigger_type: {type: string, enum: [segment_membership]}
+                segment_id: {type: string, format: uuid}
+      responses:
+        "201":
+          description: Created subscription
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+                  destination_id: {type: string, format: uuid}
+                  trigger_type: {type: string}
+                  segment_id: {type: string, format: uuid}
+                  status: {type: string}
+        "400": {$ref: "#/components/responses/BadRequest"}
+
+  /admin/v1/tenants/{tenantID}/destinations/{destinationID}/deliveries:
+    get:
+      tags: [Destinations]
+      summary: List delivery attempts for a destination
+      description: "Requires `activation:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/DestinationID"}
+      responses:
+        "200":
+          description: Delivery log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        activation_task_id: {type: string, format: uuid}
+                        status: {type: string}
+                        http_status: {type: integer, nullable: true}
+                        error_message: {type: string}
+                        attempt_count: {type: integer}
+                        idempotency_key: {type: string}
+
+  /admin/v1/tenants/{tenantID}/dlq:
+    get:
+      tags: [DLQ]
+      summary: List dead-lettered events
+      description: "Requires `dlq:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {name: status, in: query, schema: {type: string, enum: [open, retried, discarded]}}
+      responses:
+        "200":
+          description: DLQ events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events: {type: array, items: {$ref: "#/components/schemas/DLQEvent"}}
+
+  /admin/v1/tenants/{tenantID}/dlq/{id}/retry:
+    post:
+      tags: [DLQ]
+      summary: Retry a dead-lettered event (republish to the pipeline)
+      description: "Requires `dlq:retry`. Audited."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200":
+          description: Retried
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {id: {type: string}, status: {type: string}}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{tenantID}/dlq/{id}/discard:
+    post:
+      tags: [DLQ]
+      summary: Discard a dead-lettered event
+      description: "Requires `dlq:retry`. Audited."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200":
+          description: Discarded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {id: {type: string}, status: {type: string}}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+components:
+  securitySchemes:
+    AdminToken:
+      type: http
+      scheme: bearer
+      description: "Static ADMIN_API_TOKEN (SUPER_ADMIN) or a minted admin token."
+    SourceApiKey:
+      type: http
+      scheme: bearer
+      description: "A source's ingest API key (cdp_…)."
+
+  parameters:
+    TenantID:
+      name: tenantID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    SourceID:
+      name: sourceID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    CanonicalUserID:
+      name: canonicalUserID
+      in: path
+      required: true
+      schema: {type: string}
+      example: customer_019f...
+    SegmentID:
+      name: segmentID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    DestinationID:
+      name: destinationID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+
+  responses:
+    Ingested:
+      description: Accepted
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              event_id: {type: string}
+              status: {type: string, enum: [accepted, duplicate]}
+    Unauthorized:
+      description: Missing/invalid credentials
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    Forbidden:
+      description: Missing permission or tenant-scope violation
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    NotFound:
+      description: Not found
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    BadRequest:
+      description: Invalid input
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    Conflict:
+      description: Conflict (e.g. duplicate name, or same event_id with a different payload)
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    PayloadTooLarge:
+      description: Event or batch exceeds the size limit
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    RateLimited:
+      description: Per-source rate limit exceeded
+      headers:
+        Retry-After: {schema: {type: integer}}
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: {type: string}
+            message: {type: string}
+
+    IncomingEvent:
+      type: object
+      description: "tenant_id/source_id come from the API key, not the body."
+      properties:
+        event_id: {type: string, description: "Optional; generated if omitted. Idempotency key with the tenant."}
+        type: {type: string, enum: [track, identify, alias]}
+        event_name: {type: string, description: "Required for track."}
+        user_id: {type: string}
+        anonymous_id: {type: string}
+        email: {type: string}
+        phone: {type: string}
+        external_id: {type: string}
+        device_id: {type: string}
+        previous_id: {type: string, description: "For alias."}
+        timestamp: {type: string, format: date-time}
+        context: {type: object, additionalProperties: true}
+        properties: {type: object, additionalProperties: true}
+        traits: {type: object, additionalProperties: true, description: "For identify."}
+
+    BatchRequest:
+      type: object
+      required: [events]
+      properties:
+        events: {type: array, maxItems: 500, items: {$ref: "#/components/schemas/IncomingEvent"}}
+
+    BatchResult:
+      type: object
+      properties:
+        accepted: {type: integer}
+        duplicate: {type: integer}
+        rejected: {type: integer}
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              index: {type: integer}
+              event_id: {type: string}
+              status: {type: string, enum: [accepted, duplicate, rejected]}
+              error: {type: string}
+
+    Tenant:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        status: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    SourceCreated:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        name: {type: string}
+        type: {type: string}
+        status: {type: string}
+        api_key: {type: string, description: "Shown once."}
+
+    RawEvent:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        source_id: {type: string, format: uuid}
+        event_id: {type: string}
+        type: {type: string}
+        event_name: {type: string}
+        identifier_key: {type: string}
+        payload_json: {type: object, additionalProperties: true}
+        payload_hash: {type: string}
+        timestamp: {type: string, format: date-time}
+        received_at: {type: string, format: date-time}
+        processing_status: {type: string}
+        created_at: {type: string, format: date-time}
+
+    Profile:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        canonical_user_id: {type: string}
+        identity_cluster_id: {type: string, format: uuid}
+        traits: {type: object, additionalProperties: true, description: "email/phone/name masked unless pii:read."}
+        computed_attributes: {type: object, additionalProperties: true}
+        first_seen_at: {type: string, format: date-time, nullable: true}
+        last_seen_at: {type: string, format: date-time, nullable: true}
+        version: {type: integer}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    Rule:
+      type: object
+      description: |
+        Either a logical node (`operator` + `conditions`) or a leaf comparison
+        (`field` + `op` + `value`).
+      properties:
+        operator: {type: string, enum: [and, or, not]}
+        conditions: {type: array, items: {$ref: "#/components/schemas/Rule"}}
+        field: {type: string, example: "profile.traits.country"}
+        op:
+          type: string
+          enum: [eq, neq, gt, gte, lt, lte, contains, not_contains, in, not_in, exists, not_exists]
+        value: {description: "Any scalar, or an array for in/not_in."}
+
+    Segment:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        name: {type: string}
+        description: {type: string}
+        status: {type: string}
+        current_version_id: {type: string, format: uuid}
+        current_version: {type: integer}
+        rule: {$ref: "#/components/schemas/Rule"}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    Destination:
+      type: object
+      description: "The secret is never serialized."
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        type: {type: string}
+        name: {type: string}
+        status: {type: string}
+        config: {type: object, additionalProperties: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    DLQEvent:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid, nullable: true}
+        event_id: {type: string}
+        component: {type: string}
+        error_code: {type: string}
+        error_message: {type: string}
+        original_payload: {}
+        retry_count: {type: integer}
+        status: {type: string, enum: [open, retried, discarded]}
+        failed_at: {type: string, format: date-time}
