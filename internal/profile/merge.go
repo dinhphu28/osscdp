@@ -66,6 +66,49 @@ func MergeComputed(cur map[string]any, env events.Envelope) (map[string]any, []s
 	return out, changed
 }
 
+// mergeReparent folds a loser profile into the survivor when two identity
+// clusters merge. Policy (non-destructive to the survivor): traits and computed
+// attributes fill only keys the survivor is missing; event/order counts are
+// summed; first/last seen are widened. Returns the changed field names.
+func mergeReparent(dst *Profile, src Profile) []string {
+	var changed []string
+
+	for k, v := range src.Traits {
+		if _, ok := dst.Traits[k]; !ok {
+			dst.Traits[k] = v
+			changed = append(changed, "traits."+k)
+		}
+	}
+
+	// Sum the running counts across both profiles.
+	for _, key := range []string{AttrTotalEvents, AttrTotalOrders} {
+		if n := asInt(src.ComputedAttributes[key]); n > 0 {
+			dst.ComputedAttributes[key] = asInt(dst.ComputedAttributes[key]) + n
+			changed = append(changed, "computed_attributes."+key)
+		}
+	}
+	// Fill only the computed keys the survivor lacks (never clobber its latest values).
+	for k, v := range src.ComputedAttributes {
+		if k == AttrTotalEvents || k == AttrTotalOrders {
+			continue
+		}
+		if _, ok := dst.ComputedAttributes[k]; !ok {
+			dst.ComputedAttributes[k] = v
+			changed = append(changed, "computed_attributes."+k)
+		}
+	}
+
+	if src.FirstSeenAt != nil && (dst.FirstSeenAt == nil || src.FirstSeenAt.Before(*dst.FirstSeenAt)) {
+		dst.FirstSeenAt = src.FirstSeenAt
+		changed = append(changed, "first_seen_at")
+	}
+	if src.LastSeenAt != nil && (dst.LastSeenAt == nil || src.LastSeenAt.After(*dst.LastSeenAt)) {
+		dst.LastSeenAt = src.LastSeenAt
+		changed = append(changed, "last_seen_at")
+	}
+	return changed
+}
+
 // MergeSeen returns the earliest first_seen and latest last_seen given the
 // event timestamp, plus whether either changed.
 func MergeSeen(first, last *time.Time, ts time.Time) (newFirst, newLast *time.Time, changed []string) {
