@@ -129,11 +129,32 @@ ORDER BY d.name;"
 
 ---
 
-## Enhancement C — View all of a person's identifiers
+## Enhancement C — View all of a person's identifiers · Tier 1 ✅ Implemented
 
 Show every phone/email/`user_id` a person has ever used, not just the latest trait value.
 
-**Today:** The profile endpoints (`cmd/cdp-api/main.go:133-134`) return only last-write-wins traits
+**Status:** Tier 1 shipped. `GET /admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/identifiers`
+(requires `profile:read`) returns `{"canonical_user_id", "total", "by_namespace": {...}}` — a
+per-namespace **count** of every identity node linked to the person (e.g. `{"email": 2, "phone": 3}`),
+which the last-write-wins profile traits cannot show. Counts only — no values or hashes exposed. `404`
+if the profile does not exist.
+
+What was added (Tier 1):
+
+- **Service** — `Service.Identifiers(ctx, tenantID, canonicalUserID) (IdentifierInventory, error)` in
+  `internal/governance/governance.go`, resolving the profile via `GetByCanonical` (→ `ErrNotFound`)
+  then aggregating the same cluster-node join used by `Export`, `GROUP BY namespace`.
+- **Handler** — `Identifiers` in `internal/governance/handler.go`, mirroring `Export`.
+- **Route** — registered in `cmd/cdp-api/main.go` next to the export route, under `rbac.PermProfileRead`.
+- **Test** — `internal/governance/governance_integration_test.go` (testcontainers): seed a person with
+  2 emails / 3 phones / 1 user_id → assert `total=6` and the per-namespace map; unknown canonical id
+  → `ErrNotFound`.
+- **Spec** — documented in `api/openapi.yaml`.
+
+**Tier 2 (real plaintext values) is still pending** — see below. Tier 1 answers "how many, which
+namespaces"; it does not reveal the identifier strings.
+
+**Today (for Tier 2):** The profile endpoints (`cmd/cdp-api/main.go:133-134`) return only last-write-wins traits
 (`customer_profile.traits_json` — one `phone`, one `email`) plus computed attributes. The `List`
 endpoint even searches by `traits_json->>key`, so an *older* phone won't match. The only place all
 identity nodes surface is the governance **Export** endpoint
@@ -151,14 +172,13 @@ Constraints to be aware of:
   (`migrations/00003_raw_event.sql`), exposed via `GET .../events` — but keyed by event, not joined
   to a canonical ID.
 
-**Add — two tiers (do Tier 1 first):**
+**Two tiers (Tier 1 done, Tier 2 pending):**
 
-- **Tier 1 — hashed inventory (small).** New `GET .../profiles/{canonicalUserID}/identifiers`
-  returning every node grouped by namespace with counts (e.g. `{"phone": 3, "email": 2, ...}`).
-  Add a repo method `IdentityNodesForCluster(ctx, tenantID, clusterID)` reusing the Export
-  cluster-node query (`internal/governance/governance.go:62-66`), wired behind `PermProfileRead`.
-  This answers "how many, which namespaces" but not the plaintext values.
-- **Tier 2 — real values (larger).** Start populating `identity_node.value_encrypted` in `upsertNode`
+- **Tier 1 — count inventory (small). ✅ Implemented** as `GET .../profiles/{canonicalUserID}/identifiers`
+  (see status above). Returns every node grouped by namespace with counts, reusing the Export
+  cluster-node join, behind `PermProfileRead`. Answers "how many, which namespaces" but not the
+  plaintext values.
+- **Tier 2 — real values (larger). Pending.** Start populating `identity_node.value_encrypted` in `upsertNode`
   (`internal/identity/repo.go:32-44`) using the existing `crypto.Cipher` (already used for encrypting
   destination secrets — see `internal/activation/handler.go`), then decrypt on read behind a
   PII-scoped permission with masking (mirror `maskTraits` in `internal/profile`).
@@ -211,5 +231,5 @@ WHERE p.identity_cluster_id = ic.id
 |---|------------|---------------|------|--------------------|
 | A | Unsubscribe / disable a subscription | ✅ Implemented (`DELETE …/subscriptions/{subscriptionID}`) | Small | `UPDATE destination_subscription SET status='disabled'` |
 | B | List destinations by segment | ✅ Implemented (`GET …/segments/{segmentID}/destinations`) | Small | JOIN query on `destination_subscription` + `destination` |
-| C | View all of a person's identifiers | Hashed only (Export) | Tier 1 small / Tier 2 larger | Export endpoint (hashed) or `raw_event.payload_json` |
+| C | View all of a person's identifiers | ✅ Tier 1 (`GET …/profiles/{id}/identifiers`, counts); Tier 2 (plaintext) pending | Tier 1 small / Tier 2 larger | Export endpoint (hashed) or `raw_event.payload_json` |
 | D | Reparent profiles on cluster merge | No | Larger | Delete orphan rows under `merged` clusters |

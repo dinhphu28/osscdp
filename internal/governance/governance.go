@@ -109,6 +109,51 @@ func (s *Service) Export(ctx context.Context, tenantID uuid.UUID, canonicalUserI
 	return b, nil
 }
 
+// IdentifierInventory summarizes all identity nodes linked to a person, grouped
+// by namespace, as counts only — no PII, not even the hashes. It answers "how
+// many phones / emails does this person have" that the last-write-wins profile
+// traits cannot (they show one value per key). For the hashed node values, use
+// the Export endpoint; for plaintext, Tier 2 (encrypted values) is not built yet.
+type IdentifierInventory struct {
+	CanonicalUserID string         `json:"canonical_user_id"`
+	Total           int            `json:"total"`
+	ByNamespace     map[string]int `json:"by_namespace"`
+}
+
+// Identifiers returns the identifier inventory for a resolved person. It reuses
+// the Export cluster-node join, aggregated by namespace.
+func (s *Service) Identifiers(ctx context.Context, tenantID uuid.UUID, canonicalUserID string) (IdentifierInventory, error) {
+	p, err := s.profiles.GetByCanonical(ctx, tenantID, canonicalUserID)
+	if errors.Is(err, profile.ErrNotFound) {
+		return IdentifierInventory{}, ErrNotFound
+	}
+	if err != nil {
+		return IdentifierInventory{}, err
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT n.namespace, count(*)
+		FROM identity_node n
+		JOIN identity_cluster_member m ON m.identity_node_id = n.id
+		WHERE m.tenant_id=$1 AND m.cluster_id=$2
+		GROUP BY n.namespace
+		ORDER BY n.namespace`, tenantID, p.IdentityClusterID)
+	if err != nil {
+		return IdentifierInventory{}, fmt.Errorf("identifier inventory: %w", err)
+	}
+	defer rows.Close()
+	inv := IdentifierInventory{CanonicalUserID: canonicalUserID, ByNamespace: map[string]int{}}
+	for rows.Next() {
+		var ns string
+		var n int
+		if err := rows.Scan(&ns, &n); err != nil {
+			return IdentifierInventory{}, err
+		}
+		inv.ByNamespace[ns] = n
+		inv.Total += n
+	}
+	return inv, rows.Err()
+}
+
 // DeleteCounts reports rows removed per table.
 type DeleteCounts struct {
 	Profile       int64 `json:"customer_profile"`

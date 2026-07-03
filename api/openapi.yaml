@@ -433,6 +433,34 @@ paths:
                   consent: {type: array, items: {type: object}}
         "404": {$ref: "#/components/responses/NotFound"}
 
+  /admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/identifiers:
+    get:
+      tags: [Governance]
+      summary: Identifier inventory for a customer
+      description: >-
+        Requires `profile:read`. Returns a per-namespace count of every identity
+        node linked to the person (e.g. how many phones/emails), which the
+        last-write-wins profile traits cannot show. Counts only — no values or
+        hashes; use the export endpoint for the hashed node list.
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/CanonicalUserID"}
+      responses:
+        "200":
+          description: Identifier inventory
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  canonical_user_id: {type: string}
+                  total: {type: integer}
+                  by_namespace:
+                    type: object
+                    additionalProperties: {type: integer}
+                    example: {email: 2, phone: 3, user_id: 1}
+        "404": {$ref: "#/components/responses/NotFound"}
+
   /admin/v1/tenants/{tenantID}/segments:
     post:
       tags: [Segments]
