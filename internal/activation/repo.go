@@ -102,6 +102,29 @@ func (r *Repo) CreateSubscription(ctx context.Context, tenantID, destinationID u
 	return s, nil
 }
 
+// DisableSubscription soft-disables a subscription (status='disabled') so the
+// sender stops dispatching it, without deleting the row — the activation_task
+// foreign key forbids hard deletes. Scoped by destination_id so the nested
+// route's {destinationID} must match. Idempotent: disabling an already-disabled
+// subscription still matches and returns it. Returns ErrNotFound if no row matches.
+func (r *Repo) DisableSubscription(ctx context.Context, tenantID, destinationID, subscriptionID uuid.UUID) (Subscription, error) {
+	var s Subscription
+	err := r.pool.QueryRow(ctx, `
+		UPDATE destination_subscription
+		SET status=$4, updated_at=now()
+		WHERE tenant_id=$1 AND destination_id=$2 AND id=$3
+		RETURNING id, tenant_id, destination_id, trigger_type, segment_id, event_name, status`,
+		tenantID, destinationID, subscriptionID, StatusDisabled,
+	).Scan(&s.ID, &s.TenantID, &s.DestinationID, &s.TriggerType, &s.SegmentID, &s.EventName, &s.Status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Subscription{}, ErrNotFound
+	}
+	if err != nil {
+		return Subscription{}, fmt.Errorf("disable subscription: %w", err)
+	}
+	return s, nil
+}
+
 // ActiveSubscriptionsForSegment returns active subscriptions on active
 // destinations triggered by membership of the given segment.
 func (r *Repo) ActiveSubscriptionsForSegment(ctx context.Context, tenantID, segmentID uuid.UUID) ([]Subscription, error) {

@@ -41,51 +41,46 @@ GROUP BY 1 HAVING count(*) > 1;"
 
 ---
 
-## Enhancement A — Unsubscribe (disable) a subscription
+## Enhancement A — Unsubscribe (disable) a subscription ✅ Implemented
 
 Detach one destination from one segment without deleting the destination.
 
-**Today:** No endpoint. Five activation routes exist (`cmd/cdp-api/main.go:146-150`); none
-delete or disable a subscription. `CreateSubscription` hardcodes `status='active'`
-(`internal/activation/repo.go:90-93`) and no update/delete method exists. The schema already supports
-a soft-disable: `destination_subscription.status` (`migrations/00008_activation.sql:17-30`), and the
-sender only dispatches active subscriptions (`ActiveSubscriptionsForSegment`,
-`internal/activation/repo.go:113`, filters `s.status='active' AND d.status='active'`).
+**Status:** Shipped. `DELETE /admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions/{subscriptionID}`
+(requires `destination:write`) soft-disables the subscription and returns `200` with the updated row
+(`status=disabled`), or `404` if no matching subscription exists under that tenant + destination.
 
-Use **soft-disable**, not a row delete: `activation_task.subscription_id` has a foreign key
-(`migrations/00008_activation.sql:36`), so a hard `DELETE` is blocked by existing task rows.
+What was added:
 
-**Add:**
-
-- **Repo** — `DeactivateSubscription(ctx, tenantID, subscriptionID uuid.UUID) error` in
-  `internal/activation/repo.go`:
+- **Repo** — `DisableSubscription(ctx, tenantID, destinationID, subscriptionID uuid.UUID) (Subscription, error)`
+  in `internal/activation/repo.go`, using `UPDATE … RETURNING`:
   ```sql
   UPDATE destination_subscription SET status='disabled', updated_at=now()
-  WHERE tenant_id=$1 AND id=$2
+  WHERE tenant_id=$1 AND destination_id=$2 AND id=$3
+  RETURNING id, tenant_id, destination_id, trigger_type, segment_id, event_name, status
   ```
-  Return `ErrNotFound` when `RowsAffected()==0`. Reuse the `StatusDisabled` constant
-  (`internal/activation/model.go:19-23`).
+  Returns `ErrNotFound` on `pgx.ErrNoRows`. Scoped by `destination_id` so the nested route's
+  `{destinationID}` must match. Idempotent — disabling an already-disabled subscription returns it
+  unchanged. Reuses the `StatusDisabled` constant (`internal/activation/model.go`).
 - **Handler** — `DisableSubscription` in `internal/activation/handler.go`, mirroring
-  `CreateSubscription`: use `parseTenant` and read `{subscriptionID}` via `chi.URLParam`. Return
-  `204 No Content` on success, `404` on `ErrNotFound`.
-- **Route** — in the activation block of `cmd/cdp-api/main.go` (after line 149):
-  ```go
-  admin.With(auth.Require(rbac.PermDestinationWrite)).
-      Delete("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions/{subscriptionID}",
-          activationHandler.DisableSubscription)
-  ```
-- **Test** — in `internal/activation` (see `unit_test.go` for the pattern): create a subscription,
-  disable it, assert `ActiveSubscriptionsForSegment` no longer returns it.
+  `CreateSubscription` for param parsing and `UpdateDestination` for the `ErrNotFound` → `404` branch.
+- **Route** — registered in `cmd/cdp-api/main.go` under `rbac.PermDestinationWrite`.
+- **Test** — `internal/activation/repo_integration_test.go` (testcontainers): seed → disable →
+  assert `ActiveSubscriptionsForSegment` no longer returns it, the row is retained (soft-disable),
+  disabling twice is idempotent, and unknown ids / mismatched destination return `ErrNotFound`.
+- **Spec** — documented in `api/openapi.yaml`.
 
-**Interim workaround (no code):**
+**Why soft-disable, not a row delete:** `activation_task.subscription_id` is a non-cascading foreign
+key (`migrations/00008_activation.sql:36`), so a hard `DELETE` would be blocked by existing task rows.
+Setting `status='disabled'` is enough — the sender only dispatches `status='active'` subscriptions
+(`ActiveSubscriptionsForSegment`), and picks up the change on its next tick with no restart.
+
+**Interim workaround (historical — endpoint now exists):**
 
 ```sh
 docker exec -i deploy-postgres-1 psql -U cdp -d cdp -c "
 UPDATE destination_subscription SET status='disabled', updated_at=now()
 WHERE tenant_id='<tenant>' AND id='<subscription_id>';"
 ```
-
-The sender picks up the change on its next tick — no restart needed.
 
 ---
 
@@ -215,7 +210,7 @@ WHERE p.identity_cluster_id = ic.id
 
 | # | Capability | Exists today? | Size | Interim workaround |
 |---|------------|---------------|------|--------------------|
-| A | Unsubscribe / disable a subscription | No | Small | `UPDATE destination_subscription SET status='disabled'` |
+| A | Unsubscribe / disable a subscription | ✅ Implemented (`DELETE …/subscriptions/{subscriptionID}`) | Small | `UPDATE destination_subscription SET status='disabled'` |
 | B | List destinations by segment | No | Small | JOIN query on `destination_subscription` + `destination` |
 | C | View all of a person's identifiers | Hashed only (Export) | Tier 1 small / Tier 2 larger | Export endpoint (hashed) or `raw_event.payload_json` |
 | D | Reparent profiles on cluster merge | No | Larger | Delete orphan rows under `merged` clusters |
