@@ -150,6 +150,33 @@ func (r *Repo) ActiveSubscriptionsForSegment(ctx context.Context, tenantID, segm
 	return out, rows.Err()
 }
 
+// SubscriptionsBySegment lists every destination wired to a segment via a
+// subscription, including disabled subscriptions and destinations (unlike
+// ActiveSubscriptionsForSegment, which is active-only) so admins can audit the
+// full wiring. Ordered by destination name.
+func (r *Repo) SubscriptionsBySegment(ctx context.Context, tenantID, segmentID uuid.UUID) ([]SegmentDestination, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT s.id, s.status, d.id, d.name, d.type, d.status
+		FROM destination_subscription s
+		JOIN destination d ON d.id = s.destination_id
+		WHERE s.tenant_id=$1 AND s.segment_id=$2
+		ORDER BY d.name`,
+		tenantID, segmentID)
+	if err != nil {
+		return nil, fmt.Errorf("subscriptions by segment: %w", err)
+	}
+	defer rows.Close()
+	var out []SegmentDestination
+	for rows.Next() {
+		var sd SegmentDestination
+		if err := rows.Scan(&sd.SubscriptionID, &sd.SubscriptionStatus, &sd.DestinationID, &sd.Name, &sd.Type, &sd.DestinationStatus); err != nil {
+			return nil, err
+		}
+		out = append(out, sd)
+	}
+	return out, rows.Err()
+}
+
 // CreateTask inserts a task idempotently with the given status. Returns false if
 // a task with the same idempotency key already exists. A "skipped" task records a
 // consent denial; it is never claimed by the sender.

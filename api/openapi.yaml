@@ -526,6 +526,37 @@ paths:
                         status: {type: string}
                         entered_at: {type: string, format: date-time}
 
+  /admin/v1/tenants/{tenantID}/segments/{segmentID}/destinations:
+    get:
+      tags: [Segments]
+      summary: List destinations connected to a segment
+      description: >-
+        Requires `destination:read`. Returns every destination wired to the
+        segment via a subscription, including disabled subscriptions and
+        destinations (unlike the sender, which only dispatches active ones).
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/SegmentID"}
+      responses:
+        "200":
+          description: Destinations wired to the segment
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  destinations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        subscription_id: {type: string, format: uuid}
+                        subscription_status: {type: string}
+                        destination_id: {type: string, format: uuid}
+                        name: {type: string}
+                        type: {type: string}
+                        destination_status: {type: string}
+
   /admin/v1/tenants/{tenantID}/destinations:
     post:
       tags: [Destinations]

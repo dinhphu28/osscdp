@@ -278,6 +278,32 @@ func (h *Handler) Deliveries(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, out)
 }
 
+type segmentDestinationsResponse struct {
+	Destinations []SegmentDestination `json:"destinations"`
+}
+
+// ListSegmentDestinations handles GET /admin/v1/tenants/{tenantID}/segments/{segmentID}/destinations.
+// It returns every destination wired to the segment, including disabled subscriptions.
+func (h *Handler) ListSegmentDestinations(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := parseTenant(w, r)
+	if !ok {
+		return
+	}
+	segID, err := uuid.Parse(chi.URLParam(r, "segmentID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid segment id")
+		return
+	}
+	rows, err := h.repo.SubscriptionsBySegment(r.Context(), tenantID, segID)
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	out := segmentDestinationsResponse{Destinations: make([]SegmentDestination, 0, len(rows))}
+	out.Destinations = append(out.Destinations, rows...)
+	httpx.WriteJSON(w, http.StatusOK, out)
+}
+
 func parseTenant(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	id, err := uuid.Parse(chi.URLParam(r, "tenantID"))
 	if err != nil {
