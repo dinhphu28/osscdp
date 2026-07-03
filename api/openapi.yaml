@@ -632,6 +632,37 @@ paths:
                   status: {type: string}
         "400": {$ref: "#/components/responses/BadRequest"}
 
+  /admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions/{subscriptionID}:
+    delete:
+      tags: [Destinations]
+      summary: Unsubscribe (disable) a subscription
+      description: >-
+        Requires `destination:write`. Soft-disables the subscription
+        (`status=disabled`) so the sender stops dispatching it; the destination
+        itself is untouched and the row is retained. Idempotent.
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/DestinationID"}
+        - name: subscriptionID
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        "200":
+          description: The disabled subscription
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+                  destination_id: {type: string, format: uuid}
+                  trigger_type: {type: string}
+                  segment_id: {type: string, format: uuid}
+                  status: {type: string, example: disabled}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
   /admin/v1/tenants/{tenantID}/destinations/{destinationID}/deliveries:
     get:
       tags: [Destinations]

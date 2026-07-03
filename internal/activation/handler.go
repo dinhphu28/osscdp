@@ -210,6 +210,35 @@ func (h *Handler) CreateSubscription(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusCreated, sub)
 }
 
+// DisableSubscription handles DELETE /admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions/{subscriptionID}.
+// It soft-disables the subscription (status='disabled'); the destination itself is untouched.
+func (h *Handler) DisableSubscription(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := parseTenant(w, r)
+	if !ok {
+		return
+	}
+	destID, err := uuid.Parse(chi.URLParam(r, "destinationID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid destination id")
+		return
+	}
+	subID, err := uuid.Parse(chi.URLParam(r, "subscriptionID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid subscription id")
+		return
+	}
+	sub, err := h.repo.DisableSubscription(r.Context(), tenantID, destID, subID)
+	if errors.Is(err, ErrNotFound) {
+		apierror.NotFound(w, "subscription not found")
+		return
+	}
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, sub)
+}
+
 type deliveriesResponse struct {
 	Deliveries []deliveryView `json:"deliveries"`
 }
