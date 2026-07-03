@@ -42,6 +42,26 @@ func (h *Handler) Export(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, bundle)
 }
 
+// Identifiers handles GET /admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/identifiers.
+// It returns a per-namespace count of every identity node linked to the person
+// (e.g. how many phones/emails they have), without exposing the values.
+func (h *Handler) Identifiers(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := parseTenant(w, r)
+	if !ok {
+		return
+	}
+	inv, err := h.svc.Identifiers(r.Context(), tenantID, chi.URLParam(r, "canonicalUserID"))
+	if errors.Is(err, ErrNotFound) {
+		apierror.NotFound(w, "profile not found")
+		return
+	}
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, inv)
+}
+
 // Delete handles DELETE /admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}.
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := parseTenant(w, r)

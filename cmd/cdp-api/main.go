@@ -136,6 +136,7 @@ func run() error {
 		admin.With(auth.Require(rbac.PermConsentWrite)).Put("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/consent", consentHandler.Set)
 		admin.With(auth.Require(rbac.PermProfileRead)).Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/consent", consentHandler.List)
 		admin.With(auth.Require(rbac.PermProfileRead)).Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/export", governanceHandler.Export)
+		admin.With(auth.Require(rbac.PermProfileRead)).Get("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/identifiers", governanceHandler.Identifiers)
 		admin.With(auth.Require(rbac.PermProfileDelete)).Delete("/admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}", governanceHandler.Delete)
 		// Segment management (Phase 7).
 		admin.With(auth.Require(rbac.PermSegmentWrite)).Post("/admin/v1/tenants/{tenantID}/segments", segmentHandler.Create)
