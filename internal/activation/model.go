@@ -67,6 +67,17 @@ type Subscription struct {
 	Status        string     `json:"status"`
 }
 
+// SegmentDestination is one destination wired to a segment via a subscription,
+// including disabled subscriptions, for the admin "list destinations by segment" view.
+type SegmentDestination struct {
+	SubscriptionID     uuid.UUID `json:"subscription_id"`
+	SubscriptionStatus string    `json:"subscription_status"`
+	DestinationID      uuid.UUID `json:"destination_id"`
+	Name               string    `json:"name"`
+	Type               string    `json:"type"`
+	DestinationStatus  string    `json:"destination_status"`
+}
+
 // Task is a unit of outbound work.
 type Task struct {
 	ID                uuid.UUID

@@ -110,6 +110,49 @@ func TestDisableSubscription(t *testing.T) {
 	require.Equal(t, StatusDisabled, again.Status)
 }
 
+func TestSubscriptionsBySegment(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	repo := NewRepo(pool)
+	tenantID, _, subID, segmentID := seedSubscription(t, ctx, pool)
+
+	// A second destination + subscription on the same segment.
+	dest2, err := repo.CreateDestination(ctx, tenantID, TypeWebhook, "test-dest-2", json.RawMessage(`{"url":"http://example.test/2"}`), "")
+	require.NoError(t, err)
+	sub2, err := repo.CreateSubscription(ctx, tenantID, dest2.ID, TriggerSegmentMembership, &segmentID)
+	require.NoError(t, err)
+
+	// Both destinations are listed, active.
+	got, err := repo.SubscriptionsBySegment(ctx, tenantID, segmentID)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	byName := map[string]SegmentDestination{}
+	for _, sd := range got {
+		byName[sd.Name] = sd
+	}
+	require.Equal(t, subID, byName["test-dest"].SubscriptionID)
+	require.Equal(t, StatusActive, byName["test-dest"].SubscriptionStatus)
+	require.Equal(t, TypeWebhook, byName["test-dest"].Type)
+	require.Equal(t, sub2.ID, byName["test-dest-2"].SubscriptionID)
+
+	// Disabling one keeps it in the list (unlike ActiveSubscriptionsForSegment).
+	_, err = repo.DisableSubscription(ctx, tenantID, byName["test-dest-2"].DestinationID, sub2.ID)
+	require.NoError(t, err)
+	got, err = repo.SubscriptionsBySegment(ctx, tenantID, segmentID)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	for _, sd := range got {
+		if sd.SubscriptionID == sub2.ID {
+			require.Equal(t, StatusDisabled, sd.SubscriptionStatus)
+		}
+	}
+
+	// A segment with no subscriptions yields an empty slice, no error.
+	empty, err := repo.SubscriptionsBySegment(ctx, tenantID, uuid.New())
+	require.NoError(t, err)
+	require.Empty(t, empty)
+}
+
 func TestDisableSubscription_NotFound(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)

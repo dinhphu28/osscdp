@@ -84,21 +84,20 @@ WHERE tenant_id='<tenant>' AND id='<subscription_id>';"
 
 ---
 
-## Enhancement B — List destinations connected to a segment
+## Enhancement B — List destinations connected to a segment ✅ Implemented
 
 See every destination wired to a segment, including disabled subscriptions.
 
-**Today:** No endpoint. The closest code is `ActiveSubscriptionsForSegment`
-(`internal/activation/repo.go:107`), but it is internal-only (not wired to any route), returns
-*active-only* rows, and carries no destination detail (name/type/status). The index
-`idx_destination_subscription_segment` on `(tenant_id, segment_id, status)`
-(`migrations/00008_activation.sql`) already fits the query.
+**Status:** Shipped. `GET /admin/v1/tenants/{tenantID}/segments/{segmentID}/destinations`
+(requires `destination:read`) returns `{"destinations": [...]}` — one entry per subscription joined
+to its destination, **all statuses** (so disabled subscriptions/destinations are visible, unlike the
+sender's active-only `ActiveSubscriptionsForSegment`). A segment with no subscriptions returns an
+empty array.
 
-**Add:**
+What was added:
 
-- **Repo** — `SubscriptionsBySegment(ctx, tenantID, segmentID uuid.UUID)` in
-  `internal/activation/repo.go`, returning one row per subscription joined to its destination,
-  **all statuses** (so admins can see disabled ones):
+- **Repo** — `SubscriptionsBySegment(ctx, tenantID, segmentID uuid.UUID) ([]SegmentDestination, error)`
+  in `internal/activation/repo.go`:
   ```sql
   SELECT s.id, s.status, d.id, d.name, d.type, d.status
   FROM destination_subscription s
@@ -106,19 +105,19 @@ See every destination wired to a segment, including disabled subscriptions.
   WHERE s.tenant_id=$1 AND s.segment_id=$2
   ORDER BY d.name
   ```
-  Return a small struct (e.g. `SegmentDestination{SubscriptionID, SubscriptionStatus, DestinationID,
-  Name, Type, DestinationStatus}`).
-- **Handler** — `ListSegmentDestinations` in `internal/activation/handler.go`.
-- **Route** — in `cmd/cdp-api/main.go` (near the segment routes at 142-144, or the activation block):
-  ```go
-  admin.With(auth.Require(rbac.PermDestinationRead)).
-      Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/destinations",
-          activationHandler.ListSegmentDestinations)
-  ```
-- **Test** — create two destinations + subscriptions on one segment, assert both are listed; disable
-  one and assert it still appears with `status=disabled`.
+  Returns the `SegmentDestination{SubscriptionID, SubscriptionStatus, DestinationID, Name, Type,
+  DestinationStatus}` struct (`internal/activation/model.go`). Backed by the existing
+  `idx_destination_subscription_segment` index.
+- **Handler** — `ListSegmentDestinations` in `internal/activation/handler.go` (wraps the rows in a
+  `{"destinations": [...]}` envelope, mirroring `Deliveries`).
+- **Route** — registered in `cmd/cdp-api/main.go` alongside the segment routes, under
+  `rbac.PermDestinationRead`.
+- **Test** — `internal/activation/repo_integration_test.go` (testcontainers): two destinations on one
+  segment are both listed; a disabled subscription still appears with `status=disabled`; an unknown
+  segment yields an empty slice.
+- **Spec** — documented in `api/openapi.yaml`.
 
-**Interim workaround (no code):**
+**Interim workaround (historical — endpoint now exists):**
 
 ```sh
 docker exec -i deploy-postgres-1 psql -U cdp -d cdp -c "
@@ -211,6 +210,6 @@ WHERE p.identity_cluster_id = ic.id
 | # | Capability | Exists today? | Size | Interim workaround |
 |---|------------|---------------|------|--------------------|
 | A | Unsubscribe / disable a subscription | ✅ Implemented (`DELETE …/subscriptions/{subscriptionID}`) | Small | `UPDATE destination_subscription SET status='disabled'` |
-| B | List destinations by segment | No | Small | JOIN query on `destination_subscription` + `destination` |
+| B | List destinations by segment | ✅ Implemented (`GET …/segments/{segmentID}/destinations`) | Small | JOIN query on `destination_subscription` + `destination` |
 | C | View all of a person's identifiers | Hashed only (Export) | Tier 1 small / Tier 2 larger | Export endpoint (hashed) or `raw_event.payload_json` |
 | D | Reparent profiles on cluster merge | No | Larger | Delete orphan rows under `merged` clusters |
