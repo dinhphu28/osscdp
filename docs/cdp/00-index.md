@@ -46,6 +46,7 @@ flowchart LR
 | `12-testing-and-release-checklist.md` | Testing strategy, CI/CD gates, and production release checklist. |
 | `13-operations.md` | Operations runbook: running the full stack, observability, load test, backup/restore, failure tests. |
 | `14-usage.md` | How-to usage guide: start the stack, auth, send events, segments, destinations, governance, DLQ — with `curl` examples. |
+| `15-future-enhancements.md` | Planned admin-API enhancements (unsubscribe, list destinations by segment, view all identifiers) with implementation specs and interim workarounds. |
 
 ## Design principles
 
