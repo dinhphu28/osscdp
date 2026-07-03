@@ -147,6 +147,7 @@ func run() error {
 		admin.With(auth.Require(rbac.PermDestinationWrite)).Put("/admin/v1/tenants/{tenantID}/destinations/{destinationID}", activationHandler.UpdateDestination)
 		admin.With(auth.Require(rbac.PermDestinationRead)).Get("/admin/v1/tenants/{tenantID}/destinations/{destinationID}", activationHandler.GetDestination)
 		admin.With(auth.Require(rbac.PermDestinationWrite)).Post("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions", activationHandler.CreateSubscription)
+		admin.With(auth.Require(rbac.PermDestinationWrite)).Delete("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/subscriptions/{subscriptionID}", activationHandler.DisableSubscription)
 		admin.With(auth.Require(rbac.PermActivationRead)).Get("/admin/v1/tenants/{tenantID}/destinations/{destinationID}/deliveries", activationHandler.Deliveries)
 		// DLQ operations (Phase 10a).
 		admin.With(auth.Require(rbac.PermDLQRead)).Get("/admin/v1/tenants/{tenantID}/dlq", dlqHandler.List)
