@@ -23,11 +23,11 @@ A single person can end up with **multiple** canonical IDs for two reasons:
    Email/phone placed inside `traits` become profile *display* attributes but never identity nodes,
    so separate `/identify` calls never link. **Fix (usage):** always send `email`/`phone` as
    top-level fields, siblings of `user_id` — not inside `traits`.
-2. **Orphan profiles after a merge.** When two clusters merge, the *loser* cluster's already-created
-   `customer_profile` row is not deleted or repointed (`identity_cluster_id` is set only at
-   creation — `internal/profile/service.go:92`). New traffic uses the survivor's canonical ID, but
-   the old row lingers with a now-dead canonical ID and a `merged`, zero-node cluster. See
-   [Enhancement D](#enhancement-d--reparent-profiles-on-cluster-merge).
+2. **Orphan profiles after a merge (historical — now fixed by [Enhancement D](#enhancement-d--reparent-profiles-on-cluster-merge)).**
+   Merges used to leave the *loser* cluster's `customer_profile` row untouched, so it lingered with a
+   now-dead canonical ID under a `merged`, zero-node cluster. Merges now fold the loser profile into
+   the survivor and delete it in the same transaction. Rows left by merges that predate the change
+   still need the one-off cleanup in Enhancement D's workaround.
 
 Diagnostic — detect residual same-person splits (should return 0 rows):
 
@@ -196,23 +196,41 @@ curl -s -X GET 'http://localhost:18080/admin/v1/tenants/<tenant>/profiles/<canon
 
 ---
 
-## Enhancement D — Reparent profiles on cluster merge
+## Enhancement D — Reparent profiles on cluster merge ✅ Implemented
 
-Removes the root cause of orphan profiles described in the background section.
+Removes the root cause of orphan profiles described in the background section. This is a pipeline
+behavior change — no new HTTP endpoint.
 
-**Today:** When clusters merge, only identity-graph rows move to the survivor
-(`pickSurvivor`/`mergeClusters`, `internal/identity/repo.go`); the loser's `customer_profile` row is
-left untouched (`internal/profile/service.go:92` sets `identity_cluster_id` only at creation and never
-updates it). Result: a stale profile under a dead canonical ID.
+**Status:** Shipped (option (a), full reparent). When a resolution merges clusters, the loser
+profile is folded into the survivor and deleted in the same transaction — no orphan row is left.
 
-**Add (design sketch — larger, cross-package):** on merge, either (a) repoint the loser profile's
-`identity_cluster_id`/`canonical_user_id` to the survivor and merge its traits via the existing
-`MergeTraits` (`internal/profile/merge.go`), or (b) mark the loser profile `merged` and redirect
-lookups. Requires coordination between `internal/identity` (emit which canonical IDs merged) and
-`internal/profile` (apply the reparent). Include idempotency and an audit record.
+Flow:
 
-**Interim workaround (no code):** delete orphan profile rows (they point to `merged`, zero-node
-clusters and receive no live traffic):
+1. **identity** (`internal/identity`) — on merge, `resolveTx` reads the loser clusters'
+   `canonical_user_id`s (`canonicalsFor`) and includes them on the emitted event as
+   `IdentityResolved.MergedCanonicalUserIDs`.
+2. **profile** (`internal/profile`) — `Service.Update` receives those ids and, inside its existing
+   update transaction, for each loser: locks the loser profile, folds it into the survivor via
+   `mergeReparent` (`merge.go`), and `deleteProfileCascade` (`repo.go`) removes the loser profile and
+   its FK children (activation deliveries/tasks, history, segment memberships, consent) in FK-safe
+   order. The survivor is then re-evaluated for segments by the same triggering event downstream.
+3. **audit** — a `reparent` entry (actor `system`) is recorded after commit
+   (`Service.Audit`, wired in `cmd/cdp-worker`).
+
+**Reparent policy (`mergeReparent`), non-destructive to the survivor:** traits and computed
+attributes fill only keys the survivor is missing (survivor's own values win); `total_events` /
+`total_orders` are summed; `first_seen`/`last_seen` are widened. **Trade-offs:** the loser's
+activation-delivery history is deleted, and its segment memberships are dropped (the survivor
+re-enters on the triggering event's evaluation). Idempotent — on reprocess the losers are already gone.
+
+**Tests:** `internal/profile/merge_test.go` (`TestMergeReparent`, policy) and
+`internal/foundationtest/profile_test.go` (`TestProfile_ReparentOnMerge`, end-to-end: two clusters
+merge → loser profile deleted, survivor folds in the loser's phone/email, `total_events` summed,
+`reparent` audited).
+
+**Interim workaround (historical — merges now self-clean):** delete orphan profile rows left by
+merges that predate this change (they point to `merged`, zero-node clusters and receive no live
+traffic):
 
 ```sh
 docker exec -i deploy-postgres-1 psql -U cdp -d cdp -c "
@@ -232,4 +250,4 @@ WHERE p.identity_cluster_id = ic.id
 | A | Unsubscribe / disable a subscription | ✅ Implemented (`DELETE …/subscriptions/{subscriptionID}`) | Small | `UPDATE destination_subscription SET status='disabled'` |
 | B | List destinations by segment | ✅ Implemented (`GET …/segments/{segmentID}/destinations`) | Small | JOIN query on `destination_subscription` + `destination` |
 | C | View all of a person's identifiers | ✅ Tier 1 (`GET …/profiles/{id}/identifiers`, counts); Tier 2 (plaintext) pending | Tier 1 small / Tier 2 larger | Export endpoint (hashed) or `raw_event.payload_json` |
-| D | Reparent profiles on cluster merge | No | Larger | Delete orphan rows under `merged` clusters |
+| D | Reparent profiles on cluster merge | ✅ Implemented (merge folds loser into survivor + deletes it) | Larger | Delete orphan rows under `merged` clusters |

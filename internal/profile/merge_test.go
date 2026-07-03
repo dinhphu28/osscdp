@@ -10,6 +10,57 @@ import (
 	"github.com/dinhphu28/osscdp/internal/events"
 )
 
+func TestMergeReparent(t *testing.T) {
+	early := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	late := time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC)
+
+	survivor := &Profile{
+		Traits:             map[string]any{"name": "Ann", "email": "keep@x.com"},
+		ComputedAttributes: map[string]any{AttrTotalEvents: float64(2), AttrLastEventName: "page_viewed"},
+		LastSeenAt:         &late,
+	}
+	loser := Profile{
+		Traits:             map[string]any{"email": "other@x.com", "phone": "+8490"},
+		ComputedAttributes: map[string]any{AttrTotalEvents: float64(3), AttrTotalOrders: float64(1), AttrLastProductViewed: "p001"},
+		FirstSeenAt:        &early,
+		LastSeenAt:         &early,
+	}
+
+	changed := mergeReparent(survivor, loser)
+
+	// Fill-missing traits: survivor keeps its email/name; gains the loser's phone.
+	if survivor.Traits["email"] != "keep@x.com" {
+		t.Fatalf("survivor email overwritten: %v", survivor.Traits["email"])
+	}
+	if survivor.Traits["phone"] != "+8490" {
+		t.Fatalf("loser phone not folded in: %v", survivor.Traits["phone"])
+	}
+	// Counts summed; loser-only order count carried over.
+	if got := asInt(survivor.ComputedAttributes[AttrTotalEvents]); got != 5 {
+		t.Fatalf("total_events = %d, want 5", got)
+	}
+	if got := asInt(survivor.ComputedAttributes[AttrTotalOrders]); got != 1 {
+		t.Fatalf("total_orders = %d, want 1", got)
+	}
+	// Missing computed key filled; existing one not clobbered.
+	if survivor.ComputedAttributes[AttrLastProductViewed] != "p001" {
+		t.Fatalf("last_product_viewed not filled: %v", survivor.ComputedAttributes[AttrLastProductViewed])
+	}
+	if survivor.ComputedAttributes[AttrLastEventName] != "page_viewed" {
+		t.Fatalf("last_event_name clobbered: %v", survivor.ComputedAttributes[AttrLastEventName])
+	}
+	// Seen window widened: first from loser, last kept from survivor.
+	if survivor.FirstSeenAt == nil || !survivor.FirstSeenAt.Equal(early) {
+		t.Fatalf("first_seen_at not widened: %v", survivor.FirstSeenAt)
+	}
+	if !survivor.LastSeenAt.Equal(late) {
+		t.Fatalf("last_seen_at changed: %v", survivor.LastSeenAt)
+	}
+	if len(changed) == 0 {
+		t.Fatal("expected changed fields")
+	}
+}
+
 func trackEnv(name string, props, ctxJSON, traits string) events.Envelope {
 	e := events.Envelope{
 		Type:      events.TypeTrack,

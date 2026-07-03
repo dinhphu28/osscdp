@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/dinhphu28/osscdp/internal/activation"
+	"github.com/dinhphu28/osscdp/internal/audit"
 	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/config"
 	"github.com/dinhphu28/osscdp/internal/consent"
@@ -111,6 +112,7 @@ func run() error {
 	// Profile unification: consumes identity_resolved, builds customer profiles.
 	profileSvc := profile.NewService(pool, producer, bus.TopicProfileUpdated)
 	profileSvc.OnUpdated = m.ProfileUpdated.Inc
+	profileSvc.Audit = audit.NewRecorder(pool)
 	profileConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-profile", []string{bus.TopicIdentityResolved}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err
@@ -253,7 +255,7 @@ func makeProfileHandler(svc *profile.Service) bus.Handler {
 		if err := json.Unmarshal(r.Value, &ir); err != nil {
 			return err
 		}
-		return svc.Update(ctx, ir.CanonicalUserID, ir.IdentityClusterID, ir.Event)
+		return svc.Update(ctx, ir.CanonicalUserID, ir.IdentityClusterID, ir.MergedCanonicalUserIDs, ir.Event)
 	}
 }
 

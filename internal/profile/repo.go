@@ -103,6 +103,30 @@ func (r *Repo) update(ctx context.Context, q querier, p Profile, fromVersion int
 	return nil
 }
 
+// deleteProfileCascade removes a profile and all its customer-scoped child rows
+// in FK-safe order (children before parent). Used when a cluster merge reparents
+// a loser profile into the survivor. Identity nodes/clusters are owned by the
+// identity package and are not touched here — the merge already moved the nodes
+// to the survivor cluster.
+func (r *Repo) deleteProfileCascade(ctx context.Context, q querier, tenantID, profileID uuid.UUID) error {
+	children := []string{
+		`DELETE FROM activation_delivery WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		`DELETE FROM activation_task WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		`DELETE FROM customer_profile_history WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		`DELETE FROM segment_membership WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		`DELETE FROM customer_consent WHERE tenant_id=$1 AND customer_profile_id=$2`,
+	}
+	for _, sql := range children {
+		if _, err := q.Exec(ctx, sql, tenantID, profileID); err != nil {
+			return fmt.Errorf("reparent delete child: %w", err)
+		}
+	}
+	if _, err := q.Exec(ctx, `DELETE FROM customer_profile WHERE tenant_id=$1 AND id=$2`, tenantID, profileID); err != nil {
+		return fmt.Errorf("reparent delete profile: %w", err)
+	}
+	return nil
+}
+
 // markApplied inserts the history/idempotency row. Returns false if the event
 // was already applied to this profile.
 func (r *Repo) markApplied(ctx context.Context, q querier, tenantID, profileID uuid.UUID, eventID, changeType string, before, after []byte) (bool, error) {
