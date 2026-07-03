@@ -22,6 +22,9 @@ type Result struct {
 	ClusterID       uuid.UUID
 	CanonicalUserID string
 	MergeOccurred   bool
+	// MergedCanonicalIDs are the loser clusters' canonical_user_ids when a merge
+	// occurred — the profile worker reparents their stale profiles into the survivor.
+	MergedCanonicalIDs []string
 }
 
 // IdentityResolved is the event emitted after resolution. It embeds the original
@@ -33,8 +36,11 @@ type IdentityResolved struct {
 	IdentityClusterID uuid.UUID       `json:"identity_cluster_id"`
 	CanonicalUserID   string          `json:"canonical_user_id"`
 	MergeOccurred     bool            `json:"merge_occurred"`
-	ResolvedAt        time.Time       `json:"resolved_at"`
-	Event             events.Envelope `json:"event"`
+	// MergedCanonicalUserIDs lists the loser clusters' canonical_user_ids when a
+	// merge occurred, so the profile worker can reparent their profiles.
+	MergedCanonicalUserIDs []string        `json:"merged_canonical_user_ids,omitempty"`
+	ResolvedAt             time.Time       `json:"resolved_at"`
+	Event                  events.Envelope `json:"event"`
 }
 
 // Service resolves identities and emits identity_resolved.
@@ -107,9 +113,10 @@ func (s *Service) resolveTx(ctx context.Context, env events.Envelope, ids []Iden
 	}
 
 	var (
-		survivor  uuid.UUID
-		canonical string
-		merge     bool
+		survivor         uuid.UUID
+		canonical        string
+		merge            bool
+		mergedCanonicals []string
 	)
 	switch len(clusterIDs) {
 	case 0:
@@ -121,8 +128,12 @@ func (s *Service) resolveTx(ctx context.Context, env events.Envelope, ids []Iden
 		survivor, canonical, err = s.repo.pickSurvivor(ctx, tx, env.TenantID, clusterIDs)
 		if err == nil {
 			losers := without(clusterIDs, survivor)
-			err = s.repo.mergeClusters(ctx, tx, env.TenantID, survivor, losers, env.EventID)
-			merge = true
+			// Capture loser canonicals before the merge (canonical_user_id is
+			// unchanged by merge, but read it while the clusters are still distinct).
+			if mergedCanonicals, err = s.repo.canonicalsFor(ctx, tx, env.TenantID, losers); err == nil {
+				err = s.repo.mergeClusters(ctx, tx, env.TenantID, survivor, losers, env.EventID)
+				merge = true
+			}
 		}
 	}
 	if err != nil {
@@ -135,7 +146,7 @@ func (s *Service) resolveTx(ctx context.Context, env events.Envelope, ids []Iden
 	if err := tx.Commit(ctx); err != nil {
 		return Result{}, fmt.Errorf("commit: %w", err)
 	}
-	return Result{ClusterID: survivor, CanonicalUserID: canonical, MergeOccurred: merge}, nil
+	return Result{ClusterID: survivor, CanonicalUserID: canonical, MergeOccurred: merge, MergedCanonicalIDs: mergedCanonicals}, nil
 }
 
 func (s *Service) emit(ctx context.Context, env events.Envelope, res Result) error {
@@ -143,11 +154,12 @@ func (s *Service) emit(ctx context.Context, env events.Envelope, res Result) err
 		EventType:         "identity_resolved",
 		TenantID:          env.TenantID,
 		EventID:           env.EventID,
-		IdentityClusterID: res.ClusterID,
-		CanonicalUserID:   res.CanonicalUserID,
-		MergeOccurred:     res.MergeOccurred,
-		ResolvedAt:        time.Now().UTC(),
-		Event:             env,
+		IdentityClusterID:      res.ClusterID,
+		CanonicalUserID:        res.CanonicalUserID,
+		MergeOccurred:          res.MergeOccurred,
+		MergedCanonicalUserIDs: res.MergedCanonicalIDs,
+		ResolvedAt:             time.Now().UTC(),
+		Event:                  env,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

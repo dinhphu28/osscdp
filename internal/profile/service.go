@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/dinhphu28/osscdp/internal/audit"
 	"github.com/dinhphu28/osscdp/internal/events"
 )
 
@@ -39,6 +40,9 @@ type Result struct {
 	Version       int64
 	ChangedFields []string
 	Applied       bool
+	// ReparentedIDs are the loser canonical_user_ids whose profiles were folded
+	// into this survivor and deleted during a cluster merge (audited after commit).
+	ReparentedIDs []string
 }
 
 // Service updates customer profiles and emits profile_updated.
@@ -50,6 +54,8 @@ type Service struct {
 
 	// OnUpdated is a metric hook (nil-safe), called once per applied update.
 	OnUpdated func()
+	// Audit records reparent events (nil-safe; unset in unit tests).
+	Audit *audit.Recorder
 }
 
 // NewService constructs a Service.
@@ -58,9 +64,10 @@ func NewService(pool *pgxpool.Pool, pub Publisher, topic string) *Service {
 }
 
 // Update merges one resolved event into the customer's profile. Transactional,
-// idempotent by event_id.
-func (s *Service) Update(ctx context.Context, canonicalUserID string, clusterID uuid.UUID, env events.Envelope) error {
-	res, err := s.updateTx(ctx, canonicalUserID, clusterID, env)
+// idempotent by event_id. mergedCanonicalIDs (set when the resolution merged
+// clusters) name loser profiles to reparent into this survivor.
+func (s *Service) Update(ctx context.Context, canonicalUserID string, clusterID uuid.UUID, mergedCanonicalIDs []string, env events.Envelope) error {
+	res, err := s.updateTx(ctx, canonicalUserID, clusterID, mergedCanonicalIDs, env)
 	if err != nil {
 		return err
 	}
@@ -70,10 +77,20 @@ func (s *Service) Update(ctx context.Context, canonicalUserID string, clusterID 
 	if s.OnUpdated != nil {
 		s.OnUpdated()
 	}
+	if len(res.ReparentedIDs) > 0 && s.Audit != nil {
+		tenantID := env.TenantID
+		if err := s.Audit.Record(ctx, audit.Entry{
+			TenantID: &tenantID, ActorType: audit.ActorSystem, Action: "reparent",
+			ResourceType: "customer_profile", ResourceID: res.ProfileID.String(),
+			After: map[string]any{"survivor": canonicalUserID, "merged_from": res.ReparentedIDs},
+		}); err != nil {
+			return fmt.Errorf("audit reparent: %w", err)
+		}
+	}
 	return s.emit(ctx, canonicalUserID, clusterID, env, res)
 }
 
-func (s *Service) updateTx(ctx context.Context, canonicalUserID string, clusterID uuid.UUID, env events.Envelope) (Result, error) {
+func (s *Service) updateTx(ctx context.Context, canonicalUserID string, clusterID uuid.UUID, mergedCanonicalIDs []string, env events.Envelope) (Result, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Result{}, fmt.Errorf("begin: %w", err)
@@ -112,10 +129,32 @@ func (s *Service) updateTx(ctx context.Context, canonicalUserID string, clusterI
 
 	before := snapshot(prof)
 
+	// Reparent: fold any loser profiles from a cluster merge into this survivor,
+	// then delete them. Idempotent — on reprocess the losers are already gone.
+	var reparented []string
+	var reparentChanged []string
+	for _, lc := range mergedCanonicalIDs {
+		if lc == canonicalUserID {
+			continue
+		}
+		loser, found, err := s.repo.getForUpdate(ctx, tx, env.TenantID, lc)
+		if err != nil {
+			return Result{}, err
+		}
+		if !found {
+			continue
+		}
+		reparentChanged = append(reparentChanged, mergeReparent(&prof, loser)...)
+		if err := s.repo.deleteProfileCascade(ctx, tx, env.TenantID, loser.ID); err != nil {
+			return Result{}, err
+		}
+		reparented = append(reparented, lc)
+	}
+
 	newTraits, ch1 := MergeTraits(prof.Traits, env)
 	newComputed, ch2 := MergeComputed(prof.ComputedAttributes, env)
 	newFirst, newLast, ch3 := MergeSeen(prof.FirstSeenAt, prof.LastSeenAt, env.Timestamp)
-	changed := append(append(ch1, ch2...), ch3...)
+	changed := append(append(append(reparentChanged, ch1...), ch2...), ch3...)
 
 	fromVersion := prof.Version
 	prof.Traits = newTraits
@@ -134,7 +173,7 @@ func (s *Service) updateTx(ctx context.Context, canonicalUserID string, clusterI
 	if err := tx.Commit(ctx); err != nil {
 		return Result{}, fmt.Errorf("commit: %w", err)
 	}
-	return Result{ProfileID: prof.ID, Version: prof.Version, ChangedFields: changed, Applied: true}, nil
+	return Result{ProfileID: prof.ID, Version: prof.Version, ChangedFields: changed, Applied: true, ReparentedIDs: reparented}, nil
 }
 
 func (s *Service) emit(ctx context.Context, canonicalUserID string, clusterID uuid.UUID, env events.Envelope, res Result) error {

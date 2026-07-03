@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dinhphu28/osscdp/internal/audit"
 	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/identity"
@@ -30,7 +31,7 @@ func resolveAndProfile(t *testing.T, f fixture, idSvc *identity.Service, profSvc
 		WHERE n.tenant_id=$1 AND n.namespace=$2 AND n.value_hash=$3`,
 		env.TenantID, identity.NSUserID, identity.ValueHash(env.TenantID, identity.NSUserID, env.Identifiers.UserID)).
 		Scan(&canonical, &cluster))
-	require.NoError(t, profSvc.Update(context.Background(), canonical, cluster, env))
+	require.NoError(t, profSvc.Update(context.Background(), canonical, cluster, nil, env))
 	return canonical, cluster
 }
 
@@ -94,8 +95,8 @@ func TestProfile_IdempotentByEventID(t *testing.T) {
 	e1 := profEnv(t, tid, sid, "dup1", "product_viewed", "u1", "", base)
 	canonical, cluster := resolveAndProfile(t, f, idSvc, profSvc, e1)
 
-	require.NoError(t, profSvc.Update(ctx, canonical, cluster, e1))
-	require.NoError(t, profSvc.Update(ctx, canonical, cluster, e1))
+	require.NoError(t, profSvc.Update(ctx, canonical, cluster, nil, e1))
+	require.NoError(t, profSvc.Update(ctx, canonical, cluster, nil, e1))
 
 	p, err := prepo.GetByCanonical(ctx, tid, canonical)
 	require.NoError(t, err)
@@ -104,6 +105,90 @@ func TestProfile_IdempotentByEventID(t *testing.T) {
 	var hist int
 	require.NoError(t, f.pool.QueryRow(ctx, `SELECT count(*) FROM customer_profile_history WHERE tenant_id=$1`, tid).Scan(&hist))
 	require.Equal(t, 1, hist)
+}
+
+// reparentPub captures every identity_resolved payload the identity service emits.
+type reparentPub struct{ msgs [][]byte }
+
+func (p *reparentPub) Publish(_ context.Context, _, _ string, v []byte) error {
+	p.msgs = append(p.msgs, append([]byte(nil), v...))
+	return nil
+}
+
+// TestProfile_ReparentOnMerge exercises Enhancement D end-to-end: when two
+// clusters merge, the loser's profile is folded into the survivor and deleted,
+// leaving no orphan row.
+func TestProfile_ReparentOnMerge(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pub := &reparentPub{}
+	idSvc := identity.NewService(f.pool, pub, bus.TopicIdentityResolved)
+	profSvc := profile.NewService(f.pool, noopPub{}, bus.TopicProfileUpdated)
+	profSvc.Audit = audit.NewRecorder(f.pool)
+	prepo := profile.NewRepo(f.pool)
+	base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	mkEnv := func(eventID string, ids events.Identifiers, traits string, ts time.Time) events.Envelope {
+		in := events.IncomingEvent{
+			EventID: eventID, EventName: "track", UserID: ids.UserID, AnonymousID: ids.AnonymousID,
+			Email: ids.Email, Phone: ids.Phone, Timestamp: ts.Format(time.RFC3339),
+		}
+		if traits != "" {
+			in.Traits = json.RawMessage(traits)
+		}
+		env, err := events.Normalize(in, tid, sid, events.TypeTrack, ts)
+		require.NoError(t, err)
+		return env
+	}
+
+	// resolve mirrors the worker: resolve identity, then apply to the profile
+	// using the merged canonical ids the resolution just emitted.
+	resolve := func(env events.Envelope) identity.IdentityResolved {
+		pub.msgs = nil
+		require.NoError(t, idSvc.Resolve(ctx, env))
+		require.Len(t, pub.msgs, 1)
+		var ir identity.IdentityResolved
+		require.NoError(t, json.Unmarshal(pub.msgs[0], &ir))
+		require.NoError(t, profSvc.Update(ctx, ir.CanonicalUserID, ir.IdentityClusterID, ir.MergedCanonicalUserIDs, env))
+		return ir
+	}
+
+	// 1) Anonymous person -> cluster K1 with a name.
+	ir1 := resolve(mkEnv("e1", events.Identifiers{AnonymousID: "a1"}, `{"name":"Ann","country":"VN"}`, base))
+	k1 := ir1.CanonicalUserID
+	require.False(t, ir1.MergeOccurred)
+
+	// 2) Known user -> cluster K2 with phone + email.
+	ir2 := resolve(mkEnv("e2", events.Identifiers{UserID: "u1"}, `{"phone":"+8490","email":"u@x.com"}`, base.Add(time.Hour)))
+	k2 := ir2.CanonicalUserID
+	require.NotEqual(t, k1, k2)
+	_, err := prepo.GetByCanonical(ctx, tid, k2)
+	require.NoError(t, err, "loser profile exists before merge")
+
+	// 3) Linking event carries both identifiers -> merge; survivor is the older K1.
+	ir3 := resolve(mkEnv("e3", events.Identifiers{AnonymousID: "a1", UserID: "u1"}, "", base.Add(2*time.Hour)))
+	require.True(t, ir3.MergeOccurred)
+	require.Equal(t, k1, ir3.CanonicalUserID)
+	require.Equal(t, []string{k2}, ir3.MergedCanonicalUserIDs)
+
+	// Loser profile is gone — no orphan row.
+	_, err = prepo.GetByCanonical(ctx, tid, k2)
+	require.ErrorIs(t, err, profile.ErrNotFound)
+
+	// Survivor kept its own name, folded in the loser's phone/email, summed events.
+	sp, err := prepo.GetByCanonical(ctx, tid, k1)
+	require.NoError(t, err)
+	require.Equal(t, "Ann", sp.Traits["name"])
+	require.Equal(t, "+8490", sp.Traits["phone"])
+	require.Equal(t, "u@x.com", sp.Traits["email"])
+	require.EqualValues(t, 3, asIntJSON(sp.ComputedAttributes["total_events"]), "1 (K1) + 1 (folded K2) + 1 (merge event)")
+
+	// The reparent was audited.
+	var audits int
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_log WHERE tenant_id=$1 AND action='reparent'`, tid).Scan(&audits))
+	require.Equal(t, 1, audits)
 }
 
 func TestProfile_QueryByEmail(t *testing.T) {
@@ -169,7 +254,7 @@ func resolveAndProfileWith(t *testing.T, f fixture, idSvc *identity.Service, pro
 		WHERE n.tenant_id=$1 AND n.namespace=$2 AND n.value_hash=$3`,
 		env.TenantID, identity.NSUserID, identity.ValueHash(env.TenantID, identity.NSUserID, env.Identifiers.UserID)).
 		Scan(&canonical, &cluster))
-	require.NoError(t, profSvc.Update(context.Background(), canonical, cluster, env))
+	require.NoError(t, profSvc.Update(context.Background(), canonical, cluster, nil, env))
 }
 
 func asIntJSON(v any) int64 {

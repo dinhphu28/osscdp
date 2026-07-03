@@ -109,6 +109,27 @@ func (r *Repo) pickSurvivor(ctx context.Context, q querier, tenantID uuid.UUID, 
 	return id, canonical, nil
 }
 
+// canonicalsFor returns the canonical_user_ids for the given clusters (used to
+// tell the profile worker which losers to reparent after a merge).
+func (r *Repo) canonicalsFor(ctx context.Context, q querier, tenantID uuid.UUID, clusterIDs []uuid.UUID) ([]string, error) {
+	rows, err := q.Query(ctx,
+		`SELECT canonical_user_id FROM identity_cluster WHERE tenant_id = $1 AND id = ANY($2)`,
+		tenantID, clusterIDs)
+	if err != nil {
+		return nil, fmt.Errorf("canonicals for clusters: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // canonicalFor returns the canonical_user_id for a cluster.
 func (r *Repo) canonicalFor(ctx context.Context, q querier, tenantID, clusterID uuid.UUID) (string, error) {
 	var canonical string
