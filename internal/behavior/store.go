@@ -35,6 +35,12 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 func (s *Store) Count(ctx context.Context, tenantID, profileID uuid.UUID, spec Spec, at time.Time) (int64, error) {
 	from := at.Add(-spec.Window)
 	if spec.WhereMatch == nil {
+		// Non-exact counts use the hourly bucket rollup for the bulk of the window and
+		// an exact log count only for the two partial boundary hours — same result as
+		// a full log scan (finding #5: no leading-edge over-inclusion), far fewer rows.
+		if !spec.Exact {
+			return s.bucketCount(ctx, tenantID, profileID, spec.EventName, from, at)
+		}
 		var n int64
 		err := s.pool.QueryRow(ctx, `
 			SELECT count(*) FROM behavioral_event
@@ -240,6 +246,35 @@ func (s *Store) NthNewestInWindow(ctx context.Context, tenantID, profileID uuid.
 		return time.Time{}, false, fmt.Errorf("nth newest: %w", err)
 	}
 	return t, true, nil
+}
+
+// bucketCount returns the exact count of eventName in [from, at] using the hourly
+// rollup for whole in-window hours and an exact behavioral_event count for the two
+// partial boundary hours. All hour boundaries are computed with date_trunc in SQL so
+// they match the write-side bucket_start regardless of the Go/DB timezone. When from
+// and at fall in the same hour it degrades to a single exact range count.
+func (s *Store) bucketCount(ctx context.Context, tenantID, profileID uuid.UUID, eventName string, from, at time.Time) (int64, error) {
+	var n int64
+	err := s.pool.QueryRow(ctx, `
+		WITH w AS (SELECT $4::timestamptz AS from_ts, $5::timestamptz AS at_ts)
+		SELECT
+			(SELECT COALESCE(SUM(b.count), 0) FROM profile_behavior_bucket b, w
+				WHERE b.tenant_id=$1 AND b.customer_profile_id=$2 AND b.event_name=$3
+				  AND b.bucket_start >= date_trunc('hour', w.from_ts) + interval '1 hour'
+				  AND b.bucket_start <  date_trunc('hour', w.at_ts))
+			+ (SELECT count(*) FROM behavioral_event e, w
+				WHERE e.tenant_id=$1 AND e.customer_profile_id=$2 AND e.event_name=$3
+				  AND e.occurred_at >= w.from_ts
+				  AND e.occurred_at <  LEAST(date_trunc('hour', w.from_ts) + interval '1 hour', w.at_ts + interval '1 microsecond'))
+			+ (SELECT count(*) FROM behavioral_event e, w
+				WHERE e.tenant_id=$1 AND e.customer_profile_id=$2 AND e.event_name=$3
+				  AND date_trunc('hour', w.at_ts) > date_trunc('hour', w.from_ts)
+				  AND e.occurred_at >= date_trunc('hour', w.at_ts) AND e.occurred_at <= w.at_ts)`,
+		tenantID, profileID, eventName, from, at).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("bucket count: %w", err)
+	}
+	return n, nil
 }
 
 func compareCount(op string, got, want float64) bool {

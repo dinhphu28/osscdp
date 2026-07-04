@@ -130,6 +130,9 @@ func evalBehavior(ctx context.Context, b *BehaviorSpec, ec EvalContext, store Be
 // silently degrade to a 0-length window).
 func toSpec(ctx context.Context, b *BehaviorSpec, ec EvalContext, store BehaviorStore, at time.Time) (behavior.Spec, error) {
 	spec := behavior.Spec{EventName: b.EventName, ValueProp: b.ValueProp, Op: b.Op}
+	// Force the exact log path for anything buckets cannot serve honestly (where /
+	// anchor / sequence / value_prop); validation already sets Exact for most of these.
+	spec.Exact = b.Exact || b.Where != nil || b.Anchor != nil || b.ValueProp != ""
 	if b.Value != nil {
 		spec.Value = *b.Value
 	}

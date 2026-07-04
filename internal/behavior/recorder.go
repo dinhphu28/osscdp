@@ -41,15 +41,32 @@ func (r *Recorder) Append(ctx context.Context, tx pgx.Tx, profileID uuid.UUID, e
 	if p := bytes.TrimSpace(env.Properties); len(p) > 0 && !bytes.Equal(p, []byte("null")) {
 		props = []byte(env.Properties)
 	}
-	if _, err := tx.Exec(ctx, `
+	ct, err := tx.Exec(ctx, `
 		INSERT INTO behavioral_event
 			(tenant_id, customer_profile_id, event_id, event_name, occurred_at, props_json)
 		SELECT $1,$2,$3,$4,$5,$6
 		WHERE NOT EXISTS (
 			SELECT 1 FROM behavioral_event
 			WHERE tenant_id=$1 AND customer_profile_id=$2 AND event_id=$3)`,
-		env.TenantID, profileID, env.EventID, env.EventName, occurredAt, props); err != nil {
+		env.TenantID, profileID, env.EventID, env.EventName, occurredAt, props)
+	if err != nil {
 		return fmt.Errorf("append behavioral_event: %w", err)
+	}
+	// Only roll the hourly bucket forward when the log row was actually new — the
+	// bucket aggregates and has no event_id, so a redelivery must not re-increment it.
+	if ct.RowsAffected() == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO profile_behavior_bucket
+			(tenant_id, customer_profile_id, event_name, bucket_start, count, first_at, last_at)
+		VALUES ($1,$2,$3, date_trunc('hour', $4::timestamptz), 1, $4, $4)
+		ON CONFLICT (tenant_id, customer_profile_id, event_name, bucket_start)
+		DO UPDATE SET count    = profile_behavior_bucket.count + 1,
+		              first_at = LEAST(profile_behavior_bucket.first_at, $4),
+		              last_at  = GREATEST(profile_behavior_bucket.last_at, $4)`,
+		env.TenantID, profileID, env.EventName, occurredAt); err != nil {
+		return fmt.Errorf("upsert behavior bucket: %w", err)
 	}
 	return nil
 }
