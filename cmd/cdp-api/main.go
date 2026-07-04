@@ -144,6 +144,8 @@ func run() error {
 		admin.With(auth.Require(rbac.PermSegmentWrite)).Delete("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Deactivate)
 		admin.With(auth.Require(rbac.PermSegmentRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Get)
 		admin.With(auth.Require(rbac.PermSegmentRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/members", segmentHandler.Members)
+		admin.With(auth.Require(rbac.PermSegmentRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/pending/parked", segmentHandler.ListParked)
+		admin.With(auth.Require(rbac.PermSegmentWrite)).Post("/admin/v1/tenants/{tenantID}/segments/{segmentID}/pending/{profileID}/retry", segmentHandler.RetryParked)
 		admin.With(auth.Require(rbac.PermDestinationRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/destinations", activationHandler.ListSegmentDestinations)
 		// Activation: destinations, subscriptions, delivery log (Phase 8).
 		admin.With(auth.Require(rbac.PermDestinationWrite)).Post("/admin/v1/tenants/{tenantID}/destinations", activationHandler.CreateDestination)

@@ -133,6 +133,9 @@ func toSpec(ctx context.Context, b *BehaviorSpec, ec EvalContext, store Behavior
 	// Force the exact log path for anything buckets cannot serve honestly (where /
 	// anchor / sequence / value_prop); validation already sets Exact for most of these.
 	spec.Exact = b.Exact || b.Where != nil || b.Anchor != nil || b.ValueProp != ""
+	if b.ValueProp != "" {
+		spec.DriftProps = append(spec.DriftProps, b.ValueProp)
+	}
 	if b.Value != nil {
 		spec.Value = *b.Value
 	}
@@ -158,6 +161,7 @@ func toSpec(ctx context.Context, b *BehaviorSpec, ec EvalContext, store Behavior
 			m, _ := Evaluate(ctx, *where, EvalContext{Profile: ec.Profile, Event: events.Envelope{Properties: props}}, nil, at)
 			return m
 		}
+		spec.DriftProps = append(spec.DriftProps, referencedPropNames(where)...)
 	}
 	if b.Anchor != nil {
 		anchor, err := toSpec(ctx, b.Anchor, ec, store, at)
@@ -167,6 +171,33 @@ func toSpec(ctx context.Context, b *BehaviorSpec, ec EvalContext, store Behavior
 		spec.Anchor = &anchor
 	}
 	return spec, nil
+}
+
+// referencedPropNames returns the distinct top-level event.properties.<name> keys a
+// where sub-rule reads (e.g. "event.properties.price" -> "price";
+// "event.properties.a.b" -> "a"). Used to scope schema-drift detection (doc 18 §A).
+// Nested paths collapse to their top-level container — a documented limitation.
+func referencedPropNames(r *Rule) []string {
+	seen := map[string]bool{}
+	var out []string
+	var walk func(n *Rule)
+	walk = func(n *Rule) {
+		if rest, ok := strings.CutPrefix(n.Field, "event.properties."); ok && rest != "" {
+			top := rest
+			if i := strings.IndexByte(rest, '.'); i >= 0 {
+				top = rest[:i]
+			}
+			if top != "" && !seen[top] {
+				seen[top] = true
+				out = append(out, top)
+			}
+		}
+		for i := range n.Conditions {
+			walk(&n.Conditions[i])
+		}
+	}
+	walk(r)
+	return out
 }
 
 // matchCount applies a count/frequency comparison operator.

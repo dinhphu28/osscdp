@@ -134,7 +134,9 @@ func run() error {
 	profileHandler := makeProfileHandler(profileSvc)
 
 	// Segmentation: consumes profile_updated, maintains segment membership.
-	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), behavior.NewStore(pool))
+	behaviorStore := behavior.NewStore(pool)
+	behaviorStore.OnSchemaDrift = m.SchemaDrift.Inc // finding #33: in-window event-property type drift (doc 18 §A)
+	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), behaviorStore)
 	segmentSvc.OnEvaluated = m.SegmentEvaluated.Inc
 	segmentSvc.OnMatched = m.SegmentMatched.Inc
 	segmentSvc.OnStatefulEvaluated = m.StatefulEvaluated.Inc
@@ -149,12 +151,15 @@ func run() error {
 	// Deadline sweeper (Phase 5): fires absence/expiry/re-entry transitions with no
 	// inbound event by re-evaluating due segment_pending_eval rows fairly per tenant.
 	segmentRunner := segment.NewRunner(segmentSvc, cfg.SegmentSweepBatchSize, cfg.SegmentSweepPerTenantCap,
-		cfg.SegmentSweepSafetyBatch, cfg.SegmentSweepReclaimTimeout, cfg.SegmentSweepInterval, logger)
+		cfg.SegmentSweepSafetyBatch, cfg.SegmentSweepReclaimTimeout, cfg.SegmentSweepInterval, logger).
+		WithParkPolicy(cfg.SegmentSweepBackoffBase, cfg.SegmentSweepBackoffCap, cfg.SegmentSweepMaxAttempts)
 	segmentRunner.OnClaimed = m.SweepClaimed.Inc
 	segmentRunner.OnTransition = m.SweepTransition.Inc
 	segmentRunner.OnError = m.SweepError.Inc
 	segmentRunner.OnSweepLag = m.SweepLagSeconds.Observe
 	segmentRunner.OnBacklog = func(n int) { m.PendingBacklog.Set(float64(n)) }
+	segmentRunner.OnParked = m.SweepParked.Inc
+	segmentRunner.OnParkedBacklog = func(n int) { m.PendingParked.Set(float64(n)) }
 
 	// Retention (Phase 8): prune aged behavioral_event / bucket partitions.
 	retention := behavior.NewRetention(pool, cfg.BehaviorRetention, cfg.BehaviorRetentionInterval, logger)
