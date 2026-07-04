@@ -23,10 +23,43 @@ const maxWhereScan = 50000
 // (never SQL now()) so edge evaluation is deterministic across redelivery.
 type Store struct {
 	pool *pgxpool.Pool
+
+	// OnSchemaDrift (nil-safe) fires once per windowed evaluation when a rule-referenced
+	// property changed JSON type across the window (finding #33 / doc 18 §A).
+	OnSchemaDrift func()
 }
 
 // NewStore constructs a Store.
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+
+// checkDrift fires OnSchemaDrift if any of props shows >1 distinct jsonb_typeof over
+// [from, at] for this event. One bounded, indexed range query per referenced prop;
+// deterministic in `at` (never now()). Rows with props_json NULL or lacking the key are
+// excluded, so consent-dropped rows never manufacture drift. Best-effort: it swallows
+// its own errors and never fails the real membership evaluation.
+func (s *Store) checkDrift(ctx context.Context, tenantID, profileID uuid.UUID, eventName string, props []string, from, at time.Time) {
+	if s.OnSchemaDrift == nil || len(props) == 0 {
+		return
+	}
+	for _, p := range props {
+		var kinds int
+		if err := s.pool.QueryRow(ctx, `
+			SELECT count(*) FROM (
+				SELECT DISTINCT jsonb_typeof(props_json->$3) AS t
+				FROM behavioral_event
+				WHERE tenant_id=$1 AND customer_profile_id=$2 AND event_name=$4
+				  AND occurred_at >= $5 AND occurred_at <= $6
+				  AND props_json ? $3
+			) x WHERE t IS NOT NULL`,
+			tenantID, profileID, p, eventName, from, at).Scan(&kinds); err != nil {
+			return
+		}
+		if kinds > 1 {
+			s.OnSchemaDrift()
+			return // one signal per evaluation is enough
+		}
+	}
+}
 
 // Count returns how many of spec.EventName occurred in [at-Window, at] (inclusive
 // lower bound, matching Recent/Absent complementarity and doc 16). When
@@ -71,7 +104,11 @@ func (s *Store) Count(ctx context.Context, tenantID, profileID uuid.UUID, spec S
 			matched++
 		}
 	}
-	return matched, rows.Err()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	s.checkDrift(ctx, tenantID, profileID, spec.EventName, spec.DriftProps, from, at)
+	return matched, nil
 }
 
 // Recent reports whether spec.EventName occurred within the trailing Window. A
@@ -174,7 +211,11 @@ func (s *Store) SumValue(ctx context.Context, tenantID, profileID uuid.UUID, spe
 			SELECT COALESCE(SUM(CASE WHEN jsonb_typeof(props_json->$3)='number' THEN (props_json->>$3)::numeric ELSE 0 END), 0)::float8 FROM behavioral_event
 			WHERE tenant_id=$1 AND customer_profile_id=$2 AND event_name=$4 AND occurred_at >= $5 AND occurred_at <= $6`,
 			tenantID, profileID, spec.ValueProp, spec.EventName, from, at).Scan(&sum)
-		return sum, err
+		if err != nil {
+			return 0, err
+		}
+		s.checkDrift(ctx, tenantID, profileID, spec.EventName, spec.DriftProps, from, at)
+		return sum, nil
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT props_json FROM behavioral_event
@@ -206,7 +247,11 @@ func (s *Store) SumValue(ctx context.Context, tenantID, profileID uuid.UUID, spe
 			}
 		}
 	}
-	return sum, rows.Err()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	s.checkDrift(ctx, tenantID, profileID, spec.EventName, spec.DriftProps, from, at)
+	return sum, nil
 }
 
 // LastAt returns the most recent occurred_at of eventName at or before `at`

@@ -21,12 +21,19 @@ type Runner struct {
 	logger       *slog.Logger
 	now          func() time.Time
 
+	// Dead-letter park policy (doc 18 §B). Defaults if WithParkPolicy is not called.
+	backoffBase time.Duration // first-failure backoff (default 30s)
+	backoffCap  time.Duration // backoff ceiling (default 1h)
+	maxAttempts int           // park after this many failures (default 10)
+
 	// Metric hooks (nil-safe).
-	OnClaimed    func()
-	OnTransition func()
-	OnError      func()
-	OnSweepLag   func(seconds float64) // now - due_at at claim
-	OnBacklog    func(due int)         // due, unclaimed rows this tick
+	OnClaimed       func()
+	OnTransition    func()
+	OnError         func()
+	OnSweepLag      func(seconds float64) // now - due_at at claim
+	OnBacklog       func(due int)         // due, unclaimed rows this tick
+	OnParked        func()                // a row crossed into the dead-letter
+	OnParkedBacklog func(depth int)       // current parked-row depth this tick
 }
 
 // NewRunner constructs a sweeper. reclaim time-boxes a crashed claim; safetyBatch
@@ -35,12 +42,20 @@ func NewRunner(svc *Service, batchSize, perTenantCap, safetyBatch int, reclaim, 
 	return &Runner{
 		svc: svc, batchSize: batchSize, perTenantCap: perTenantCap, safetyBatch: safetyBatch,
 		reclaim: reclaim, interval: interval, logger: logger,
+		backoffBase: 30 * time.Second, backoffCap: time.Hour, maxAttempts: 10,
 		now: func() time.Time { return time.Now().UTC() },
 	}
 }
 
 // WithClock overrides the clock (tests advance the injected instant).
 func (r *Runner) WithClock(now func() time.Time) *Runner { r.now = now; return r }
+
+// WithParkPolicy sets the exponential-backoff base/cap and the park-after-N threshold
+// for a persistently-failing deadline row (doc 18 §B).
+func (r *Runner) WithParkPolicy(base, cap time.Duration, maxAttempts int) *Runner {
+	r.backoffBase, r.backoffCap, r.maxAttempts = base, cap, maxAttempts
+	return r
+}
 
 // Run sweeps due deadlines each tick until ctx is canceled.
 func (r *Runner) Run(ctx context.Context) {
@@ -69,6 +84,13 @@ func (r *Runner) RunOnce(ctx context.Context) (int, error) {
 			r.logger.Warn("pending backlog query failed", "error", err.Error())
 		}
 	}
+	if r.OnParkedBacklog != nil {
+		if n, err := r.svc.Repo().ParkedCount(ctx); err == nil {
+			r.OnParkedBacklog(int(n))
+		} else if ctx.Err() == nil {
+			r.logger.Warn("parked count query failed", "error", err.Error())
+		}
+	}
 	rows, err := r.svc.Repo().ClaimDuePending(ctx, now, r.batchSize, r.perTenantCap, r.reclaim)
 	if err != nil {
 		return 0, err
@@ -86,11 +108,21 @@ func (r *Runner) RunOnce(ctx context.Context) (int, error) {
 			}
 			r.logger.Error("sweep eval failed",
 				"tenant", row.TenantID.String(), "segment", row.SegmentID.String(), "error", err.Error())
-			// Back off: push the deadline forward (and unclaim) so a persistently
-			// failing row neither tight-loops on the reclaim nor keeps its oldest
-			// due_at and starves the tenant's healthy deadlines.
-			if derr := r.svc.Repo().DeferPending(ctx, row.TenantID, row.SegmentID, row.CustomerProfileID, now.Add(r.reclaim)); derr != nil && ctx.Err() == nil {
-				r.logger.Error("defer pending failed", "error", derr.Error())
+			// Back off exponentially (and unclaim); past the ceiling, park (dead-letter)
+			// the row so a persistent poison stops churning, stops distorting the lag/
+			// backlog SLIs, and stops crowding the tenant's fair-claim slots.
+			attempts, parked, ferr := r.svc.Repo().FailPending(ctx,
+				row.TenantID, row.SegmentID, row.CustomerProfileID, now,
+				err.Error(), r.backoffBase, r.backoffCap, r.maxAttempts)
+			if ferr != nil && ctx.Err() == nil {
+				r.logger.Error("fail pending failed", "error", ferr.Error())
+			} else if parked {
+				if r.OnParked != nil {
+					r.OnParked()
+				}
+				r.logger.Warn("sweep deadline parked (dead-letter)",
+					"tenant", row.TenantID.String(), "segment", row.SegmentID.String(),
+					"profile", row.CustomerProfileID.String(), "attempts", attempts, "error", err.Error())
 			}
 			continue
 		}

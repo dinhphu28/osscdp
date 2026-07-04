@@ -53,7 +53,7 @@ func TestSweep_AbsenceFiresWithoutEvent(t *testing.T) {
 	members, err := repo.ListMembers(ctx, tid, seg.ID)
 	require.NoError(t, err)
 	require.Len(t, members, 0, "just ordered → not yet absent")
-	due, ok, err := repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
+	due, _, ok, err := repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, due.Equal(t0.Add(24*time.Hour)), "deadline armed 24h after the order")
@@ -138,7 +138,7 @@ func TestSweep_CompositeReArmsToLaterDeadline(t *testing.T) {
 	// Edge at t0 arms the earliest deadline: recency flips at t0+24h.
 	pu.Event.Timestamp, pu.Event.ReceivedAt = t0, t0
 	require.NoError(t, svc.Evaluate(ctx, pu))
-	due, ok, err := repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
+	due, _, ok, err := repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, due.Equal(t0.Add(24*time.Hour)), "armed to the earlier (recency) deadline")
@@ -150,7 +150,7 @@ func TestSweep_CompositeReArmsToLaterDeadline(t *testing.T) {
 	_, err = runner.RunOnce(ctx)
 	require.NoError(t, err)
 
-	due2, ok, err := repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
+	due2, _, ok, err := repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
 	require.NoError(t, err)
 	require.True(t, ok, "deadline re-armed, not dropped")
 	require.True(t, due2.Equal(t0.Add(48*time.Hour)), "re-armed to the later (absence) deadline, got %v", due2)
@@ -171,14 +171,14 @@ func TestSweep_SafetyReEnqueuesActiveMember(t *testing.T) {
 		`INSERT INTO segment_membership (tenant_id, segment_id, customer_profile_id, status, last_evaluated_at, transition_seq)
 		 VALUES ($1,$2,$3,'active',now(),1)`, tid, seg.ID, pu.CustomerProfileID)
 	require.NoError(t, err)
-	_, ok, err := repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
+	_, _, ok, err := repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
 	require.NoError(t, err)
 	require.False(t, ok, "no deadline yet")
 
 	n, err := repo.SafetyReEnqueue(ctx, time.Now().UTC(), 100)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, n, 1)
-	_, ok, err = repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
+	_, _, ok, err = repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
 	require.NoError(t, err)
 	require.True(t, ok, "active member with no deadline is re-enqueued by the safety sweep")
 }

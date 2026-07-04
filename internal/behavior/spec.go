@@ -27,4 +27,10 @@ type Spec struct {
 	// the DSL comparison grammar the segment package owns (the store cannot run it
 	// in SQL). Provided as a closure so the store stays DSL-agnostic.
 	WhereMatch func(props json.RawMessage) bool
+
+	// DriftProps names the TOP-LEVEL props this leaf references (value_prop + the
+	// event.properties.* fields of a where filter). When non-empty, the exact scan
+	// paths probe whether any of them shows >1 distinct JSON type in-window and fire
+	// OnSchemaDrift. Empty => no drift probe (recency/absence/plain count pay nothing).
+	DriftProps []string
 }

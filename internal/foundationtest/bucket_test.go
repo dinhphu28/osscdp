@@ -129,7 +129,7 @@ func TestSegment_PrefilterSkipsPureBehavioral(t *testing.T) {
 	pu := seedProfile(t, f, tid, sid, "e1", "page_view", "u1", "")
 	require.NoError(t, svc.Evaluate(ctx, pu))
 
-	_, ok, err := repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
+	_, _, ok, err := repo.CurrentDueAt(ctx, tid, seg.ID, pu.CustomerProfileID)
 	require.NoError(t, err)
 	require.False(t, ok, "the unreferenced event must not evaluate the pure-behavioural segment")
 }
