@@ -34,6 +34,9 @@ type Config struct {
 	SegmentSweepReclaimTimeout time.Duration
 	SegmentSweepSafetyBatch    int
 
+	BehaviorRetention         time.Duration
+	BehaviorRetentionInterval time.Duration
+
 	RateLimitRPS     float64
 	RateLimitBurst   int
 	CircuitThreshold int
@@ -70,6 +73,9 @@ func Load() (Config, error) {
 		SegmentSweepPerTenantCap:   getEnvInt("SEGMENT_SWEEP_PER_TENANT_CAP", 50),
 		SegmentSweepReclaimTimeout: getEnvDuration("SEGMENT_SWEEP_RECLAIM_TIMEOUT", time.Minute),
 		SegmentSweepSafetyBatch:    getEnvInt("SEGMENT_SWEEP_SAFETY_BATCH", 20),
+
+		BehaviorRetention:         getEnvDuration("BEHAVIOR_RETENTION", 40*24*time.Hour),
+		BehaviorRetentionInterval: getEnvDuration("BEHAVIOR_RETENTION_INTERVAL", 6*time.Hour),
 
 		RateLimitRPS:       getEnvFloat("RATE_LIMIT_RPS", 50),
 		RateLimitBurst:     getEnvInt("RATE_LIMIT_BURST", 100),

@@ -25,6 +25,8 @@ type Runner struct {
 	OnClaimed    func()
 	OnTransition func()
 	OnError      func()
+	OnSweepLag   func(seconds float64) // now - due_at at claim
+	OnBacklog    func(due int)         // due, unclaimed rows this tick
 }
 
 // NewRunner constructs a sweeper. reclaim time-boxes a crashed claim; safetyBatch
@@ -60,6 +62,13 @@ func (r *Runner) Run(ctx context.Context) {
 // safety re-enqueue forward. Returns how many deadlines were processed.
 func (r *Runner) RunOnce(ctx context.Context) (int, error) {
 	now := r.now()
+	if r.OnBacklog != nil {
+		if n, err := r.svc.Repo().PendingBacklog(ctx, now, r.reclaim); err == nil {
+			r.OnBacklog(int(n))
+		} else if ctx.Err() == nil {
+			r.logger.Warn("pending backlog query failed", "error", err.Error())
+		}
+	}
 	rows, err := r.svc.Repo().ClaimDuePending(ctx, now, r.batchSize, r.perTenantCap, r.reclaim)
 	if err != nil {
 		return 0, err
@@ -67,6 +76,9 @@ func (r *Runner) RunOnce(ctx context.Context) (int, error) {
 	for _, row := range rows {
 		if r.OnClaimed != nil {
 			r.OnClaimed()
+		}
+		if r.OnSweepLag != nil {
+			r.OnSweepLag(now.Sub(row.DueAt).Seconds())
 		}
 		if err := r.svc.SweepEvaluate(ctx, row, now); err != nil {
 			if r.OnError != nil {

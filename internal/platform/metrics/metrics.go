@@ -30,6 +30,9 @@ type Metrics struct {
 	SweepClaimed          prometheus.Counter
 	SweepTransition       prometheus.Counter
 	SweepError            prometheus.Counter
+	SweepLagSeconds       prometheus.Histogram
+	PendingBacklog        prometheus.Gauge
+	BehaviorRetention     prometheus.Counter
 	ActivationSent        prometheus.Counter
 	ActivationFailed      prometheus.Counter
 	ActivationSkipped     prometheus.Counter
@@ -103,6 +106,18 @@ func New() *Metrics {
 		SweepError: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "segment_sweep_error_total", Help: "Deadline re-evaluations that errored (deferred for retry).",
 		}),
+		SweepLagSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "segment_sweep_lag_seconds",
+			Help: "Seconds between a deadline's due_at and when the sweeper claimed it.",
+			// 1s .. ~48 days, so day-scale lag from the reclaim path stays resolvable.
+			Buckets: prometheus.ExponentialBuckets(1, 4, 12),
+		}),
+		PendingBacklog: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "segment_pending_backlog", Help: "Due, unclaimed segment_pending_eval rows at the last sweep tick.",
+		}),
+		BehaviorRetention: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "behavior_retention_pruned_total", Help: "Behavioral partitions dropped + residue rows deleted by retention.",
+		}),
 		ActivationSent: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "activation_sent_total", Help: "Activation deliveries that succeeded.",
 		}),
@@ -130,7 +145,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.EventsPublished, m.EventsConsumed, m.ProcessingRetries,
 		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond, m.IdentityResolved, m.IdentityMerge,
-		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.StatefulEvaluated, m.StatefulMatched, m.MembershipPublished, m.MembershipPublishFail, m.SweepClaimed, m.SweepTransition, m.SweepError, m.ActivationSent, m.ActivationFailed,
+		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.StatefulEvaluated, m.StatefulMatched, m.MembershipPublished, m.MembershipPublishFail, m.SweepClaimed, m.SweepTransition, m.SweepError, m.SweepLagSeconds, m.PendingBacklog, m.BehaviorRetention, m.ActivationSent, m.ActivationFailed,
 		m.ActivationSkipped, m.ActivationCircuitOpen,
 		m.EventsReceived, m.EventsValidated, m.EventsRejected, m.EventsRateLimited)
 	return m
