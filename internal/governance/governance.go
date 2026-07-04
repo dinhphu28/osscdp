@@ -11,6 +11,7 @@ import (
 
 	"github.com/dinhphu28/osscdp/internal/audit"
 	"github.com/dinhphu28/osscdp/internal/consent"
+	"github.com/dinhphu28/osscdp/internal/crypto"
 	"github.com/dinhphu28/osscdp/internal/profile"
 )
 
@@ -20,11 +21,13 @@ type Service struct {
 	profiles *profile.Repo
 	consent  *consent.Repo
 	audit    *audit.Recorder
+	cipher   *crypto.Cipher
 }
 
-// NewService constructs a Service.
-func NewService(pool *pgxpool.Pool, recorder *audit.Recorder) *Service {
-	return &Service{pool: pool, profiles: profile.NewRepo(pool), consent: consent.NewRepo(pool), audit: recorder}
+// NewService constructs a Service. cipher (nil-safe) decrypts identity_node
+// plaintext for the identifier inventory (Enhancement C Tier 2).
+func NewService(pool *pgxpool.Pool, recorder *audit.Recorder, cipher *crypto.Cipher) *Service {
+	return &Service{pool: pool, profiles: profile.NewRepo(pool), consent: consent.NewRepo(pool), audit: recorder, cipher: cipher}
 }
 
 // IdentityNode is an exported identity node (hashed value only — no raw PII).
@@ -110,18 +113,21 @@ func (s *Service) Export(ctx context.Context, tenantID uuid.UUID, canonicalUserI
 }
 
 // IdentifierInventory summarizes all identity nodes linked to a person, grouped
-// by namespace, as counts only — no PII, not even the hashes. It answers "how
-// many phones / emails does this person have" that the last-write-wins profile
-// traits cannot (they show one value per key). For the hashed node values, use
-// the Export endpoint; for plaintext, Tier 2 (encrypted values) is not built yet.
+// by namespace. Counts (ByNamespace/Total) answer "how many phones / emails does
+// this person have" that the last-write-wins profile traits cannot. Values holds
+// the decrypted plaintext per namespace (Tier 2), for nodes ingested after
+// encryption was enabled; the handler masks it unless the caller holds pii:read.
 type IdentifierInventory struct {
-	CanonicalUserID string         `json:"canonical_user_id"`
-	Total           int            `json:"total"`
-	ByNamespace     map[string]int `json:"by_namespace"`
+	CanonicalUserID string              `json:"canonical_user_id"`
+	Total           int                 `json:"total"`
+	ByNamespace     map[string]int      `json:"by_namespace"`
+	Values          map[string][]string `json:"values,omitempty"`
 }
 
 // Identifiers returns the identifier inventory for a resolved person. It reuses
-// the Export cluster-node join, aggregated by namespace.
+// the Export cluster-node join and, when a cipher is configured, decrypts each
+// node's value_encrypted into Values (nodes lacking ciphertext are counted but
+// contribute no value).
 func (s *Service) Identifiers(ctx context.Context, tenantID uuid.UUID, canonicalUserID string) (IdentifierInventory, error) {
 	p, err := s.profiles.GetByCanonical(ctx, tenantID, canonicalUserID)
 	if errors.Is(err, profile.ErrNotFound) {
@@ -131,11 +137,10 @@ func (s *Service) Identifiers(ctx context.Context, tenantID uuid.UUID, canonical
 		return IdentifierInventory{}, err
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT n.namespace, count(*)
+		SELECT n.namespace, n.value_encrypted
 		FROM identity_node n
 		JOIN identity_cluster_member m ON m.identity_node_id = n.id
 		WHERE m.tenant_id=$1 AND m.cluster_id=$2
-		GROUP BY n.namespace
 		ORDER BY n.namespace`, tenantID, p.IdentityClusterID)
 	if err != nil {
 		return IdentifierInventory{}, fmt.Errorf("identifier inventory: %w", err)
@@ -144,12 +149,23 @@ func (s *Service) Identifiers(ctx context.Context, tenantID uuid.UUID, canonical
 	inv := IdentifierInventory{CanonicalUserID: canonicalUserID, ByNamespace: map[string]int{}}
 	for rows.Next() {
 		var ns string
-		var n int
-		if err := rows.Scan(&ns, &n); err != nil {
+		var enc *string
+		if err := rows.Scan(&ns, &enc); err != nil {
 			return IdentifierInventory{}, err
 		}
-		inv.ByNamespace[ns] = n
-		inv.Total += n
+		inv.ByNamespace[ns]++
+		inv.Total++
+		if enc == nil || *enc == "" || s.cipher == nil {
+			continue
+		}
+		// Skip (don't fail the request) a node that cannot be decrypted, e.g. a
+		// key rotation left old ciphertext undecryptable.
+		if v, decErr := s.cipher.Decrypt(*enc); decErr == nil {
+			if inv.Values == nil {
+				inv.Values = map[string][]string{}
+			}
+			inv.Values[ns] = append(inv.Values[ns], v)
+		}
 	}
 	return inv, rows.Err()
 }

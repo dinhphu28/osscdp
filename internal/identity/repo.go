@@ -29,14 +29,19 @@ func NewRepo(pool *pgxpool.Pool) *Repo {
 }
 
 // upsertNode inserts or returns the identity node for (tenant, namespace, hash).
-func (r *Repo) upsertNode(ctx context.Context, q querier, tenantID uuid.UUID, namespace, valueHash string) (uuid.UUID, error) {
+func (r *Repo) upsertNode(ctx context.Context, q querier, tenantID uuid.UUID, namespace, valueHash, valueEncrypted string) (uuid.UUID, error) {
 	var id uuid.UUID
+	// value_encrypted is filled opportunistically: set on first insert, and
+	// backfilled on re-ingest for a node that predates encryption (COALESCE keeps
+	// the existing ciphertext so the randomized GCM output does not churn).
 	err := q.QueryRow(ctx, `
-		INSERT INTO identity_node (id, tenant_id, namespace, value_hash)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (tenant_id, namespace, value_hash) DO UPDATE SET updated_at = now()
+		INSERT INTO identity_node (id, tenant_id, namespace, value_hash, value_encrypted)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (tenant_id, namespace, value_hash) DO UPDATE
+		SET updated_at = now(),
+		    value_encrypted = COALESCE(identity_node.value_encrypted, EXCLUDED.value_encrypted)
 		RETURNING id`,
-		uuid.New(), tenantID, namespace, valueHash).Scan(&id)
+		uuid.New(), tenantID, namespace, valueHash, nullString(valueEncrypted)).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("upsert identity_node: %w", err)
 	}
