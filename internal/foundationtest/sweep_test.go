@@ -183,6 +183,34 @@ func TestSweep_SafetyReEnqueuesActiveMember(t *testing.T) {
 	require.True(t, ok, "active member with no deadline is re-enqueued by the safety sweep")
 }
 
+// TestSweep_MetricHooksFire: the sweep-lag histogram and backlog gauge hooks fire
+// with sensible values (Phase 8 observability).
+func TestSweep_MetricHooksFire(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	repo := segment.NewRepo(f.pool)
+	svc := segment.NewService(f.pool, profile.NewRepo(f.pool), behavior.NewStore(f.pool))
+	seg, err := repo.CreateSegment(ctx, tid, "s", "", absenceRule())
+	require.NoError(t, err)
+	pu := seedProfile(t, f, tid, sid, "e1", "page_view", "u1", "")
+	insertPending(t, f, tid, seg.ID, pu.CustomerProfileID, time.Now().Add(-2*time.Minute), nil)
+
+	var lag float64
+	var backlog, claimed int
+	runner := segment.NewRunner(svc, 100, 50, 0, time.Minute, time.Second, testLogger())
+	runner.OnSweepLag = func(s float64) { lag = s }
+	runner.OnBacklog = func(n int) { backlog = n }
+	runner.OnClaimed = func() { claimed++ }
+
+	n, err := runner.RunOnce(ctx)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, n, 1)
+	require.GreaterOrEqual(t, claimed, 1)
+	require.Greater(t, lag, 0.0, "sweep lag = now - due_at is observed")
+	require.GreaterOrEqual(t, backlog, 1, "backlog gauge counts the due row")
+}
+
 // TestSweep_FairClaimAcrossTenants: one tenant with many overdue rows must not starve
 // another tenant's due row in the same claim (finding #8).
 func TestSweep_FairClaimAcrossTenants(t *testing.T) {

@@ -67,25 +67,44 @@ Good for:
 - Batch export.
 - Campaign target lists.
 
-## Level 3 — Stateful behavioral segmentation
+## Level 3 — Stateful behavioral segmentation ✅ shipped
 
-Stateful segmentation evaluates behavior over time.
-
-Example:
+Stateful segmentation evaluates behavior over time. The flagship works end-to-end:
 
 ```text
 Viewed product at least 3 times in 7 days
 AND did not purchase within 24 hours
 ```
 
-Defer this until the core CDP is stable.
+— evaluated at event time **and** fired by a deadline sweeper with no inbound event
+(including for dormant profiles). Design of record: [16 — Level 3 Stateful Behavioral
+Segmentation](16-stateful-segmentation.md); build plan: [17 — Implementation
+Plan](17-stateful-segmentation-implementation.md). It was built in-process (Postgres,
+no Kafka-Streams/Flink/Redis) as: a durable partitioned `behavioral_event` log +
+hourly `profile_behavior_bucket` rollups, a clock-injected windowed evaluator, atomic
+outbox-emitted membership, and a per-tenant-fair deadline sweeper.
 
-Possible future implementations:
+### Windowing support matrix
 
-- Kafka Streams.
-- Flink.
-- Custom worker + Redis state.
-- ClickHouse materialized views.
+| Behaviour kind | Served from |
+|---|---|
+| `count` / `frequency` (threshold) | **bucket** rollup (exact via boundary-hour correction), or exact log if `where`/`value_prop` |
+| `recency` / `absence` | exact `MAX(occurred_at)` index lookup |
+| correlated `absence` (with anchor) | exact log |
+| `sequence` | exact log (ordered self-join) |
+| frequency-of-value (`value_prop`) | exact log |
+
+A behavioural `due_at` deadline is armed only for **sweep-safe** rules (no stateless
+`event.*` leaf). `count`/`recency`/`absence`/correlated-`absence` each arm an exact
+elapse deadline (e.g. `last(anchor)+W` for correlated absence); only `sequence` has no
+cheap elapse deadline and relies on the safety sweep. `sequence`, correlated `absence`,
+`where`, and `value_prop` are always exact (never bucket-served).
+
+**Known limitations:** retention keeps data for `max(BEHAVIOR_RETENTION, longest active
+window + margin)`, so no in-window data is pruned. Event **property-shape drift** (a
+`where`/`value_prop` property changing type mid-window) is **not yet detected** and can
+silently mis-evaluate those windows — schema-version drift detection (doc 16 finding
+#33) is deferred.
 
 ## Segment model
 

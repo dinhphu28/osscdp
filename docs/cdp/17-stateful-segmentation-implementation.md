@@ -789,9 +789,11 @@ Rationale: doc 16 §Retention, §Observability, findings #9, #33. Operational co
   keyed off **server `inserted_at`/partition range**, never client `occurred_at`, and never inside a
   live window (finding #9). Config `BEHAVIOR_RETENTION` (default e.g. `40d`). `UpdateSegment` warns /
   extends retention when a new version's `max_window_seconds` exceeds the retained horizon (finding #19).
-- **Schema-version** (finding #33): `behavioral_event.schema_version` is already stamped (Phase 2);
-  emit a `BehaviorSchemaDrift` metric when a live-window rule references a property whose
-  `schema_version` changed, and require a new `segment_version` on a property-shape change.
+- **Schema-version** (finding #33) — **DEFERRED (not shipped).** `behavioral_event.schema_version` is
+  stamped (Phase 2) but never read; there is no `BehaviorSchemaDrift` metric and no
+  property-shape-change enforcement. Event property-shape drift can therefore silently mis-evaluate
+  in-flight `where`/`value_prop` windows — a documented known limitation (doc 06 §Level 3), to be
+  implemented in a follow-up.
 - **Metrics** on `metrics.Metrics` (`metrics.go:12`) + nil-safe hooks (doc 16 §Observability):
   `SegmentStatefulEvaluated`, `SegmentStatefulMatched`, `BehaviorEventsAppended`,
   `BehaviorBucketsUpserted`, `SegmentSweepClaimed`, `SegmentSweepTransitions`, `SegmentSweepLagSeconds`
@@ -810,6 +812,21 @@ Rationale: doc 16 §Retention, §Observability, findings #9, #33. Operational co
 - `BehaviorSchemaDrift` fires when a rule's referenced property changes `schema_version` mid-window.
 
 **Ship:** operationally complete; doc 06 reflects reality.
+
+**Implementation notes (adversarial-review-confirmed):**
+
+- **Retention is window-aware** — the effective horizon is `max(BEHAVIOR_RETENTION, longest active
+  window + margin)` (queried from `segment_version.max_window_seconds`), so no in-window data is ever
+  pruned (findings #9/#19). It DROPs whole aged weekly partitions (create-ahead so writes land in
+  droppable partitions), DELETEs only the DEFAULT partition's residue, drops under a `SET LOCAL
+  lock_timeout` (never stalls inserts), and is leader-guarded by an advisory lock (one replica prunes).
+- **Metrics wired to real hooks**: `segment_sweep_lag_seconds` (histogram, 1s–~48d), `segment_pending_backlog`
+  (gauge incl. reclaimable rows), `behavior_retention_pruned_total`. The Phase-3/4/5/6 metrics
+  (stateful eval/match, membership publish, sweep claim/transition/error) were wired in their phases.
+- **Deferred (documented as known limitations):** schema-version drift detection (finding #33 — no
+  `BehaviorSchemaDrift`, property-shape drift can silently mis-evaluate `where`/`value_prop` windows);
+  the write-path append/upsert/fold counters; the DETACH/redistribute dance (the DELETE fallback keeps
+  the DEFAULT bounded instead).
 
 ---
 

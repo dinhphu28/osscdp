@@ -21,8 +21,8 @@ CREATE TABLE profile_behavior_bucket (
     PRIMARY KEY (tenant_id, customer_profile_id, event_name, bucket_start)
 ) PARTITION BY RANGE (bucket_start);
 
--- Phase 6 ships a single DEFAULT partition; Phase 8's retention job manages weekly
--- ranges (same DETACH/redistribute/re-ATTACH dance as behavioral_event).
+-- Phase 6 ships a single DEFAULT partition; Phase 8 retention creates future weekly
+-- partitions ahead, DROPs old ones, and DELETEs DEFAULT residue (see behavioral_event).
 CREATE TABLE profile_behavior_bucket_default PARTITION OF profile_behavior_bucket DEFAULT;
 
 -- Backfill from behavioral_event rows already recorded under earlier phases, so a

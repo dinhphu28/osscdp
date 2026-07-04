@@ -295,6 +295,20 @@ type PendingEval struct {
 	SegmentID         uuid.UUID
 	CustomerProfileID uuid.UUID
 	Reason            string
+	DueAt             time.Time
+}
+
+// PendingBacklog counts due deadline rows that are claimable now — unclaimed OR with a
+// stale claim past the reclaim window (crashed claims) — a sweeper-lag SLI gauge.
+func (r *Repo) PendingBacklog(ctx context.Context, now time.Time, reclaim time.Duration) (int64, error) {
+	var n int64
+	err := r.pool.QueryRow(ctx,
+		`SELECT count(*) FROM segment_pending_eval WHERE due_at <= $1 AND (claimed_at IS NULL OR claimed_at < $2)`,
+		now, now.Add(-reclaim)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("pending backlog: %w", err)
+	}
+	return n, nil
 }
 
 // UpsertPendingTx arms/re-arms a deadline for (segment, profile). Re-arming clears
@@ -376,7 +390,7 @@ func (r *Repo) ClaimDuePending(ctx context.Context, now time.Time, batchSize, pe
 		)
 		UPDATE segment_pending_eval p SET claimed_at=$1
 		FROM locked l WHERE p.ctid = l.ctid
-		RETURNING p.tenant_id, p.segment_id, p.customer_profile_id, p.reason`,
+		RETURNING p.tenant_id, p.segment_id, p.customer_profile_id, p.reason, p.due_at`,
 		now, now.Add(-reclaim), perTenantCap, batchSize)
 	if err != nil {
 		return nil, fmt.Errorf("claim due pending: %w", err)
@@ -385,7 +399,7 @@ func (r *Repo) ClaimDuePending(ctx context.Context, now time.Time, batchSize, pe
 	var out []PendingEval
 	for rows.Next() {
 		var p PendingEval
-		if err := rows.Scan(&p.TenantID, &p.SegmentID, &p.CustomerProfileID, &p.Reason); err != nil {
+		if err := rows.Scan(&p.TenantID, &p.SegmentID, &p.CustomerProfileID, &p.Reason, &p.DueAt); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
