@@ -87,6 +87,13 @@ func run() error {
 	rel.OnPublished = m.EventsPublished.Inc
 	rel.OnPublishFail = m.KafkaPublishFailed.Inc
 
+	// Second relay: drains the segment membership outbox (Phase 4) to its topic, so
+	// membership flip + emit commit atomically and publish at-least-once.
+	memRelay := relay.New(pool, producer, bus.TopicSegmentMembershipChanged, cfg.RelayBatchSize, cfg.RelayPollInterval, logger).
+		WithTable("segment_membership_outbox")
+	memRelay.OnPublished = m.MembershipPublished.Inc
+	memRelay.OnPublishFail = m.MembershipPublishFail.Inc
+
 	rawRepo := rawevent.NewRepo(pool)
 	dlqRec := dlq.NewRecorder(pool)
 
@@ -125,7 +132,7 @@ func run() error {
 	profileHandler := makeProfileHandler(profileSvc)
 
 	// Segmentation: consumes profile_updated, maintains segment membership.
-	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), producer, bus.TopicSegmentMembershipChanged, behavior.NewStore(pool))
+	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), behavior.NewStore(pool))
 	segmentSvc.OnEvaluated = m.SegmentEvaluated.Inc
 	segmentSvc.OnMatched = m.SegmentMatched.Inc
 	segmentSvc.OnStatefulEvaluated = m.StatefulEvaluated.Inc
@@ -165,8 +172,9 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(8)
+	wg.Add(9)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
+	go func() { defer wg.Done(); memRelay.Run(ctx) }()
 	go func() { defer wg.Done(); activationRunner.Run(ctx) }()
 	go func() {
 		defer wg.Done()

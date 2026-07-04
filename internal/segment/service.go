@@ -13,11 +13,6 @@ import (
 	"github.com/dinhphu28/osscdp/internal/profile"
 )
 
-// Publisher emits segment_membership_changed.
-type Publisher interface {
-	Publish(ctx context.Context, topic, key string, value []byte) error
-}
-
 // ProfileReader loads a profile by id.
 type ProfileReader interface {
 	GetByID(ctx context.Context, tenantID, id uuid.UUID) (profile.Profile, error)
@@ -38,15 +33,16 @@ type MembershipChanged struct {
 	CustomerProfileID uuid.UUID `json:"customer_profile_id"`
 	Change            string    `json:"change"`
 	ReasonEventID     string    `json:"reason_event_id"`
+	TransitionSeq     int64     `json:"transition_seq"`
 	ChangedAt         time.Time `json:"changed_at"`
 }
 
 // Service evaluates profiles against active segments and tracks membership.
+// Membership transitions and their emits are written atomically to
+// segment_membership_outbox; a relay drains that table to the bus.
 type Service struct {
 	repo     *Repo
 	profiles ProfileReader
-	pub      Publisher
-	topic    string
 
 	// store answers windowed behavioral leaves (nil => stateful leaves inert).
 	store BehaviorStore
@@ -60,8 +56,8 @@ type Service struct {
 
 // NewService constructs a Service. store (nil-safe) evaluates Level 3 behavioral
 // leaves; a nil store leaves stateful segments inert.
-func NewService(pool *pgxpool.Pool, profiles ProfileReader, pub Publisher, topic string, store BehaviorStore) *Service {
-	return &Service{repo: NewRepo(pool), profiles: profiles, pub: pub, topic: topic, store: store}
+func NewService(pool *pgxpool.Pool, profiles ProfileReader, store BehaviorStore) *Service {
+	return &Service{repo: NewRepo(pool), profiles: profiles, store: store}
 }
 
 // Repo exposes the underlying repository (for admin handlers).
@@ -110,35 +106,54 @@ func (s *Service) Evaluate(ctx context.Context, pu profile.ProfileUpdated) error
 		if matched && stateful && s.OnStatefulMatched != nil {
 			s.OnStatefulMatched()
 		}
-		status, err := s.repo.MembershipStatus(ctx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID)
-		if err != nil {
+		if err := s.applyMembership(ctx, pu, seg, matched); err != nil {
 			return err
-		}
-		switch {
-		case matched && status != MembershipActive:
-			if err := s.repo.Enter(ctx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID, seg.Version); err != nil {
-				return err
-			}
-			if err := s.emit(ctx, pu, seg, ChangeEntered); err != nil {
-				return err
-			}
-		case matched && status == MembershipActive:
-			if err := s.repo.TouchEvaluated(ctx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID); err != nil {
-				return err
-			}
-		case !matched && status == MembershipActive:
-			if err := s.repo.Exit(ctx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID); err != nil {
-				return err
-			}
-			if err := s.emit(ctx, pu, seg, ChangeExited); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
 }
 
-func (s *Service) emit(ctx context.Context, pu profile.ProfileUpdated, seg ActiveVersion, change string) error {
+// applyMembership performs one (segment, profile) transition in a single tx: a
+// conditional flip (no read-then-write race) and, only when the status actually
+// flipped, the outbox insert — so flip + emit commit atomically. A redundant
+// transition (already active / already exited / never a member) emits nothing.
+func (s *Service) applyMembership(ctx context.Context, pu profile.ProfileUpdated, seg ActiveVersion, matched bool) error {
+	tx, err := s.repo.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var (
+		seq     int64
+		flipped bool
+		change  string
+	)
+	if matched {
+		change = ChangeEntered
+		if seq, flipped, err = s.repo.EnterTx(ctx, tx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID, seg.Version); err != nil {
+			return err
+		}
+		if !flipped {
+			// Already a member: record the evaluation, emit nothing.
+			if err := s.repo.TouchEvaluatedTx(ctx, tx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID, seg.Version); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
+	} else {
+		change = ChangeExited
+		if seq, flipped, err = s.repo.ExitTx(ctx, tx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID); err != nil {
+			return err
+		}
+		if !flipped {
+			return tx.Commit(ctx) // not a member / already exited
+		}
+	}
+
+	// ReasonEventID is a unique per-flip token (<event_id>:<seq>) so activation's
+	// idempotency key is distinct per real transition (finding #27) while replays
+	// of the same flip dedup.
 	payload := MembershipChanged{
 		EventType:         "segment_membership_changed",
 		TenantID:          pu.TenantID,
@@ -146,12 +161,17 @@ func (s *Service) emit(ctx context.Context, pu profile.ProfileUpdated, seg Activ
 		SegmentVersionID:  seg.VersionID,
 		CustomerProfileID: pu.CustomerProfileID,
 		Change:            change,
-		ReasonEventID:     pu.EventID,
+		ReasonEventID:     fmt.Sprintf("%s:%d", pu.EventID, seq),
+		TransitionSeq:     seq,
 		ChangedAt:         time.Now().UTC(),
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal membership change: %w", err)
 	}
-	return s.pub.Publish(ctx, s.topic, pu.TenantID.String()+"|"+pu.CanonicalUserID, b)
+	key := pu.TenantID.String() + "|" + pu.CanonicalUserID
+	if err := s.repo.InsertMembershipOutbox(ctx, tx, pu.TenantID, key, b); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

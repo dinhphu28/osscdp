@@ -24,6 +24,7 @@ type Relay struct {
 	pool      *pgxpool.Pool
 	pub       Publisher
 	topic     string
+	table     string
 	batchSize int
 	interval  time.Duration
 	logger    *slog.Logger
@@ -33,9 +34,17 @@ type Relay struct {
 	OnPublishFail func()
 }
 
-// New constructs a Relay.
+// New constructs a Relay draining the default event_outbox table.
 func New(pool *pgxpool.Pool, pub Publisher, topic string, batchSize int, interval time.Duration, logger *slog.Logger) *Relay {
-	return &Relay{pool: pool, pub: pub, topic: topic, batchSize: batchSize, interval: interval, logger: logger}
+	return &Relay{pool: pool, pub: pub, topic: topic, table: "event_outbox", batchSize: batchSize, interval: interval, logger: logger}
+}
+
+// WithTable points the relay at a different outbox table (e.g. a second relay
+// draining segment_membership_outbox). The name is an internal constant, never
+// user input. Returns the relay for chaining.
+func (r *Relay) WithTable(table string) *Relay {
+	r.table = table
+	return r
 }
 
 // Run loops until ctx is canceled, draining the outbox each tick.
@@ -70,7 +79,7 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 
 	rows, err := tx.Query(ctx, `
 		SELECT id, partition_key, payload_json
-		FROM event_outbox
+		FROM `+r.table+`
 		WHERE status = $1
 		ORDER BY created_at
 		LIMIT $2
@@ -116,7 +125,7 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE event_outbox SET status = 'published', published_at = now()
+		UPDATE `+r.table+` SET status = 'published', published_at = now()
 		WHERE id = ANY($1)`, published); err != nil {
 		return 0, fmt.Errorf("mark published: %w", err)
 	}

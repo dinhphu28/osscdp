@@ -467,6 +467,20 @@ separate `MembershipStatus` read (the conditional UPDATE subsumes it).
 **Ship:** no double-emit, no lost emit, no idempotency collision. Today's engine is strictly more
 correct even without any stateful rule.
 
+**Known trade-offs (adversarial-review-confirmed, correctness-safe):**
+
+- **One tx per (segment, profile) transition.** `applyMembership` opens a short transaction per segment
+  (conditional flip + outbox insert), so row locks are held briefly but a tenant with N active segments
+  costs up to N sequential round-trips per event. This is correct and lock-friendly; batching all of an
+  event's flips into one tx is a possible later throughput optimization.
+- **Send-stage ordering is best-effort.** `transition_seq` is carried in the emit and the activation
+  payload, and the `tenant|canonical` partition key keeps a user's emits in order into the activation
+  consumer (so task *creation* is ordered, replays dedup by the seq-bearing key). But the activation
+  *runner* claims/retries tasks with no `transition_seq` tie-break, so a stateful destination can still see
+  an enter/exit delivered out of order. Destinations must be idempotent/commutative and may use the
+  payload's `transition_seq` to arbitrate last-writer-wins. Full send-stage LWW (per-membership serialized
+  delivery / `last_delivered_seq` guard) is deferred to a later activation-hardening pass.
+
 ---
 
 ## Phase 5 — Deadline queue + sweeper + population seed + safety sweep
