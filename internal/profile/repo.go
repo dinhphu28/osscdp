@@ -188,12 +188,45 @@ func (r *Repo) reparentProfileChildren(ctx context.Context, q querier, tenantID,
 		}
 	}
 
+	// behavioral_event: re-key rows whose event_id the survivor lacks (mirrors the
+	// history re-key). Ships with migration 00011 so the loser DELETE below does not
+	// orphan behavioral rows; there is no FK on customer_profile_id, so order is free.
+	if _, err := q.Exec(ctx, `
+		UPDATE behavioral_event b
+		SET customer_profile_id=$3
+		WHERE b.tenant_id=$1 AND b.customer_profile_id=$2
+		  AND NOT EXISTS (SELECT 1 FROM behavioral_event s
+		                  WHERE s.tenant_id=$1 AND s.customer_profile_id=$3 AND s.event_id=b.event_id)`,
+		tenantID, loserID, survivorID); err != nil {
+		return fmt.Errorf("reparent behavioral_event: %w", err)
+	}
+
+	// Rebuild the survivor's behavior buckets from the now-deduped log. A blind SUM of
+	// the loser's + survivor's buckets would double-count a shared event_id (finding
+	// #21); re-aggregating from behavioral_event (already deduped above) is exact.
+	if _, err := q.Exec(ctx,
+		`DELETE FROM profile_behavior_bucket WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		tenantID, survivorID); err != nil {
+		return fmt.Errorf("clear survivor buckets: %w", err)
+	}
+	if _, err := q.Exec(ctx, `
+		INSERT INTO profile_behavior_bucket (tenant_id, customer_profile_id, event_name, bucket_start, count, first_at, last_at)
+		SELECT tenant_id, customer_profile_id, event_name, date_trunc('hour', occurred_at), count(*), min(occurred_at), max(occurred_at)
+		FROM behavioral_event
+		WHERE tenant_id=$1 AND customer_profile_id=$2
+		GROUP BY tenant_id, customer_profile_id, event_name, date_trunc('hour', occurred_at)`,
+		tenantID, survivorID); err != nil {
+		return fmt.Errorf("rebuild survivor buckets: %w", err)
+	}
+
 	// Drop the loser's leftover child rows that conflicted with the survivor
 	// (children before parent for FK-safety), then the loser profile itself.
 	for _, sql := range []string{
 		`DELETE FROM customer_profile_history WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM segment_membership WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM customer_consent WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		`DELETE FROM behavioral_event WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		`DELETE FROM profile_behavior_bucket WHERE tenant_id=$1 AND customer_profile_id=$2`,
 	} {
 		if _, err := q.Exec(ctx, sql, tenantID, loserID); err != nil {
 			return fmt.Errorf("reparent cleanup: %w", err)

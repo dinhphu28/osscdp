@@ -1,12 +1,16 @@
 package segment
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/dinhphu28/osscdp/internal/behavior"
 	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/profile"
 )
@@ -17,30 +21,182 @@ type EvalContext struct {
 	Event   events.Envelope
 }
 
-// Evaluate reports whether the rule matches the context.
-func Evaluate(r Rule, ec EvalContext) bool {
+// BehaviorStore answers windowed behavioral questions for the evaluator (Level 3).
+// A nil store makes behavior leaves inert, so pure-stateless rules evaluate
+// exactly as before. Implemented by *behavior.Store; tests inject a fake.
+type BehaviorStore interface {
+	Count(ctx context.Context, tenantID, profileID uuid.UUID, spec behavior.Spec, at time.Time) (int64, error)
+	Recent(ctx context.Context, tenantID, profileID uuid.UUID, spec behavior.Spec, at time.Time) (bool, error)
+	Absent(ctx context.Context, tenantID, profileID uuid.UUID, spec behavior.Spec, at time.Time) (bool, error)
+	CorrelatedAbsent(ctx context.Context, tenantID, profileID uuid.UUID, spec behavior.Spec, at time.Time) (bool, error)
+	Sequence(ctx context.Context, tenantID, profileID uuid.UUID, spec behavior.Spec, at time.Time) (bool, error)
+	SumValue(ctx context.Context, tenantID, profileID uuid.UUID, spec behavior.Spec, at time.Time) (float64, error)
+	// LastAt / NthNewestInWindow support due_at deadline computation (Phase 5).
+	LastAt(ctx context.Context, tenantID, profileID uuid.UUID, eventName string, at time.Time) (time.Time, bool, error)
+	NthNewestInWindow(ctx context.Context, tenantID, profileID uuid.UUID, eventName string, window time.Duration, n int, at time.Time) (time.Time, bool, error)
+}
+
+// Evaluate reports whether the rule matches the context. Behavioral leaves consult
+// the store; a nil store leaves them inert (false), so pure-stateless rules evaluate
+// unchanged and a NOT over an un-evaluable behavior subtree cannot flip to a spurious
+// match. A store read error is threaded out (not swallowed to false): the caller
+// fails the handler so at-least-once redelivery retries, rather than letting a
+// transient error spuriously enter (via NOT) or exit a member.
+func Evaluate(ctx context.Context, r Rule, ec EvalContext, store BehaviorStore, at time.Time) (bool, error) {
 	if r.isLogical() {
 		switch r.Operator {
 		case OpAnd:
 			for _, c := range r.Conditions {
-				if !Evaluate(c, ec) {
-					return false
+				m, err := Evaluate(ctx, c, ec, store, at)
+				if err != nil {
+					return false, err
+				}
+				if !m {
+					return false, nil
 				}
 			}
-			return true
+			return true, nil
 		case OpOr:
 			for _, c := range r.Conditions {
-				if Evaluate(c, ec) {
-					return true
+				m, err := Evaluate(ctx, c, ec, store, at)
+				if err != nil {
+					return false, err
+				}
+				if m {
+					return true, nil
 				}
 			}
-			return false
+			return false, nil
 		case OpNot:
-			return len(r.Conditions) == 1 && !Evaluate(r.Conditions[0], ec)
+			if len(r.Conditions) != 1 {
+				return false, nil
+			}
+			if store == nil && hasBehavior(r.Conditions[0]) {
+				return false, nil // inert without a store; NOT must not invert
+			}
+			m, err := Evaluate(ctx, r.Conditions[0], ec, store, at)
+			if err != nil {
+				return false, err
+			}
+			return !m, nil
 		}
 	}
+	if r.Behavior != nil {
+		return evalBehavior(ctx, r.Behavior, ec, store, at)
+	}
 	val, present := resolveField(r.Field, ec)
-	return applyOp(r.Op, val, present, r.Value)
+	return applyOp(r.Op, val, present, r.Value), nil
+}
+
+// evalBehavior dispatches a windowed behavioral leaf to the store. A nil store
+// leaves it inert (false). A store error is returned so the caller can retry.
+func evalBehavior(ctx context.Context, b *BehaviorSpec, ec EvalContext, store BehaviorStore, at time.Time) (bool, error) {
+	if store == nil {
+		return false, nil
+	}
+	spec, err := toSpec(ctx, b, ec, store, at)
+	if err != nil {
+		return false, err
+	}
+	tid, pid := ec.Profile.TenantID, ec.Profile.ID
+	switch b.Kind {
+	case BehaviorCount:
+		n, err := store.Count(ctx, tid, pid, spec, at)
+		return err == nil && b.Value != nil && matchCount(b.Op, float64(n), *b.Value), err
+	case BehaviorFrequency:
+		if b.ValueProp != "" {
+			sum, err := store.SumValue(ctx, tid, pid, spec, at)
+			return err == nil && b.Value != nil && matchCount(b.Op, sum, *b.Value), err
+		}
+		n, err := store.Count(ctx, tid, pid, spec, at)
+		return err == nil && b.Value != nil && matchCount(b.Op, float64(n), *b.Value), err
+	case BehaviorRecency:
+		return store.Recent(ctx, tid, pid, spec, at)
+	case BehaviorAbsence:
+		if b.Anchor != nil {
+			return store.CorrelatedAbsent(ctx, tid, pid, spec, at)
+		}
+		return store.Absent(ctx, tid, pid, spec, at)
+	case BehaviorSequence:
+		return store.Sequence(ctx, tid, pid, spec, at)
+	}
+	return false, nil
+}
+
+// toSpec translates the DSL BehaviorSpec into the storage-layer behavior.Spec. The
+// where-filter closure evaluates the props filter with a NIL store (a where is a
+// pure comparison over the row's props, never a store re-entrant behavior). Window
+// parse failures are surfaced (validation guarantees parseability, but do not
+// silently degrade to a 0-length window).
+func toSpec(ctx context.Context, b *BehaviorSpec, ec EvalContext, store BehaviorStore, at time.Time) (behavior.Spec, error) {
+	spec := behavior.Spec{EventName: b.EventName, ValueProp: b.ValueProp, Op: b.Op}
+	// Force the exact log path for anything buckets cannot serve honestly (where /
+	// anchor / sequence / value_prop); validation already sets Exact for most of these.
+	spec.Exact = b.Exact || b.Where != nil || b.Anchor != nil || b.ValueProp != ""
+	if b.Value != nil {
+		spec.Value = *b.Value
+	}
+	if b.Kind == BehaviorSequence {
+		w, err := ParseWindow(b.Within)
+		if err != nil {
+			return behavior.Spec{}, fmt.Errorf("sequence within: %w", err)
+		}
+		spec.Within = w
+	} else {
+		w, err := ParseWindow(b.Window)
+		if err != nil {
+			return behavior.Spec{}, fmt.Errorf("behavior window: %w", err)
+		}
+		spec.Window = w
+	}
+	for i := range b.Steps {
+		spec.Steps = append(spec.Steps, b.Steps[i].EventName)
+	}
+	if b.Where != nil {
+		where := b.Where
+		spec.WhereMatch = func(props json.RawMessage) bool {
+			m, _ := Evaluate(ctx, *where, EvalContext{Profile: ec.Profile, Event: events.Envelope{Properties: props}}, nil, at)
+			return m
+		}
+	}
+	if b.Anchor != nil {
+		anchor, err := toSpec(ctx, b.Anchor, ec, store, at)
+		if err != nil {
+			return behavior.Spec{}, err
+		}
+		spec.Anchor = &anchor
+	}
+	return spec, nil
+}
+
+// matchCount applies a count/frequency comparison operator.
+func matchCount(op string, got, want float64) bool {
+	switch op {
+	case OpGte:
+		return got >= want
+	case OpGt:
+		return got > want
+	case OpLte:
+		return got <= want
+	case OpLt:
+		return got < want
+	case OpEq:
+		return got == want
+	}
+	return false
+}
+
+// hasBehavior reports whether the rule tree contains a behavioral leaf.
+func hasBehavior(r Rule) bool {
+	if r.Behavior != nil {
+		return true
+	}
+	for _, c := range r.Conditions {
+		if hasBehavior(c) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveField(path string, ec EvalContext) (any, bool) {

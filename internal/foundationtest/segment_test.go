@@ -3,15 +3,18 @@ package foundationtest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dinhphu28/osscdp/internal/behavior"
 	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/identity"
 	"github.com/dinhphu28/osscdp/internal/profile"
+	"github.com/dinhphu28/osscdp/internal/relay"
 	"github.com/dinhphu28/osscdp/internal/segment"
 )
 
@@ -43,12 +46,22 @@ func vnPhoneRule() segment.Rule {
 	}}
 }
 
+// countOutbox counts staged membership emits for a tenant (Phase 4: transitions
+// emit by inserting into segment_membership_outbox, not by publishing directly).
+func countMembershipOutbox(t *testing.T, f fixture, tid uuid.UUID) int {
+	t.Helper()
+	var n int
+	require.NoError(t, f.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM segment_membership_outbox WHERE tenant_id=$1`, tid).Scan(&n))
+	return n
+}
+
 func TestSegment_EnterThenExit(t *testing.T) {
 	f := setup(t)
 	ctx := context.Background()
 	tid, sid := mkTenant(t, f, "acme")
 	repo := segment.NewRepo(f.pool)
-	svc := segment.NewService(f.pool, profile.NewRepo(f.pool), noopPub{}, bus.TopicSegmentMembershipChanged)
+	svc := segment.NewService(f.pool, profile.NewRepo(f.pool), nil)
 
 	seg, err := repo.CreateSegment(ctx, tid, "vn-phone-viewers", "", vnPhoneRule())
 	require.NoError(t, err)
@@ -81,9 +94,7 @@ func TestSegment_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	tid, sid := mkTenant(t, f, "acme")
 	repo := segment.NewRepo(f.pool)
-
-	var emits int
-	svc := segment.NewService(f.pool, profile.NewRepo(f.pool), countingPub{&emits}, bus.TopicSegmentMembershipChanged)
+	svc := segment.NewService(f.pool, profile.NewRepo(f.pool), nil)
 	seg, err := repo.CreateSegment(ctx, tid, "s1", "", vnPhoneRule())
 	require.NoError(t, err)
 
@@ -95,7 +106,8 @@ func TestSegment_Idempotent(t *testing.T) {
 	members, err := repo.ListMembers(ctx, tid, seg.ID)
 	require.NoError(t, err)
 	require.Len(t, members, 1)
-	require.Equal(t, 1, emits, "membership change must emit only on the entering transition")
+	// Redundant (already-active) matches write no outbox row — only the flip emits.
+	require.Equal(t, 1, countMembershipOutbox(t, f, tid), "membership change emits only on the entering transition")
 }
 
 func TestSegment_VersioningAndEdit(t *testing.T) {
@@ -121,11 +133,11 @@ func TestSegment_TenantIsolation(t *testing.T) {
 	tidA, sidA := mkTenant(t, f, "tenant-a")
 	tidB, _ := mkTenant(t, f, "tenant-b")
 	repo := segment.NewRepo(f.pool)
-	svc := segment.NewService(f.pool, profile.NewRepo(f.pool), noopPub{}, bus.TopicSegmentMembershipChanged)
+	svc := segment.NewService(f.pool, profile.NewRepo(f.pool), nil)
 
 	segA, err := repo.CreateSegment(ctx, tidA, "s", "", vnPhoneRule())
 	require.NoError(t, err)
-	// Tenant B has no segments → evaluating B's profile touches nothing in A.
+	// Tenant B has no segments → evaluating A's profile touches nothing in B.
 	pu := seedProfile(t, f, tidA, sidA, "e1", "product_viewed", "u1", `{"country":"VN"}`)
 	require.NoError(t, svc.Evaluate(ctx, pu))
 
@@ -139,7 +151,9 @@ func TestSegment_TenantIsolation(t *testing.T) {
 	require.Len(t, membersA, 1)
 }
 
-func TestSegment_EmitsMembershipChanged(t *testing.T) {
+// TestSegment_EmitsViaOutboxRelay proves the Phase-4 path: the flip stages an
+// outbox row atomically, and a relay drains it to the bus with the per-flip token.
+func TestSegment_EmitsViaOutboxRelay(t *testing.T) {
 	f, broker := setupPipeline(t)
 	ctx := context.Background()
 	tid, sid := mkTenant(t, f, "acme")
@@ -160,12 +174,19 @@ func TestSegment_EmitsMembershipChanged(t *testing.T) {
 		_ = consumer.Run(runCtx, func(_ context.Context, r bus.Record) error { sink.add(r); return nil }, nil)
 	}()
 
-	svc := segment.NewService(f.pool, profile.NewRepo(f.pool), prod, bus.TopicSegmentMembershipChanged)
+	svc := segment.NewService(f.pool, profile.NewRepo(f.pool), nil)
 	seg, err := repo.CreateSegment(ctx, tid, "s1", "", vnPhoneRule())
 	require.NoError(t, err)
 
 	pu := seedProfile(t, f, tid, sid, "e1", "product_viewed", "u1", `{"country":"VN"}`)
 	require.NoError(t, svc.Evaluate(ctx, pu))
+
+	// The flip only staged an outbox row; the relay publishes it.
+	rel := relay.New(f.pool, prod, bus.TopicSegmentMembershipChanged, 10, time.Second, testLogger()).
+		WithTable("segment_membership_outbox")
+	n, err := rel.RunOnce(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
 
 	require.Eventually(t, func() bool { return sink.len() >= 1 }, 30*time.Second, 200*time.Millisecond)
 	var mc segment.MembershipChanged
@@ -173,10 +194,59 @@ func TestSegment_EmitsMembershipChanged(t *testing.T) {
 	require.Equal(t, "segment_membership_changed", mc.EventType)
 	require.Equal(t, segment.ChangeEntered, mc.Change)
 	require.Equal(t, seg.ID, mc.SegmentID)
-	require.Equal(t, "e1", mc.ReasonEventID)
+	require.Equal(t, "e1:1", mc.ReasonEventID, "per-flip token is <event_id>:<seq>")
+	require.EqualValues(t, 1, mc.TransitionSeq)
 	require.Equal(t, tid.String()+"|"+pu.CanonicalUserID, string(sink.first().Key))
 }
 
-type countingPub struct{ n *int }
+// TestSegment_StatefulEnterViaBehavioralEvents is the Phase-3 end-to-end proof:
+// seeded behavioral_event rows drive a count-in-window segment to Enter through
+// the real Service.Evaluate membership switch (with a real behavior.Store).
+func TestSegment_StatefulEnterViaBehavioralEvents(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	repo := segment.NewRepo(f.pool)
+	svc := segment.NewService(f.pool, profile.NewRepo(f.pool), behavior.NewStore(f.pool))
 
-func (c countingPub) Publish(context.Context, string, string, []byte) error { *c.n++; return nil }
+	val := 3.0
+	rule := segment.Rule{Behavior: &segment.BehaviorSpec{Kind: segment.BehaviorCount, EventName: "product_viewed", Window: "7d", Op: segment.OpGte, Value: &val}}
+	seg, err := repo.CreateSegment(ctx, tid, "power-viewers", "", rule)
+	require.NoError(t, err)
+
+	seedViews := func(pu profile.ProfileUpdated, n int) {
+		for i := 0; i < n; i++ {
+			occ := pu.Event.Timestamp.Add(-time.Duration(i+1) * time.Hour)
+			_, err := f.pool.Exec(ctx,
+				`INSERT INTO behavioral_event (tenant_id, customer_profile_id, event_id, event_name, occurred_at) VALUES ($1,$2,$3,'product_viewed',$4)`,
+				tid, pu.CustomerProfileID, fmt.Sprintf("bv-%s-%d", pu.CustomerProfileID, i), occ)
+			require.NoError(t, err)
+			// count is served from buckets (Phase 6); seed the bucket to match the log.
+			_, err = f.pool.Exec(ctx,
+				`INSERT INTO profile_behavior_bucket (tenant_id, customer_profile_id, event_name, bucket_start, count, first_at, last_at)
+				 VALUES ($1,$2,'product_viewed', date_trunc('hour', $3::timestamptz), 1, $3, $3)
+				 ON CONFLICT (tenant_id, customer_profile_id, event_name, bucket_start)
+				 DO UPDATE SET count = profile_behavior_bucket.count + 1`,
+				tid, pu.CustomerProfileID, occ)
+			require.NoError(t, err)
+		}
+	}
+
+	// 3 qualifying views -> enters through the stateful count leaf.
+	pu := seedProfile(t, f, tid, sid, "e1", "product_viewed", "u1", "")
+	seedViews(pu, 3)
+	require.NoError(t, svc.Evaluate(ctx, pu))
+	members, err := repo.ListMembers(ctx, tid, seg.ID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.Equal(t, pu.CustomerProfileID, members[0].CustomerProfileID)
+
+	// Only 2 views -> below threshold -> does not enter.
+	pu2 := seedProfile(t, f, tid, sid, "e2", "product_viewed", "u2", "")
+	seedViews(pu2, 2)
+	require.NoError(t, svc.Evaluate(ctx, pu2))
+	members2, err := repo.ListMembers(ctx, tid, seg.ID)
+	require.NoError(t, err)
+	require.Len(t, members2, 1, "the 2-view profile must not enter")
+	require.Equal(t, pu.CustomerProfileID, members2[0].CustomerProfileID)
+}

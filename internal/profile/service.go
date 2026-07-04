@@ -8,11 +8,19 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dinhphu28/osscdp/internal/audit"
 	"github.com/dinhphu28/osscdp/internal/events"
 )
+
+// BehaviorRecorder appends a behavioral_event row inside the profile-update tx
+// (Level 3 stateful segmentation). Kept as an interface so the profile package
+// does not import internal/behavior; the worker injects the concrete recorder.
+type BehaviorRecorder interface {
+	Append(ctx context.Context, tx pgx.Tx, profileID uuid.UUID, env events.Envelope) error
+}
 
 // Publisher emits profile_updated.
 type Publisher interface {
@@ -64,6 +72,8 @@ type Service struct {
 	Audit *audit.Recorder
 	// Logger reports best-effort failures (e.g. reparent audit); nil-safe.
 	Logger *slog.Logger
+	// Behavior appends behavioral_event rows in the same tx (nil-safe; Phase 2).
+	Behavior BehaviorRecorder
 }
 
 // NewService constructs a Service.
@@ -194,6 +204,13 @@ func (s *Service) updateTx(ctx context.Context, canonicalUserID string, clusterI
 
 	if err := s.repo.update(ctx, tx, prof, fromVersion); err != nil {
 		return Result{}, err
+	}
+	// Append the durable behavioral_event in the same tx, behind the alreadyApplied
+	// ledger — this is where exactly-once behavioral counters come for free.
+	if s.Behavior != nil {
+		if err := s.Behavior.Append(ctx, tx, prof.ID, env); err != nil {
+			return Result{}, err
+		}
 	}
 	after := snapshot(prof)
 	if _, err := s.repo.markApplied(ctx, tx, env.TenantID, prof.ID, env.EventID, "update", before, after); err != nil {

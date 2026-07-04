@@ -19,6 +19,7 @@ import (
 
 	"github.com/dinhphu28/osscdp/internal/activation"
 	"github.com/dinhphu28/osscdp/internal/audit"
+	"github.com/dinhphu28/osscdp/internal/behavior"
 	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/config"
 	"github.com/dinhphu28/osscdp/internal/consent"
@@ -86,6 +87,13 @@ func run() error {
 	rel.OnPublished = m.EventsPublished.Inc
 	rel.OnPublishFail = m.KafkaPublishFailed.Inc
 
+	// Second relay: drains the segment membership outbox (Phase 4) to its topic, so
+	// membership flip + emit commit atomically and publish at-least-once.
+	memRelay := relay.New(pool, producer, bus.TopicSegmentMembershipChanged, cfg.RelayBatchSize, cfg.RelayPollInterval, logger).
+		WithTable("segment_membership_outbox")
+	memRelay.OnPublished = m.MembershipPublished.Inc
+	memRelay.OnPublishFail = m.MembershipPublishFail.Inc
+
 	rawRepo := rawevent.NewRepo(pool)
 	dlqRec := dlq.NewRecorder(pool)
 
@@ -115,6 +123,7 @@ func run() error {
 	profileSvc.OnUpdated = m.ProfileUpdated.Inc
 	profileSvc.Audit = audit.NewRecorder(pool)
 	profileSvc.Logger = logger
+	profileSvc.Behavior = behavior.NewRecorder() // Phase 2: durable behavioral_event log
 	profileConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-profile", []string{bus.TopicIdentityResolved}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err
@@ -123,15 +132,25 @@ func run() error {
 	profileHandler := makeProfileHandler(profileSvc)
 
 	// Segmentation: consumes profile_updated, maintains segment membership.
-	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), producer, bus.TopicSegmentMembershipChanged)
+	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), behavior.NewStore(pool))
 	segmentSvc.OnEvaluated = m.SegmentEvaluated.Inc
 	segmentSvc.OnMatched = m.SegmentMatched.Inc
+	segmentSvc.OnStatefulEvaluated = m.StatefulEvaluated.Inc
+	segmentSvc.OnStatefulMatched = m.StatefulMatched.Inc
 	segmentConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-segment", []string{bus.TopicProfileUpdated}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err
 	}
 	segmentConsumer.OnRetry = m.ProcessingRetries.Inc
 	segmentHandler := makeSegmentHandler(segmentSvc)
+
+	// Deadline sweeper (Phase 5): fires absence/expiry/re-entry transitions with no
+	// inbound event by re-evaluating due segment_pending_eval rows fairly per tenant.
+	segmentRunner := segment.NewRunner(segmentSvc, cfg.SegmentSweepBatchSize, cfg.SegmentSweepPerTenantCap,
+		cfg.SegmentSweepSafetyBatch, cfg.SegmentSweepReclaimTimeout, cfg.SegmentSweepInterval, logger)
+	segmentRunner.OnClaimed = m.SweepClaimed.Inc
+	segmentRunner.OnTransition = m.SweepTransition.Inc
+	segmentRunner.OnError = m.SweepError.Inc
 
 	// Activation: consumes segment_membership_changed → creates tasks; a sender
 	// loop delivers them with retry/backoff. The consent gate skips denied sends.
@@ -161,8 +180,10 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(8)
+	wg.Add(10)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
+	go func() { defer wg.Done(); memRelay.Run(ctx) }()
+	go func() { defer wg.Done(); segmentRunner.Run(ctx) }()
 	go func() { defer wg.Done(); activationRunner.Run(ctx) }()
 	go func() {
 		defer wg.Done()

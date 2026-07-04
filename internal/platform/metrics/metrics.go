@@ -23,6 +23,13 @@ type Metrics struct {
 	ProfileUpdated        prometheus.Counter
 	SegmentEvaluated      prometheus.Counter
 	SegmentMatched        prometheus.Counter
+	StatefulEvaluated     prometheus.Counter
+	StatefulMatched       prometheus.Counter
+	MembershipPublished   prometheus.Counter
+	MembershipPublishFail prometheus.Counter
+	SweepClaimed          prometheus.Counter
+	SweepTransition       prometheus.Counter
+	SweepError            prometheus.Counter
 	ActivationSent        prometheus.Counter
 	ActivationFailed      prometheus.Counter
 	ActivationSkipped     prometheus.Counter
@@ -75,6 +82,27 @@ func New() *Metrics {
 		SegmentMatched: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "segment_matched_total", Help: "Segment rule evaluations that matched.",
 		}),
+		StatefulEvaluated: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_stateful_evaluated_total", Help: "Behavioral (Level 3) segment evaluations performed.",
+		}),
+		StatefulMatched: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_stateful_matched_total", Help: "Behavioral segment evaluations that matched.",
+		}),
+		MembershipPublished: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_membership_published_total", Help: "Membership-change emits relayed from the outbox to the bus.",
+		}),
+		MembershipPublishFail: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_membership_publish_failed_total", Help: "Membership-change outbox publishes that failed.",
+		}),
+		SweepClaimed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_sweep_claimed_total", Help: "Deadline rows claimed by the segment sweeper.",
+		}),
+		SweepTransition: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_sweep_evaluated_total", Help: "Deadline rows re-evaluated by the segment sweeper.",
+		}),
+		SweepError: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_sweep_error_total", Help: "Deadline re-evaluations that errored (deferred for retry).",
+		}),
 		ActivationSent: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "activation_sent_total", Help: "Activation deliveries that succeeded.",
 		}),
@@ -102,7 +130,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.EventsPublished, m.EventsConsumed, m.ProcessingRetries,
 		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond, m.IdentityResolved, m.IdentityMerge,
-		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.ActivationSent, m.ActivationFailed,
+		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.StatefulEvaluated, m.StatefulMatched, m.MembershipPublished, m.MembershipPublishFail, m.SweepClaimed, m.SweepTransition, m.SweepError, m.ActivationSent, m.ActivationFailed,
 		m.ActivationSkipped, m.ActivationCircuitOpen,
 		m.EventsReceived, m.EventsValidated, m.EventsRejected, m.EventsRateLimited)
 	return m
