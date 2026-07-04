@@ -25,6 +25,8 @@ type Metrics struct {
 	SegmentMatched        prometheus.Counter
 	StatefulEvaluated     prometheus.Counter
 	StatefulMatched       prometheus.Counter
+	MembershipPublished   prometheus.Counter
+	MembershipPublishFail prometheus.Counter
 	ActivationSent        prometheus.Counter
 	ActivationFailed      prometheus.Counter
 	ActivationSkipped     prometheus.Counter
@@ -83,6 +85,12 @@ func New() *Metrics {
 		StatefulMatched: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "segment_stateful_matched_total", Help: "Behavioral segment evaluations that matched.",
 		}),
+		MembershipPublished: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_membership_published_total", Help: "Membership-change emits relayed from the outbox to the bus.",
+		}),
+		MembershipPublishFail: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_membership_publish_failed_total", Help: "Membership-change outbox publishes that failed.",
+		}),
 		ActivationSent: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "activation_sent_total", Help: "Activation deliveries that succeeded.",
 		}),
@@ -110,7 +118,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.EventsPublished, m.EventsConsumed, m.ProcessingRetries,
 		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond, m.IdentityResolved, m.IdentityMerge,
-		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.StatefulEvaluated, m.StatefulMatched, m.ActivationSent, m.ActivationFailed,
+		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.StatefulEvaluated, m.StatefulMatched, m.MembershipPublished, m.MembershipPublishFail, m.ActivationSent, m.ActivationFailed,
 		m.ActivationSkipped, m.ActivationCircuitOpen,
 		m.EventsReceived, m.EventsValidated, m.EventsRejected, m.EventsRateLimited)
 	return m

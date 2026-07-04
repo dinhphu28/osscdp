@@ -205,43 +205,77 @@ func (r *Repo) MembershipStatus(ctx context.Context, tenantID, segmentID, profil
 	return status, nil
 }
 
-// Enter inserts or reactivates a membership.
-func (r *Repo) Enter(ctx context.Context, tenantID, segmentID, profileID uuid.UUID, version int) error {
-	_, err := r.pool.Exec(ctx, `
+// EnterTx conditionally flips a membership to active within tx, bumping
+// transition_seq only when it actually flips (a brand-new row, or one not already
+// active). It returns the new transition_seq and whether a flip occurred; when
+// already active it reports flipped=false and emits nothing. Atomic: the caller
+// inserts the outbox row in the same tx.
+func (r *Repo) EnterTx(ctx context.Context, tx pgx.Tx, tenantID, segmentID, profileID uuid.UUID, version int) (seq int64, flipped bool, err error) {
+	err = tx.QueryRow(ctx, `
 		INSERT INTO segment_membership
-			(tenant_id, segment_id, customer_profile_id, status, entered_at, exited_at, last_evaluated_at, version)
-		VALUES ($1,$2,$3,$4, now(), NULL, now(), $5)
-		ON CONFLICT (tenant_id, segment_id, customer_profile_id)
-		DO UPDATE SET status=$4, entered_at=now(), exited_at=NULL, last_evaluated_at=now(), version=$5`,
-		tenantID, segmentID, profileID, MembershipActive, version)
-	if err != nil {
-		return fmt.Errorf("enter membership: %w", err)
+			(tenant_id, segment_id, customer_profile_id, status, entered_at, exited_at, last_evaluated_at, version, transition_seq)
+		VALUES ($1,$2,$3,'active', now(), NULL, now(), $4, 1)
+		ON CONFLICT (tenant_id, segment_id, customer_profile_id) DO UPDATE
+			SET status='active', entered_at=now(), exited_at=NULL, last_evaluated_at=now(), version=$4,
+			    transition_seq = segment_membership.transition_seq + 1
+			WHERE segment_membership.status IS DISTINCT FROM 'active'
+		RETURNING transition_seq`,
+		tenantID, segmentID, profileID, version).Scan(&seq)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil // already active — conflict with the WHERE guard false
 	}
-	return nil
+	if err != nil {
+		return 0, false, fmt.Errorf("enter membership: %w", err)
+	}
+	return seq, true, nil
 }
 
-// Exit marks a membership exited.
-func (r *Repo) Exit(ctx context.Context, tenantID, segmentID, profileID uuid.UUID) error {
-	_, err := r.pool.Exec(ctx, `
-		UPDATE segment_membership SET status=$4, exited_at=now(), last_evaluated_at=now()
-		WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3`,
-		tenantID, segmentID, profileID, MembershipExited)
-	if err != nil {
-		return fmt.Errorf("exit membership: %w", err)
+// ExitTx conditionally flips a membership to exited within tx, bumping
+// transition_seq only when it flips. A missing or already-exited row reports
+// flipped=false (nothing to emit).
+func (r *Repo) ExitTx(ctx context.Context, tx pgx.Tx, tenantID, segmentID, profileID uuid.UUID) (seq int64, flipped bool, err error) {
+	err = tx.QueryRow(ctx, `
+		UPDATE segment_membership
+		SET status='exited', exited_at=now(), last_evaluated_at=now(), transition_seq = transition_seq + 1
+		WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3 AND status IS DISTINCT FROM 'exited'
+		RETURNING transition_seq`,
+		tenantID, segmentID, profileID).Scan(&seq)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
 	}
-	return nil
+	if err != nil {
+		return 0, false, fmt.Errorf("exit membership: %w", err)
+	}
+	return seq, true, nil
 }
 
-// TouchEvaluated bumps last_evaluated_at for an unchanged membership.
-func (r *Repo) TouchEvaluated(ctx context.Context, tenantID, segmentID, profileID uuid.UUID) error {
-	_, err := r.pool.Exec(ctx,
-		`UPDATE segment_membership SET last_evaluated_at=now() WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3`,
-		tenantID, segmentID, profileID)
+// TouchEvaluatedTx refreshes last_evaluated_at (and the rule version, so a
+// continuously-active member still tracks later rule versions) for a still-matching,
+// already-active membership. No status change, no emit.
+func (r *Repo) TouchEvaluatedTx(ctx context.Context, tx pgx.Tx, tenantID, segmentID, profileID uuid.UUID, version int) error {
+	_, err := tx.Exec(ctx,
+		`UPDATE segment_membership SET last_evaluated_at=now(), version=$4 WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3`,
+		tenantID, segmentID, profileID, version)
 	if err != nil {
 		return fmt.Errorf("touch membership: %w", err)
 	}
 	return nil
 }
+
+// InsertMembershipOutbox stages a segment_membership_changed emit in the same tx as
+// the flip, so flip + emit commit atomically (a relay drains it at-least-once).
+func (r *Repo) InsertMembershipOutbox(ctx context.Context, tx pgx.Tx, tenantID uuid.UUID, partitionKey string, payload []byte) error {
+	_, err := tx.Exec(ctx,
+		`INSERT INTO segment_membership_outbox (tenant_id, partition_key, payload_json) VALUES ($1,$2,$3)`,
+		tenantID, partitionKey, payload)
+	if err != nil {
+		return fmt.Errorf("insert membership outbox: %w", err)
+	}
+	return nil
+}
+
+// Begin opens a transaction on the repo's pool.
+func (r *Repo) Begin(ctx context.Context) (pgx.Tx, error) { return r.pool.Begin(ctx) }
 
 // ListMembers returns active memberships of a segment.
 func (r *Repo) ListMembers(ctx context.Context, tenantID, segmentID uuid.UUID) ([]Membership, error) {

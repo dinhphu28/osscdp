@@ -16,16 +16,19 @@ type customerView struct {
 }
 
 type activationPayload struct {
-	Type       string       `json:"type"`
-	TenantID   uuid.UUID    `json:"tenant_id"`
-	SegmentID  uuid.UUID    `json:"segment_id"`
-	Customer   customerView `json:"customer"`
-	Change     string       `json:"change"`
-	OccurredAt time.Time    `json:"occurred_at"`
+	Type      string       `json:"type"`
+	TenantID  uuid.UUID    `json:"tenant_id"`
+	SegmentID uuid.UUID    `json:"segment_id"`
+	Customer  customerView `json:"customer"`
+	Change    string       `json:"change"`
+	// TransitionSeq is the per-membership monotonic sequence of this flip, so a
+	// stateful destination can arbitrate last-writer-wins if deliveries reorder.
+	TransitionSeq int64     `json:"transition_seq"`
+	OccurredAt    time.Time `json:"occurred_at"`
 }
 
 // BuildPayload builds the doc-07 activation payload for a membership change.
-func BuildPayload(tenantID, segmentID uuid.UUID, change string, occurredAt time.Time, prof profile.Profile) ([]byte, error) {
+func BuildPayload(tenantID, segmentID uuid.UUID, change string, transitionSeq int64, occurredAt time.Time, prof profile.Profile) ([]byte, error) {
 	p := activationPayload{
 		Type:      "segment_membership_changed",
 		TenantID:  tenantID,
@@ -35,8 +38,9 @@ func BuildPayload(tenantID, segmentID uuid.UUID, change string, occurredAt time.
 			Traits:             prof.Traits,
 			ComputedAttributes: prof.ComputedAttributes,
 		},
-		Change:     change,
-		OccurredAt: occurredAt.UTC(),
+		Change:        change,
+		TransitionSeq: transitionSeq,
+		OccurredAt:    occurredAt.UTC(),
 	}
 	return json.Marshal(p)
 }

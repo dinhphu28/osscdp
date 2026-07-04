@@ -56,7 +56,7 @@ func (s *Service) OnMembershipChanged(ctx context.Context, mc segment.Membership
 	if err != nil {
 		return err
 	}
-	payload, err := BuildPayload(mc.TenantID, mc.SegmentID, mc.Change, mc.ChangedAt, prof)
+	payload, err := BuildPayload(mc.TenantID, mc.SegmentID, mc.Change, mc.TransitionSeq, mc.ChangedAt, prof)
 	if err != nil {
 		return err
 	}
