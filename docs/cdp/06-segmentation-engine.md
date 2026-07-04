@@ -104,7 +104,10 @@ cheap elapse deadline and relies on the safety sweep. `sequence`, correlated `ab
 window + margin)`, so no in-window data is pruned. Event **property-shape drift** (a
 `where`/`value_prop` property changing type mid-window) is **not yet detected** and can
 silently mis-evaluate those windows — schema-version drift detection (doc 16 finding
-#33) is deferred.
+#33) is deferred, with a detailed implementation plan in
+[18 §A](18-stateful-segmentation-followups.md) (stamp a shape fingerprint + observe/WARN).
+Bucket-accelerated recency/absence was **evaluated and declined** as net-negative
+([18 §C](18-stateful-segmentation-followups.md)).
 
 ## Segment model
 
