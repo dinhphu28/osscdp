@@ -160,6 +160,12 @@ func run() error {
 	retention := behavior.NewRetention(pool, cfg.BehaviorRetention, cfg.BehaviorRetentionInterval, logger)
 	retention.OnPruned = func(n int) { m.BehaviorRetention.Add(float64(n)) }
 
+	// Durable population-seed runner: drains segment_seed_job (resumable), seeding the
+	// existing population for newly created/updated sweep-safe segments.
+	seedRunner := segment.NewSeedRunner(segmentSvc.Repo(), cfg.SeedJobPagesPerClaim, cfg.SeedJobReclaimTimeout, cfg.SeedJobInterval, logger)
+	seedRunner.OnSeededPage = m.SeedPages.Inc
+	seedRunner.OnJobDone = m.SeedJobsDone.Inc
+
 	// Activation: consumes segment_membership_changed → creates tasks; a sender
 	// loop delivers them with retry/backoff. The consent gate skips denied sends.
 	activationSvc := activation.NewService(pool, profile.NewRepo(pool), consent.NewRepo(pool))
@@ -188,11 +194,12 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(11)
+	wg.Add(12)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
 	go func() { defer wg.Done(); memRelay.Run(ctx) }()
 	go func() { defer wg.Done(); segmentRunner.Run(ctx) }()
 	go func() { defer wg.Done(); retention.Run(ctx) }()
+	go func() { defer wg.Done(); seedRunner.Run(ctx) }()
 	go func() { defer wg.Done(); activationRunner.Run(ctx) }()
 	go func() {
 		defer wg.Done()

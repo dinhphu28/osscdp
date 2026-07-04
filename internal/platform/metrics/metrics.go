@@ -33,6 +33,8 @@ type Metrics struct {
 	SweepLagSeconds       prometheus.Histogram
 	PendingBacklog        prometheus.Gauge
 	BehaviorRetention     prometheus.Counter
+	SeedPages             prometheus.Counter
+	SeedJobsDone          prometheus.Counter
 	ActivationSent        prometheus.Counter
 	ActivationFailed      prometheus.Counter
 	ActivationSkipped     prometheus.Counter
@@ -118,6 +120,12 @@ func New() *Metrics {
 		BehaviorRetention: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "behavior_retention_pruned_total", Help: "Behavioral partitions dropped + residue rows deleted by retention.",
 		}),
+		SeedPages: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_seed_pages_total", Help: "Population-seed pages enqueued by the seed runner.",
+		}),
+		SeedJobsDone: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_seed_jobs_done_total", Help: "Population-seed jobs fully drained.",
+		}),
 		ActivationSent: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "activation_sent_total", Help: "Activation deliveries that succeeded.",
 		}),
@@ -145,7 +153,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.EventsPublished, m.EventsConsumed, m.ProcessingRetries,
 		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond, m.IdentityResolved, m.IdentityMerge,
-		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.StatefulEvaluated, m.StatefulMatched, m.MembershipPublished, m.MembershipPublishFail, m.SweepClaimed, m.SweepTransition, m.SweepError, m.SweepLagSeconds, m.PendingBacklog, m.BehaviorRetention, m.ActivationSent, m.ActivationFailed,
+		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.StatefulEvaluated, m.StatefulMatched, m.MembershipPublished, m.MembershipPublishFail, m.SweepClaimed, m.SweepTransition, m.SweepError, m.SweepLagSeconds, m.PendingBacklog, m.BehaviorRetention, m.SeedPages, m.SeedJobsDone, m.ActivationSent, m.ActivationFailed,
 		m.ActivationSkipped, m.ActivationCircuitOpen,
 		m.EventsReceived, m.EventsValidated, m.EventsRejected, m.EventsRateLimited)
 	return m

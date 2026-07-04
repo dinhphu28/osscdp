@@ -1,11 +1,9 @@
 package segment
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -56,28 +54,9 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		apierror.Internal(w)
 		return
 	}
-	h.seedIfSweepable(tenantID, seg.ID, req.Rule, "seed")
+	// CreateSegment durably records a seed job in-tx for sweep-safe rules (drained by
+	// the seed runner), so no fire-and-forget goroutine is needed here.
 	httpx.WriteJSON(w, http.StatusCreated, seg)
-}
-
-// seedIfSweepable enqueues due-now deadlines for the tenant's profiles when the
-// segment is a sweep-safe stateful rule, so the existing population (including
-// dormant "did-not-do" profiles) is evaluated by the sweeper without an inbound
-// event. Runs OFF the request path (own context, paged) so a large population never
-// blocks or is cancelled with the admin response. Best-effort; re-issuing
-// create/update re-seeds. (A durable job queue is the production-grade follow-up.)
-func (h *Handler) seedIfSweepable(tenantID, segmentID uuid.UUID, rule Rule, reason string) {
-	// Seed any sweep-safe rule (no stateless event.* leaf) — behavioural OR trait-only.
-	// A loosened trait rule (e.g. dropping a condition) admits newly-qualifying profiles
-	// the same way; the sweeper evaluates each at now() with no event (finding #24).
-	if referencesEvent(rule) {
-		return
-	}
-	go func() {
-		bg, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		_, _ = h.repo.SeedPendingForSegment(bg, tenantID, segmentID, time.Now().UTC(), reason)
-	}()
 }
 
 type updateRequest struct {
@@ -114,7 +93,6 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		apierror.Internal(w)
 		return
 	}
-	h.seedIfSweepable(tenantID, seg.ID, req.Rule, "version_change")
 	httpx.WriteJSON(w, http.StatusOK, seg)
 }
 

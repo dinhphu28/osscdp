@@ -37,6 +37,10 @@ type Config struct {
 	BehaviorRetention         time.Duration
 	BehaviorRetentionInterval time.Duration
 
+	SeedJobInterval       time.Duration
+	SeedJobPagesPerClaim  int
+	SeedJobReclaimTimeout time.Duration
+
 	RateLimitRPS     float64
 	RateLimitBurst   int
 	CircuitThreshold int
@@ -76,6 +80,10 @@ func Load() (Config, error) {
 
 		BehaviorRetention:         getEnvDuration("BEHAVIOR_RETENTION", 40*24*time.Hour),
 		BehaviorRetentionInterval: getEnvDuration("BEHAVIOR_RETENTION_INTERVAL", 6*time.Hour),
+
+		SeedJobInterval:       getEnvDuration("SEED_JOB_INTERVAL", 5*time.Second),
+		SeedJobPagesPerClaim:  getEnvInt("SEED_JOB_PAGES_PER_CLAIM", 10),
+		SeedJobReclaimTimeout: getEnvDuration("SEED_JOB_RECLAIM_TIMEOUT", time.Minute),
 
 		RateLimitRPS:       getEnvFloat("RATE_LIMIT_RPS", 50),
 		RateLimitBurst:     getEnvInt("RATE_LIMIT_BURST", 100),
