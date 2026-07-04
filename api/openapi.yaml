@@ -440,8 +440,9 @@ paths:
       description: >-
         Requires `profile:read`. Returns a per-namespace count of every identity
         node linked to the person (e.g. how many phones/emails), which the
-        last-write-wins profile traits cannot show. Counts only — no values or
-        hashes; use the export endpoint for the hashed node list.
+        last-write-wins profile traits cannot show. `values` carries the decrypted
+        plaintext per namespace for nodes ingested after encryption was enabled
+        (Tier 2); it is masked unless the caller holds `pii:read`.
       parameters:
         - {$ref: "#/components/parameters/TenantID"}
         - {$ref: "#/components/parameters/CanonicalUserID"}
@@ -459,6 +460,13 @@ paths:
                     type: object
                     additionalProperties: {type: integer}
                     example: {email: 2, phone: 3, user_id: 1}
+                  values:
+                    type: object
+                    description: "Decrypted identifier values per namespace (masked without pii:read). Omitted when no encrypted nodes exist."
+                    additionalProperties:
+                      type: array
+                      items: {type: string}
+                    example: {email: ["u***@x.com"], phone: ["+8490****567"]}
         "404": {$ref: "#/components/responses/NotFound"}
 
   /admin/v1/tenants/{tenantID}/segments:

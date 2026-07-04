@@ -14,9 +14,12 @@ import (
 
 	"github.com/dinhphu28/osscdp/internal/activation"
 	"github.com/dinhphu28/osscdp/internal/audit"
+	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/consent"
 	"github.com/dinhphu28/osscdp/internal/crypto"
+	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/governance"
+	"github.com/dinhphu28/osscdp/internal/identity"
 	"github.com/dinhphu28/osscdp/internal/profile"
 	"github.com/dinhphu28/osscdp/internal/rawevent"
 	"github.com/dinhphu28/osscdp/internal/source"
@@ -110,7 +113,7 @@ func TestGovernance_ExportThenDelete(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, rawevent.NewRepo(f.pool).Store(ctx, pu.Event, rawPayload))
 
-	gov := governance.NewService(f.pool, audit.NewRecorder(f.pool))
+	gov := governance.NewService(f.pool, audit.NewRecorder(f.pool), nil)
 
 	bundle, err := gov.Export(ctx, tid, pu.CanonicalUserID)
 	require.NoError(t, err)
@@ -172,6 +175,41 @@ func TestWebhookSigning_HeaderPresent(t *testing.T) {
 	_, err = runner.RunOnce(ctx)
 	require.NoError(t, err)
 	require.Contains(t, gotSig, "sha256=")
+}
+
+// TestIdentifiers_Tier2Values exercises Enhancement C Tier 2 end-to-end: identity
+// encrypts each identifier at ingest, and the governance inventory decrypts them.
+func TestIdentifiers_Tier2Values(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+
+	cipher, err := crypto.New(mustKey(t))
+	require.NoError(t, err)
+
+	idSvc := identity.NewService(f.pool, noopPub{}, bus.TopicIdentityResolved)
+	idSvc.Cipher = cipher
+	profSvc := profile.NewService(f.pool, noopPub{}, bus.TopicProfileUpdated)
+
+	// Ingest an event carrying user_id + email + phone -> three encrypted nodes.
+	env := mergeEnv(t, tid, sid, "t2", events.Identifiers{UserID: "u1", Email: "e@x.com", Phone: "+8490"}, "", time.Now())
+	canonical, _ := resolveAndProfile(t, f, idSvc, profSvc, env)
+
+	// With a cipher, the inventory returns the decrypted plaintext values.
+	gov := governance.NewService(f.pool, audit.NewRecorder(f.pool), cipher)
+	inv, err := gov.Identifiers(ctx, tid, canonical)
+	require.NoError(t, err)
+	require.Equal(t, 3, inv.Total)
+	require.Equal(t, []string{"e@x.com"}, inv.Values["email"])
+	require.Equal(t, []string{"+8490"}, inv.Values["phone"])
+	require.Equal(t, []string{"u1"}, inv.Values["user_id"])
+
+	// Without a cipher, values are omitted; counts still returned.
+	govNoCipher := governance.NewService(f.pool, audit.NewRecorder(f.pool), nil)
+	inv2, err := govNoCipher.Identifiers(ctx, tid, canonical)
+	require.NoError(t, err)
+	require.Equal(t, 3, inv2.Total)
+	require.Nil(t, inv2.Values)
 }
 
 func mustKey(t *testing.T) string {

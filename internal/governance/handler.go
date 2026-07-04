@@ -44,7 +44,8 @@ func (h *Handler) Export(w http.ResponseWriter, r *http.Request) {
 
 // Identifiers handles GET /admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}/identifiers.
 // It returns a per-namespace count of every identity node linked to the person
-// (e.g. how many phones/emails they have), without exposing the values.
+// plus (Tier 2) the decrypted plaintext values, masked unless the caller holds
+// pii:read.
 func (h *Handler) Identifiers(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := parseTenant(w, r)
 	if !ok {
@@ -59,7 +60,34 @@ func (h *Handler) Identifiers(w http.ResponseWriter, r *http.Request) {
 		apierror.Internal(w)
 		return
 	}
+	if principal, ok := auth.PrincipalFromContext(r.Context()); !ok || !principal.Can(rbac.PermPIIRead) {
+		inv.Values = maskIdentifierValues(inv.Values)
+	}
 	httpx.WriteJSON(w, http.StatusOK, inv)
+}
+
+// maskIdentifierValues masks each identifier value by namespace: email and phone
+// use their format-aware maskers, everything else keeps only the first character.
+func maskIdentifierValues(vals map[string][]string) map[string][]string {
+	if vals == nil {
+		return nil
+	}
+	out := make(map[string][]string, len(vals))
+	for ns, list := range vals {
+		masked := make([]string, len(list))
+		for i, v := range list {
+			switch ns {
+			case "email":
+				masked[i] = rbac.MaskEmail(v)
+			case "phone":
+				masked[i] = rbac.MaskPhone(v)
+			default:
+				masked[i] = rbac.MaskName(v)
+			}
+		}
+		out[ns] = masked
+	}
+	return out
 }
 
 // Delete handles DELETE /admin/v1/tenants/{tenantID}/profiles/{canonicalUserID}.
