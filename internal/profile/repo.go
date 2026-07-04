@@ -188,12 +188,26 @@ func (r *Repo) reparentProfileChildren(ctx context.Context, q querier, tenantID,
 		}
 	}
 
+	// behavioral_event: re-key rows whose event_id the survivor lacks (mirrors the
+	// history re-key). Ships with migration 00011 so the loser DELETE below does not
+	// orphan behavioral rows; there is no FK on customer_profile_id, so order is free.
+	if _, err := q.Exec(ctx, `
+		UPDATE behavioral_event b
+		SET customer_profile_id=$3
+		WHERE b.tenant_id=$1 AND b.customer_profile_id=$2
+		  AND NOT EXISTS (SELECT 1 FROM behavioral_event s
+		                  WHERE s.tenant_id=$1 AND s.customer_profile_id=$3 AND s.event_id=b.event_id)`,
+		tenantID, loserID, survivorID); err != nil {
+		return fmt.Errorf("reparent behavioral_event: %w", err)
+	}
+
 	// Drop the loser's leftover child rows that conflicted with the survivor
 	// (children before parent for FK-safety), then the loser profile itself.
 	for _, sql := range []string{
 		`DELETE FROM customer_profile_history WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM segment_membership WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM customer_consent WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		`DELETE FROM behavioral_event WHERE tenant_id=$1 AND customer_profile_id=$2`,
 	} {
 		if _, err := q.Exec(ctx, sql, tenantID, loserID); err != nil {
 			return fmt.Errorf("reparent cleanup: %w", err)

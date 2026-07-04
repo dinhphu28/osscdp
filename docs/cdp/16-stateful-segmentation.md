@@ -256,8 +256,8 @@ CREATE TABLE behavioral_event (
     occurred_at         TIMESTAMPTZ NOT NULL,             -- CLAMPED; partition key
     props_json          JSONB,                            -- small; backs `where` filters + exact re-query
     schema_version      INT NOT NULL DEFAULT 1,           -- detect event-shape drift across a live window
-    inserted_at         TIMESTAMPTZ NOT NULL DEFAULT now(),-- server time; retention keys off THIS, not occurred_at
-    PRIMARY KEY (tenant_id, customer_profile_id, event_id, occurred_at)  -- idempotent append; occurred_at is deterministic
+    inserted_at         TIMESTAMPTZ NOT NULL DEFAULT now(),-- server audit time; retention is DROP PARTITION on the occurred_at key (clamped <= received_at)
+    PRIMARY KEY (tenant_id, customer_profile_id, event_id, occurred_at)  -- required by partitioning; append dedups by (profile,event_id), not the PK
 ) PARTITION BY RANGE (occurred_at);
 -- Weekly partitions created ahead by the retention job; a default partition catches stragglers.
 
@@ -268,9 +268,12 @@ CREATE INDEX idx_behavioral_event_window
 DROP TABLE IF EXISTS behavioral_event;
 ```
 
-The PK includes `occurred_at` (required by native partitioning). Dedup still holds: `occurred_at` is
-a deterministic function of the event (the clamped envelope timestamp, stable across redeliveries), so
-a redelivered `event_id` collides on the same PK and `ON CONFLICT DO NOTHING` drops it.
+The PK includes `occurred_at` (required by native partitioning). Dedup does **not** rely on the PK:
+`occurred_at` is the *clamped* value, which collapses to a per-delivery `received_at` when the client
+timestamp is in the future, so it is not stable across re-ingestions of the same `event_id`. The
+appender is therefore idempotent by `(profile, event_id)` — `INSERT … WHERE NOT EXISTS (event_id
+match)`, matching the merge fold — and the profile idempotency ledger short-circuits before the append
+even runs on redelivery. Retention is `DROP PARTITION` on the `occurred_at` range key.
 
 ### `00012_profile_behavior_bucket.sql` — tumbling counters + deadline queue
 
