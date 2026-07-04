@@ -118,3 +118,18 @@ func TestIdentifiers_NotFound(t *testing.T) {
 	_, err := svc.Identifiers(ctx, tenantID, "customer_"+uuid.New().String())
 	require.ErrorIs(t, err, ErrNotFound)
 }
+
+func TestIdentifiers_EmptyCluster(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	svc := NewService(pool, audit.NewRecorder(pool))
+
+	// A profile whose cluster has no identity nodes yet.
+	tenantID, canonical := seedPerson(t, ctx, pool, map[string]int{})
+
+	inv, err := svc.Identifiers(ctx, tenantID, canonical)
+	require.NoError(t, err)
+	require.Equal(t, 0, inv.Total)
+	require.NotNil(t, inv.ByNamespace, "must be an empty object, not null")
+	require.Empty(t, inv.ByNamespace)
+}
