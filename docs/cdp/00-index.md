@@ -47,6 +47,8 @@ flowchart LR
 | `13-operations.md` | Operations runbook: running the full stack, observability, load test, backup/restore, failure tests. |
 | `14-usage.md` | How-to usage guide: start the stack, auth, send events, segments, destinations, governance, DLQ — with `curl` examples. |
 | `15-future-enhancements.md` | Planned admin-API enhancements (unsubscribe, list destinations by segment, view all identifiers) with implementation specs and interim workarounds. |
+| `16-stateful-segmentation.md` | Design of record for Level 3 stateful behavioral segmentation (windowed count/absence/sequence/frequency/recency): chosen architecture, DSL extension, data model, evaluation semantics, and resolved review findings. |
+| `17-stateful-segmentation-implementation.md` | Step-by-step, 8-phase implementation plan for stateful segmentation — each phase with what exists today, what to add (file anchors), and tests. |
 
 ## Design principles
 
