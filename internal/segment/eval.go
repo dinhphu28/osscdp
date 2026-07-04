@@ -17,7 +17,12 @@ type EvalContext struct {
 	Event   events.Envelope
 }
 
-// Evaluate reports whether the rule matches the context.
+// Evaluate reports whether the rule matches the context. Level 3 behavioral
+// leaves are inert until the Phase 3 evaluator lands: a behavior leaf is treated
+// as unsatisfied (false), so a mixed rule's stateless leaves still work while the
+// segment adds no members on the strength of a not-yet-evaluated behavior. NOT is
+// guarded separately — negating an un-evaluable behavior subtree would flip false
+// to a spurious whole-population match, so it stays inert.
 func Evaluate(r Rule, ec EvalContext) bool {
 	if r.isLogical() {
 		switch r.Operator {
@@ -36,11 +41,30 @@ func Evaluate(r Rule, ec EvalContext) bool {
 			}
 			return false
 		case OpNot:
-			return len(r.Conditions) == 1 && !Evaluate(r.Conditions[0], ec)
+			if len(r.Conditions) != 1 || hasBehavior(r.Conditions[0]) {
+				return false
+			}
+			return !Evaluate(r.Conditions[0], ec)
 		}
+	}
+	if r.Behavior != nil {
+		return false // inert until Phase 3
 	}
 	val, present := resolveField(r.Field, ec)
 	return applyOp(r.Op, val, present, r.Value)
+}
+
+// hasBehavior reports whether the rule tree contains a behavioral leaf.
+func hasBehavior(r Rule) bool {
+	if r.Behavior != nil {
+		return true
+	}
+	for _, c := range r.Conditions {
+		if hasBehavior(c) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveField(path string, ec EvalContext) (any, bool) {

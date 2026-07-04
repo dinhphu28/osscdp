@@ -93,3 +93,27 @@ func TestEval_Logical(t *testing.T) {
 		t.Fatal("not should invert")
 	}
 }
+
+func TestEval_BehaviorLeafInert(t *testing.T) {
+	c := ctx()
+	b := Rule{Behavior: &BehaviorSpec{Kind: BehaviorCount, EventName: "product_viewed", Window: "7d", Op: OpGte}}
+	if Evaluate(b, c) {
+		t.Fatal("behavior leaf must be inert (false) until Phase 3")
+	}
+	// AND with an otherwise-true stateless leaf is dragged false by the inert behavior leaf.
+	and := Rule{Operator: OpAnd, Conditions: []Rule{leaf("profile.traits.country", OpEq, "VN"), b}}
+	if Evaluate(and, c) {
+		t.Fatal("AND with an inert behavior leaf must be false")
+	}
+	// OR still matches on the true stateless leaf (behavior contributes nothing).
+	or := Rule{Operator: OpOr, Conditions: []Rule{leaf("profile.traits.country", OpEq, "VN"), b}}
+	if !Evaluate(or, c) {
+		t.Fatal("OR should still match on the true stateless leaf")
+	}
+	// NOT over a behavior leaf must NOT invert to a whole-population match: a rule
+	// referencing any behavior leaf is inert as a whole.
+	not := Rule{Operator: OpNot, Conditions: []Rule{b}}
+	if Evaluate(not, c) {
+		t.Fatal("NOT over an inert behavior leaf must not match")
+	}
+}

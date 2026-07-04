@@ -173,7 +173,7 @@ type BehaviorSpec struct {
     EventName string         `json:"event_name,omitempty"` // e.g. "product_viewed"; required for non-sequence
     Window    string         `json:"window,omitempty"`     // "7d","24h","30m" — parsed to time.Duration
     Op        string         `json:"op,omitempty"`         // count/frequency: gte|gt|lte|lt|eq
-    Value     float64        `json:"value,omitempty"`      // threshold
+    Value     *float64       `json:"value,omitempty"`      // threshold (pointer: absent is distinct from 0; required for count/frequency)
     ValueProp string         `json:"value_prop,omitempty"` // frequency-of-value: sums this numeric property
     Where     *Rule          `json:"where,omitempty"`      // OPTIONAL props filter — reuses the comparison-leaf grammar
     Steps     []BehaviorSpec `json:"steps,omitempty"`      // sequence: ordered A,B,...
