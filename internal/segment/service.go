@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,6 +49,11 @@ type Service struct {
 	// store answers windowed behavioral leaves (nil => stateful leaves inert).
 	store BehaviorStore
 
+	// Per-tenant cache of parsed active versions, keyed by the segments epoch so a
+	// create/update in the API process invalidates the worker's cache (finding #14).
+	cacheMu sync.Mutex
+	cache   map[uuid.UUID]cachedVersions
+
 	// Metric hooks (nil-safe).
 	OnEvaluated         func()
 	OnMatched           func()
@@ -55,10 +61,41 @@ type Service struct {
 	OnStatefulMatched   func()
 }
 
+type cachedVersions struct {
+	count      int64
+	updated    time.Time
+	versionSum int64
+	versions   []ActiveVersion
+}
+
 // NewService constructs a Service. store (nil-safe) evaluates Level 3 behavioral
 // leaves; a nil store leaves stateful segments inert.
 func NewService(pool *pgxpool.Pool, profiles ProfileReader, store BehaviorStore) *Service {
-	return &Service{repo: NewRepo(pool), profiles: profiles, store: store}
+	return &Service{repo: NewRepo(pool), profiles: profiles, store: store, cache: map[uuid.UUID]cachedVersions{}}
+}
+
+// activeVersions returns the tenant's parsed active segment versions, served from a
+// cache validated against the cheap segments epoch (so the per-event fan-out avoids
+// re-fetching + re-unmarshalling every rule when nothing changed).
+func (s *Service) activeVersions(ctx context.Context, tenantID uuid.UUID) ([]ActiveVersion, error) {
+	count, updated, versionSum, err := s.repo.SegmentsEpoch(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	s.cacheMu.Lock()
+	c, ok := s.cache[tenantID]
+	s.cacheMu.Unlock()
+	if ok && c.count == count && c.updated.Equal(updated) && c.versionSum == versionSum {
+		return c.versions, nil
+	}
+	versions, err := s.repo.ActiveSegmentVersions(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	s.cacheMu.Lock()
+	s.cache[tenantID] = cachedVersions{count: count, updated: updated, versionSum: versionSum, versions: versions}
+	s.cacheMu.Unlock()
+	return versions, nil
 }
 
 // Repo exposes the underlying repository (for admin handlers).
@@ -75,7 +112,7 @@ func (s *Service) Evaluate(ctx context.Context, pu profile.ProfileUpdated) error
 		return err
 	}
 
-	segs, err := s.repo.ActiveSegmentVersions(ctx, pu.TenantID)
+	segs, err := s.activeVersions(ctx, pu.TenantID)
 	if err != nil {
 		return err
 	}
@@ -88,6 +125,13 @@ func (s *Service) Evaluate(ctx context.Context, pu profile.ProfileUpdated) error
 	}
 
 	for _, seg := range segs {
+		// Prefilter: a purely-behavioural segment can only change at the edge if THIS
+		// event is one it references; skip the others. A segment with any stateless
+		// leaf is ALWAYS evaluated — a trait change may newly match it (findings
+		// #15/#30) — so it is never gated here.
+		if !seg.HasStateless && !containsString(seg.ReferencedNames, pu.Event.EventName) {
+			continue
+		}
 		if s.OnEvaluated != nil {
 			s.OnEvaluated()
 		}
@@ -304,4 +348,13 @@ func absDuration(d time.Duration) time.Duration {
 		return -d
 	}
 	return d
+}
+
+func containsString(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }

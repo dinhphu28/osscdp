@@ -41,12 +41,16 @@ type Segment struct {
 	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
-// ActiveVersion is an active segment's current rule version.
+// ActiveVersion is an active segment's current rule version plus the Phase-6
+// metadata the worker uses to prefilter the per-event fan-out.
 type ActiveVersion struct {
-	SegmentID uuid.UUID
-	VersionID uuid.UUID
-	Version   int
-	Rule      Rule
+	SegmentID       uuid.UUID
+	VersionID       uuid.UUID
+	Version         int
+	Rule            Rule
+	IsStateful      bool
+	HasStateless    bool
+	ReferencedNames []string
 }
 
 // Membership is a customer's membership in a segment.
@@ -89,9 +93,11 @@ func (r *Repo) CreateSegment(ctx context.Context, tenantID uuid.UUID, name, desc
 		return Segment{}, fmt.Errorf("insert segment: %w", err)
 	}
 	verID := uuid.New()
+	isStateful, hasStateless, events, maxWindow := analyzeRule(rule)
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO segment_version (id, tenant_id, segment_id, version, rule_json, status) VALUES ($1,$2,$3,1,$4,$5)`,
-		verID, tenantID, segID, ruleJSON, VersionActive); err != nil {
+		`INSERT INTO segment_version (id, tenant_id, segment_id, version, rule_json, status, is_stateful, has_stateless_leaves, referenced_event_names, max_window_seconds)
+		 VALUES ($1,$2,$3,1,$4,$5,$6,$7,$8,$9)`,
+		verID, tenantID, segID, ruleJSON, VersionActive, isStateful, hasStateless, events, int64(maxWindow.Seconds())); err != nil {
 		return Segment{}, fmt.Errorf("insert version: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
@@ -124,9 +130,11 @@ func (r *Repo) UpdateSegment(ctx context.Context, tenantID, segmentID uuid.UUID,
 		return Segment{}, ErrNotFound
 	}
 	verID := uuid.New()
+	isStateful, hasStateless, events, maxWindow := analyzeRule(rule)
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO segment_version (id, tenant_id, segment_id, version, rule_json, status) VALUES ($1,$2,$3,$4,$5,$6)`,
-		verID, tenantID, segmentID, maxVer+1, ruleJSON, VersionActive); err != nil {
+		`INSERT INTO segment_version (id, tenant_id, segment_id, version, rule_json, status, is_stateful, has_stateless_leaves, referenced_event_names, max_window_seconds)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		verID, tenantID, segmentID, maxVer+1, ruleJSON, VersionActive, isStateful, hasStateless, events, int64(maxWindow.Seconds())); err != nil {
 		return Segment{}, fmt.Errorf("insert version: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
@@ -166,7 +174,7 @@ func (r *Repo) GetSegment(ctx context.Context, tenantID, segmentID uuid.UUID) (S
 // ActiveSegmentVersions returns the current rule version of every active segment.
 func (r *Repo) ActiveSegmentVersions(ctx context.Context, tenantID uuid.UUID) ([]ActiveVersion, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT s.id, v.id, v.version, v.rule_json
+		SELECT s.id, v.id, v.version, v.rule_json, v.is_stateful, v.has_stateless_leaves, v.referenced_event_names
 		FROM segment s
 		JOIN segment_version v ON v.id = s.current_version_id
 		WHERE s.tenant_id=$1 AND s.status=$2`,
@@ -179,7 +187,7 @@ func (r *Repo) ActiveSegmentVersions(ctx context.Context, tenantID uuid.UUID) ([
 	for rows.Next() {
 		var av ActiveVersion
 		var ruleJSON []byte
-		if err := rows.Scan(&av.SegmentID, &av.VersionID, &av.Version, &ruleJSON); err != nil {
+		if err := rows.Scan(&av.SegmentID, &av.VersionID, &av.Version, &ruleJSON, &av.IsStateful, &av.HasStateless, &av.ReferencedNames); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(ruleJSON, &av.Rule); err != nil {
@@ -188,6 +196,28 @@ func (r *Repo) ActiveSegmentVersions(ctx context.Context, tenantID uuid.UUID) ([
 		out = append(out, av)
 	}
 	return out, rows.Err()
+}
+
+// SegmentsEpoch is a cheap per-tenant fingerprint of the active-segment set that the
+// worker reads per event to invalidate its parsed-rule cache cross-process (no notify
+// channel). It combines count + newest updated_at with sum(current version) — the
+// version sum strictly increases on every create/update (a new version = maxVer+1 is
+// repointed), so it detects a change even when two out-of-order commits leave count
+// and max(updated_at) unchanged.
+func (r *Repo) SegmentsEpoch(ctx context.Context, tenantID uuid.UUID) (count int64, maxUpdated time.Time, versionSum int64, err error) {
+	var updated *time.Time
+	err = r.pool.QueryRow(ctx, `
+		SELECT count(*), max(s.updated_at), COALESCE(sum(v.version), 0)
+		FROM segment s JOIN segment_version v ON v.id = s.current_version_id
+		WHERE s.tenant_id=$1 AND s.status=$2`,
+		tenantID, SegmentActive).Scan(&count, &updated, &versionSum)
+	if err != nil {
+		return 0, time.Time{}, 0, fmt.Errorf("segments epoch: %w", err)
+	}
+	if updated != nil {
+		maxUpdated = *updated
+	}
+	return count, maxUpdated, versionSum, nil
 }
 
 // ActiveVersionForSegment returns the current active rule version of one segment.

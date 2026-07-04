@@ -75,7 +75,8 @@ func TestStore(t *testing.T) {
 		seedEvent(t, ctx, pool, tid, pid, "v3", "view", at, "")             // in (== at)
 		seedEvent(t, ctx, pool, tid, pid, "v4", "view", at.Add(-7*day), "") // in (inclusive lower bound)
 
-		n, err := s.Count(ctx, tid, pid, Spec{EventName: "view", Window: 7 * day}, at)
+		// Exact: seed only the log (no buckets); exercises the exact-count boundary.
+		n, err := s.Count(ctx, tid, pid, Spec{EventName: "view", Window: 7 * day, Exact: true}, at)
 		require.NoError(t, err)
 		require.EqualValues(t, 3, n, "occurred_at >= at-7d and <= at counts v1,v3,v4; v2 excluded")
 	})

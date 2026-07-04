@@ -676,6 +676,23 @@ document this rather than silently summing the wrong thing.
 
 **Ship:** `O(1)`-ish writes, bounded windowed reads, cached and correctly-prefiltered fan-out.
 
+**Implementation notes / trade-offs (adversarial-review-confirmed):**
+
+- **Only count is bucket-accelerated.** `count`/`frequency-without-value_prop` non-exact leaves read
+  buckets (`bucketCount`: whole in-window hours summed + the two partial boundary hours counted exactly
+  from the log — exact, no finding-#5 over-inclusion). `recency`/`absence` stay on the exact
+  `MAX(occurred_at)` index lookup (already `O(1)`-ish; bucketing them adds boundary complexity for no
+  real win). `where`/`anchor`/`sequence`/`value_prop` stay exact (`spec.Exact`).
+- **Both migrations backfill** existing data (buckets re-aggregated from `behavioral_event`;
+  `is_stateful` set by a JSON heuristic) so an upgrade over Phase-2..5 data is correct;
+  `referenced_event_names`/`has_stateless_leaves` keep fail-open defaults (over-evaluate, never skip)
+  until a rule is re-saved.
+- **Cache epoch is `(count, max updated_at, sum(version))`.** The version sum is monotonic, so two
+  out-of-order commits cannot leave a stale rule cached.
+- **Hour boundaries assume a UTC DB session** (`date_trunc('hour', …)` on both write and read).
+- **Follow-ups:** a durable per-tenant re-analyze pass to repopulate metadata for old segments before
+  `is_stateful` becomes load-bearing; bucket-accelerated recency/absence with an exact boundary landmark.
+
 ---
 
 ## Phase 7 — Governance erasure + segment lifecycle

@@ -201,6 +201,24 @@ func (r *Repo) reparentProfileChildren(ctx context.Context, q querier, tenantID,
 		return fmt.Errorf("reparent behavioral_event: %w", err)
 	}
 
+	// Rebuild the survivor's behavior buckets from the now-deduped log. A blind SUM of
+	// the loser's + survivor's buckets would double-count a shared event_id (finding
+	// #21); re-aggregating from behavioral_event (already deduped above) is exact.
+	if _, err := q.Exec(ctx,
+		`DELETE FROM profile_behavior_bucket WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		tenantID, survivorID); err != nil {
+		return fmt.Errorf("clear survivor buckets: %w", err)
+	}
+	if _, err := q.Exec(ctx, `
+		INSERT INTO profile_behavior_bucket (tenant_id, customer_profile_id, event_name, bucket_start, count, first_at, last_at)
+		SELECT tenant_id, customer_profile_id, event_name, date_trunc('hour', occurred_at), count(*), min(occurred_at), max(occurred_at)
+		FROM behavioral_event
+		WHERE tenant_id=$1 AND customer_profile_id=$2
+		GROUP BY tenant_id, customer_profile_id, event_name, date_trunc('hour', occurred_at)`,
+		tenantID, survivorID); err != nil {
+		return fmt.Errorf("rebuild survivor buckets: %w", err)
+	}
+
 	// Drop the loser's leftover child rows that conflicted with the survivor
 	// (children before parent for FK-safety), then the loser profile itself.
 	for _, sql := range []string{
@@ -208,6 +226,7 @@ func (r *Repo) reparentProfileChildren(ctx context.Context, q querier, tenantID,
 		`DELETE FROM segment_membership WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM customer_consent WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM behavioral_event WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		`DELETE FROM profile_behavior_bucket WHERE tenant_id=$1 AND customer_profile_id=$2`,
 	} {
 		if _, err := q.Exec(ctx, sql, tenantID, loserID); err != nil {
 			return fmt.Errorf("reparent cleanup: %w", err)

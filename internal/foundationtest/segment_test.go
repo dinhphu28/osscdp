@@ -216,9 +216,18 @@ func TestSegment_StatefulEnterViaBehavioralEvents(t *testing.T) {
 
 	seedViews := func(pu profile.ProfileUpdated, n int) {
 		for i := 0; i < n; i++ {
+			occ := pu.Event.Timestamp.Add(-time.Duration(i+1) * time.Hour)
 			_, err := f.pool.Exec(ctx,
 				`INSERT INTO behavioral_event (tenant_id, customer_profile_id, event_id, event_name, occurred_at) VALUES ($1,$2,$3,'product_viewed',$4)`,
-				tid, pu.CustomerProfileID, fmt.Sprintf("bv-%s-%d", pu.CustomerProfileID, i), pu.Event.Timestamp.Add(-time.Duration(i+1)*time.Hour))
+				tid, pu.CustomerProfileID, fmt.Sprintf("bv-%s-%d", pu.CustomerProfileID, i), occ)
+			require.NoError(t, err)
+			// count is served from buckets (Phase 6); seed the bucket to match the log.
+			_, err = f.pool.Exec(ctx,
+				`INSERT INTO profile_behavior_bucket (tenant_id, customer_profile_id, event_name, bucket_start, count, first_at, last_at)
+				 VALUES ($1,$2,'product_viewed', date_trunc('hour', $3::timestamptz), 1, $3, $3)
+				 ON CONFLICT (tenant_id, customer_profile_id, event_name, bucket_start)
+				 DO UPDATE SET count = profile_behavior_bucket.count + 1`,
+				tid, pu.CustomerProfileID, occ)
 			require.NoError(t, err)
 		}
 	}

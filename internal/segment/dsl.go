@@ -5,10 +5,61 @@ package segment
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// analyzeRule derives the segment_version metadata (Phase 6) from a parsed rule:
+// isStateful (has any behaviour leaf), hasStateless (has any comparison leaf, so a
+// trait change may newly match — it must never be prefiltered out), the sorted set
+// of event names any behaviour leaf references (for the pure-behavioural edge
+// prefilter), and the largest window across leaves.
+func analyzeRule(r Rule) (isStateful, hasStateless bool, events []string, maxWindow time.Duration) {
+	seen := map[string]bool{}
+	var walk func(Rule)
+	walk = func(r Rule) {
+		switch {
+		case r.Behavior != nil:
+			isStateful = true
+			collectBehaviorMeta(r.Behavior, seen, &maxWindow)
+		case r.isLogical():
+			for _, c := range r.Conditions {
+				walk(c)
+			}
+		case r.Field != "":
+			hasStateless = true
+		}
+	}
+	walk(r)
+	events = []string{} // non-nil so it stores as '{}' (the column is NOT NULL)
+	for e := range seen {
+		events = append(events, e)
+	}
+	sort.Strings(events)
+	return
+}
+
+func collectBehaviorMeta(b *BehaviorSpec, seen map[string]bool, maxWindow *time.Duration) {
+	if b.EventName != "" {
+		seen[b.EventName] = true
+	}
+	if w, err := ParseWindow(b.Window); err == nil && w > *maxWindow {
+		*maxWindow = w
+	}
+	if b.Within != "" {
+		if w, err := ParseWindow(b.Within); err == nil && w > *maxWindow {
+			*maxWindow = w
+		}
+	}
+	if b.Anchor != nil {
+		collectBehaviorMeta(b.Anchor, seen, maxWindow)
+	}
+	for i := range b.Steps {
+		collectBehaviorMeta(&b.Steps[i], seen, maxWindow)
+	}
+}
 
 // Logical operators.
 const (

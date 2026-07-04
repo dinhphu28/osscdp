@@ -21,6 +21,7 @@ type Spec struct {
 	Within    time.Duration // sequence: max gap between consecutive steps
 	Steps     []string      // sequence: ordered event names A,B,...
 	Anchor    *Spec         // correlated absence: the anchor behaviour (a count)
+	Exact     bool          // force the behavioral_event path (no bucket acceleration)
 
 	// WhereMatch, when non-nil, filters in-window rows by their props_json using
 	// the DSL comparison grammar the segment package owns (the store cannot run it
