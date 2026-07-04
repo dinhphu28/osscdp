@@ -48,14 +48,20 @@ type Service struct {
 	pub      Publisher
 	topic    string
 
+	// store answers windowed behavioral leaves (nil => stateful leaves inert).
+	store BehaviorStore
+
 	// Metric hooks (nil-safe).
-	OnEvaluated func()
-	OnMatched   func()
+	OnEvaluated         func()
+	OnMatched           func()
+	OnStatefulEvaluated func()
+	OnStatefulMatched   func()
 }
 
-// NewService constructs a Service.
-func NewService(pool *pgxpool.Pool, profiles ProfileReader, pub Publisher, topic string) *Service {
-	return &Service{repo: NewRepo(pool), profiles: profiles, pub: pub, topic: topic}
+// NewService constructs a Service. store (nil-safe) evaluates Level 3 behavioral
+// leaves; a nil store leaves stateful segments inert.
+func NewService(pool *pgxpool.Pool, profiles ProfileReader, pub Publisher, topic string, store BehaviorStore) *Service {
+	return &Service{repo: NewRepo(pool), profiles: profiles, pub: pub, topic: topic, store: store}
 }
 
 // Repo exposes the underlying repository (for admin handlers).
@@ -77,14 +83,32 @@ func (s *Service) Evaluate(ctx context.Context, pu profile.ProfileUpdated) error
 		return err
 	}
 	ec := EvalContext{Profile: prof, Event: pu.Event}
+	// Edge path anchors windowed reads to the event's own clamped timestamp (not
+	// now()), so a redelivered profile_updated re-evaluates the same window.
+	at := pu.Event.Timestamp
+	if pu.Event.ReceivedAt.Before(at) {
+		at = pu.Event.ReceivedAt
+	}
 
 	for _, seg := range segs {
 		if s.OnEvaluated != nil {
 			s.OnEvaluated()
 		}
-		matched := Evaluate(seg.Rule, ec)
+		stateful := hasBehavior(seg.Rule)
+		if stateful && s.OnStatefulEvaluated != nil {
+			s.OnStatefulEvaluated()
+		}
+		matched, err := Evaluate(ctx, seg.Rule, ec, s.store, at)
+		if err != nil {
+			// A behavior-store read failed; fail the handler so the at-least-once
+			// consumer retries rather than persisting a spurious enter/exit.
+			return fmt.Errorf("evaluate segment %s: %w", seg.SegmentID, err)
+		}
 		if matched && s.OnMatched != nil {
 			s.OnMatched()
+		}
+		if matched && stateful && s.OnStatefulMatched != nil {
+			s.OnStatefulMatched()
 		}
 		status, err := s.repo.MembershipStatus(ctx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID)
 		if err != nil {
