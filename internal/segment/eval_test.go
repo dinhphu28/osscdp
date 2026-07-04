@@ -1,8 +1,10 @@
 package segment
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/profile"
@@ -58,7 +60,7 @@ func TestEval_AllOperators(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := Evaluate(tc.rule, c); got != tc.want {
+			if got := evalRule(tc.rule, c); got != tc.want {
 				t.Fatalf("Evaluate = %v, want %v", got, tc.want)
 			}
 		})
@@ -71,25 +73,25 @@ func TestEval_Logical(t *testing.T) {
 		leaf("profile.traits.country", OpEq, "VN"),
 		leaf("event.event_name", OpEq, "product_viewed"),
 	}}
-	if !Evaluate(and, c) {
+	if !evalRule(and, c) {
 		t.Fatal("and should match")
 	}
 	andFail := Rule{Operator: OpAnd, Conditions: []Rule{
 		leaf("profile.traits.country", OpEq, "VN"),
 		leaf("event.event_name", OpEq, "checkout"),
 	}}
-	if Evaluate(andFail, c) {
+	if evalRule(andFail, c) {
 		t.Fatal("and should fail when one condition fails")
 	}
 	or := Rule{Operator: OpOr, Conditions: []Rule{
 		leaf("profile.traits.country", OpEq, "US"),
 		leaf("event.event_name", OpEq, "product_viewed"),
 	}}
-	if !Evaluate(or, c) {
+	if !evalRule(or, c) {
 		t.Fatal("or should match when any matches")
 	}
 	not := Rule{Operator: OpNot, Conditions: []Rule{leaf("profile.traits.country", OpEq, "US")}}
-	if !Evaluate(not, c) {
+	if !evalRule(not, c) {
 		t.Fatal("not should invert")
 	}
 }
@@ -97,23 +99,30 @@ func TestEval_Logical(t *testing.T) {
 func TestEval_BehaviorLeafInert(t *testing.T) {
 	c := ctx()
 	b := Rule{Behavior: &BehaviorSpec{Kind: BehaviorCount, EventName: "product_viewed", Window: "7d", Op: OpGte}}
-	if Evaluate(b, c) {
+	if evalRule(b, c) {
 		t.Fatal("behavior leaf must be inert (false) until Phase 3")
 	}
 	// AND with an otherwise-true stateless leaf is dragged false by the inert behavior leaf.
 	and := Rule{Operator: OpAnd, Conditions: []Rule{leaf("profile.traits.country", OpEq, "VN"), b}}
-	if Evaluate(and, c) {
+	if evalRule(and, c) {
 		t.Fatal("AND with an inert behavior leaf must be false")
 	}
 	// OR still matches on the true stateless leaf (behavior contributes nothing).
 	or := Rule{Operator: OpOr, Conditions: []Rule{leaf("profile.traits.country", OpEq, "VN"), b}}
-	if !Evaluate(or, c) {
+	if !evalRule(or, c) {
 		t.Fatal("OR should still match on the true stateless leaf")
 	}
 	// NOT over a behavior leaf must NOT invert to a whole-population match: a rule
 	// referencing any behavior leaf is inert as a whole.
 	not := Rule{Operator: OpNot, Conditions: []Rule{b}}
-	if Evaluate(not, c) {
+	if evalRule(not, c) {
 		t.Fatal("NOT over an inert behavior leaf must not match")
 	}
+}
+
+// evalRule runs the (post-Phase-3) Evaluate with a nil store and zero instant —
+// stateless rules are unaffected and behavior leaves stay inert.
+func evalRule(r Rule, ec EvalContext) bool {
+	ok, _ := Evaluate(context.Background(), r, ec, nil, time.Time{})
+	return ok
 }

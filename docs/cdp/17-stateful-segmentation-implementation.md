@@ -318,7 +318,9 @@ func (s *Store) SumValue(ctx, ..., at) (float64, error)
 **Change `Evaluate`'s signature** (`internal/segment/eval.go:21`) to thread ctx + store + instant:
 
 ```go
-func Evaluate(ctx context.Context, r Rule, ec EvalContext, store BehaviorStore, at time.Time) bool
+// Returns an error (not swallowed to false) so a transient store read error fails
+// the handler and is retried, rather than spuriously entering (via NOT) or exiting a member.
+func Evaluate(ctx context.Context, r Rule, ec EvalContext, store BehaviorStore, at time.Time) (bool, error)
 ```
 
 - Add a branch at the top of the leaf path (before `resolveField`, `eval.go:42`): if

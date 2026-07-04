@@ -125,9 +125,11 @@ func run() error {
 	profileHandler := makeProfileHandler(profileSvc)
 
 	// Segmentation: consumes profile_updated, maintains segment membership.
-	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), producer, bus.TopicSegmentMembershipChanged)
+	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), producer, bus.TopicSegmentMembershipChanged, behavior.NewStore(pool))
 	segmentSvc.OnEvaluated = m.SegmentEvaluated.Inc
 	segmentSvc.OnMatched = m.SegmentMatched.Inc
+	segmentSvc.OnStatefulEvaluated = m.StatefulEvaluated.Inc
+	segmentSvc.OnStatefulMatched = m.StatefulMatched.Inc
 	segmentConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-segment", []string{bus.TopicProfileUpdated}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err
