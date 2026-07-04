@@ -67,7 +67,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 // blocks or is cancelled with the admin response. Best-effort; re-issuing
 // create/update re-seeds. (A durable job queue is the production-grade follow-up.)
 func (h *Handler) seedIfSweepable(tenantID, segmentID uuid.UUID, rule Rule, reason string) {
-	if !hasBehavior(rule) || referencesEvent(rule) {
+	// Seed any sweep-safe rule (no stateless event.* leaf) — behavioural OR trait-only.
+	// A loosened trait rule (e.g. dropping a condition) admits newly-qualifying profiles
+	// the same way; the sweeper evaluates each at now() with no event (finding #24).
+	if referencesEvent(rule) {
 		return
 	}
 	go func() {
@@ -113,6 +116,28 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 	h.seedIfSweepable(tenantID, seg.ID, req.Rule, "version_change")
 	httpx.WriteJSON(w, http.StatusOK, seg)
+}
+
+// Deactivate handles DELETE /admin/v1/tenants/{tenantID}/segments/{segmentID}:
+// retires the segment (edge + sweeper stop touching it; stranded due-rows purged).
+func (h *Handler) Deactivate(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := parseTenant(w, r)
+	if !ok {
+		return
+	}
+	segmentID, err := uuid.Parse(chi.URLParam(r, "segmentID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid segment id")
+		return
+	}
+	if err := h.repo.DeactivateSegment(r.Context(), tenantID, segmentID); errors.Is(err, ErrNotFound) {
+		apierror.NotFound(w, "segment not found")
+		return
+	} else if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // Get handles GET /admin/v1/tenants/{tenantID}/segments/{segmentID}.

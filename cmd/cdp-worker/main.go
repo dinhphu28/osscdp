@@ -123,7 +123,9 @@ func run() error {
 	profileSvc.OnUpdated = m.ProfileUpdated.Inc
 	profileSvc.Audit = audit.NewRecorder(pool)
 	profileSvc.Logger = logger
-	profileSvc.Behavior = behavior.NewRecorder() // Phase 2: durable behavioral_event log
+	behaviorRec := behavior.NewRecorder() // Phase 2: durable behavioral_event log
+	behaviorRec.PropsGate = behavior.ConsentPropsGate{} // Phase 7: gate props under analytics consent
+	profileSvc.Behavior = behaviorRec
 	profileConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-profile", []string{bus.TopicIdentityResolved}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err
@@ -151,6 +153,12 @@ func run() error {
 	segmentRunner.OnClaimed = m.SweepClaimed.Inc
 	segmentRunner.OnTransition = m.SweepTransition.Inc
 	segmentRunner.OnError = m.SweepError.Inc
+	segmentRunner.OnSweepLag = m.SweepLagSeconds.Observe
+	segmentRunner.OnBacklog = func(n int) { m.PendingBacklog.Set(float64(n)) }
+
+	// Retention (Phase 8): prune aged behavioral_event / bucket partitions.
+	retention := behavior.NewRetention(pool, cfg.BehaviorRetention, cfg.BehaviorRetentionInterval, logger)
+	retention.OnPruned = func(n int) { m.BehaviorRetention.Add(float64(n)) }
 
 	// Activation: consumes segment_membership_changed → creates tasks; a sender
 	// loop delivers them with retry/backoff. The consent gate skips denied sends.
@@ -180,10 +188,11 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(10)
+	wg.Add(11)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
 	go func() { defer wg.Done(); memRelay.Run(ctx) }()
 	go func() { defer wg.Done(); segmentRunner.Run(ctx) }()
+	go func() { defer wg.Done(); retention.Run(ctx) }()
 	go func() { defer wg.Done(); activationRunner.Run(ctx) }()
 	go func() {
 		defer wg.Done()

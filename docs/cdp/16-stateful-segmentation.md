@@ -765,7 +765,7 @@ Every confirmed review gap and where this design resolves it.
 | 30 | `referenced_event_names` prefilter skips mixed stateless+behavior on non-behavior events (high) | Same resolution as #15: never gate a segment that has any stateless leaf; `has_stateless_leaves` flag; always evaluate on profile-trait-changing events. |
 | 31 | Client-supplied `occurred_at` poisons windows and defeats retention; no clamp (high) | Clamp to `LEAST(envelope.Timestamp, received_at)` at write; bucket/log on the clamped value; retention keys off server `inserted_at`. See [Data model](#00011_behavioral_eventsql--durable-profile-keyed-log). |
 | 32 | Population discovery for "did NOT do X" is structurally invisible to edge and sweep (high) | Negative/absence-only segments get an explicit candidate set materialized into `segment_pending_eval` at activation + paginated periodic enumeration (Phase 5), decoupled from event arrival; anchor to a positive companion where possible; standalone-absence scan cost documented. |
-| 33 | Event schema evolution silently corrupts in-flight windows (medium) | `schema_version` stamped on `behavioral_event`; `where`/`value_prop` frozen against ingest-time shape; `BehaviorSchemaDrift` metric; property-shape change requires a new `segment_version` + recompute. |
+| 33 | Event schema evolution silently corrupts in-flight windows (medium) | **DEFERRED (not shipped).** `schema_version` is stamped on `behavioral_event` but not yet read/compared; the `BehaviorSchemaDrift` metric and property-shape-change enforcement are a follow-up. Known limitation (doc 06 §Level 3). |
 
 ---
 

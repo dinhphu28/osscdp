@@ -18,10 +18,11 @@ CREATE TABLE behavioral_event (
 -- Phase 2 ships a single DEFAULT partition so all inserts land somewhere. The
 -- appender is idempotent by (profile, event_id) in the INSERT (occurred_at is a
 -- clamped, per-delivery value and is NOT a reliable dedup key), so this does not
--- rely on the PK for dedup. NOTE for Phase 8: Postgres refuses to ATTACH a new
--- weekly range partition while the DEFAULT holds rows overlapping that range — the
--- retention job must DETACH DEFAULT, create the weekly partition, redistribute
--- overlapping rows, then re-ATTACH DEFAULT.
+-- rely on the PK for dedup. Phase-8 retention (internal/behavior/retention.go)
+-- creates FUTURE weekly partitions ahead of time (empty ranges, no DEFAULT overlap)
+-- so new writes land in droppable partitions, DROPs whole partitions past the horizon,
+-- and DELETEs only the DEFAULT partition's residue (the bootstrap week) — it does not
+-- attempt the DETACH/redistribute/re-ATTACH dance on a populated DEFAULT.
 CREATE TABLE behavioral_event_default PARTITION OF behavioral_event DEFAULT;
 
 -- Workhorse index for count-in-window / absence / recency / sequence anchors.
