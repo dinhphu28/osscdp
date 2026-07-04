@@ -31,6 +31,9 @@ type BehaviorStore interface {
 	CorrelatedAbsent(ctx context.Context, tenantID, profileID uuid.UUID, spec behavior.Spec, at time.Time) (bool, error)
 	Sequence(ctx context.Context, tenantID, profileID uuid.UUID, spec behavior.Spec, at time.Time) (bool, error)
 	SumValue(ctx context.Context, tenantID, profileID uuid.UUID, spec behavior.Spec, at time.Time) (float64, error)
+	// LastAt / NthNewestInWindow support due_at deadline computation (Phase 5).
+	LastAt(ctx context.Context, tenantID, profileID uuid.UUID, eventName string, at time.Time) (time.Time, bool, error)
+	NthNewestInWindow(ctx context.Context, tenantID, profileID uuid.UUID, eventName string, window time.Duration, n int, at time.Time) (time.Time, bool, error)
 }
 
 // Evaluate reports whether the rule matches the context. Behavioral leaves consult

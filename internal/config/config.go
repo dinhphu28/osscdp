@@ -28,6 +28,12 @@ type Config struct {
 	ActivationPollInterval time.Duration
 	ActivationBatchSize    int
 
+	SegmentSweepInterval       time.Duration
+	SegmentSweepBatchSize      int
+	SegmentSweepPerTenantCap   int
+	SegmentSweepReclaimTimeout time.Duration
+	SegmentSweepSafetyBatch    int
+
 	RateLimitRPS     float64
 	RateLimitBurst   int
 	CircuitThreshold int
@@ -58,6 +64,12 @@ func Load() (Config, error) {
 
 		ActivationPollInterval: getEnvDuration("ACTIVATION_POLL_INTERVAL", 2*time.Second),
 		ActivationBatchSize:    getEnvInt("ACTIVATION_BATCH_SIZE", 50),
+
+		SegmentSweepInterval:       getEnvDuration("SEGMENT_SWEEP_INTERVAL", 5*time.Second),
+		SegmentSweepBatchSize:      getEnvInt("SEGMENT_SWEEP_BATCH_SIZE", 100),
+		SegmentSweepPerTenantCap:   getEnvInt("SEGMENT_SWEEP_PER_TENANT_CAP", 50),
+		SegmentSweepReclaimTimeout: getEnvDuration("SEGMENT_SWEEP_RECLAIM_TIMEOUT", time.Minute),
+		SegmentSweepSafetyBatch:    getEnvInt("SEGMENT_SWEEP_SAFETY_BATCH", 20),
 
 		RateLimitRPS:       getEnvFloat("RATE_LIMIT_RPS", 50),
 		RateLimitBurst:     getEnvInt("RATE_LIMIT_BURST", 100),

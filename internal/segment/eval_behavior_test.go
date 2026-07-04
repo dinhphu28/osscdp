@@ -20,6 +20,10 @@ type fakeStore struct {
 	count                                int64
 	recent, absent, corrAbsent, sequence bool
 	sum                                  float64
+	lastAt                               time.Time
+	hasLast                              bool
+	nth                                  time.Time
+	hasNth                               bool
 }
 
 func (f fakeStore) Count(context.Context, uuid.UUID, uuid.UUID, behavior.Spec, time.Time) (int64, error) {
@@ -39,6 +43,12 @@ func (f fakeStore) Sequence(context.Context, uuid.UUID, uuid.UUID, behavior.Spec
 }
 func (f fakeStore) SumValue(context.Context, uuid.UUID, uuid.UUID, behavior.Spec, time.Time) (float64, error) {
 	return f.sum, nil
+}
+func (f fakeStore) LastAt(context.Context, uuid.UUID, uuid.UUID, string, time.Time) (time.Time, bool, error) {
+	return f.lastAt, f.hasLast, nil
+}
+func (f fakeStore) NthNewestInWindow(context.Context, uuid.UUID, uuid.UUID, string, time.Duration, int, time.Time) (time.Time, bool, error) {
+	return f.nth, f.hasNth, nil
 }
 
 func evalWith(r Rule, prof profile.Profile, store BehaviorStore) bool {
@@ -142,6 +152,12 @@ func (errStore) Sequence(context.Context, uuid.UUID, uuid.UUID, behavior.Spec, t
 }
 func (errStore) SumValue(context.Context, uuid.UUID, uuid.UUID, behavior.Spec, time.Time) (float64, error) {
 	return 0, errBoom
+}
+func (errStore) LastAt(context.Context, uuid.UUID, uuid.UUID, string, time.Time) (time.Time, bool, error) {
+	return time.Time{}, false, errBoom
+}
+func (errStore) NthNewestInWindow(context.Context, uuid.UUID, uuid.UUID, string, time.Duration, int, time.Time) (time.Time, bool, error) {
+	return time.Time{}, false, errBoom
 }
 
 func TestEvalBehavior_StoreErrorPropagates(t *testing.T) {

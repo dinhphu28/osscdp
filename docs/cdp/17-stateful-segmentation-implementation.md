@@ -582,6 +582,21 @@ bucket-granularity of the stored one (finding #12), and only recompute the count
 **Ship:** absence/expiry transitions fire without an inbound event, including for dormant profiles;
 the flagship rule works end-to-end.
 
+**Known trade-offs / follow-ups (adversarial-review-confirmed):**
+
+- **Seed durability.** The population seed is paged (bounded per-page tx over `customer_profile` by id)
+  and runs off the request path, but it is still a best-effort in-process job. A crash mid-seed can leave
+  dormant profiles unevaluated, and the safety sweep only re-enqueues **active** memberships — so a lost
+  seed of a never-a-member dormant profile does not self-heal. A durable, resumable seed job (a
+  `needs_seed` cursor drained by a background worker with retry) is the production-grade follow-up.
+- **Poison rows.** A `(segment, profile)` whose sweep persistently errors is deferred with a fixed
+  backoff (`DeferPending`) so it neither tight-loops nor starves its tenant's fair-claim slots, but there
+  is no attempt counter / dead-letter yet — it retries indefinitely. Add an attempts column + park-after-N.
+- **Sweep-safety gate is conservative.** `referencesEvent` keeps any rule with a stateless `event.*` leaf
+  edge-only. This is safe (never a spurious sweep) but over-broad for `OR(event.x, behaviour)`, whose
+  elapse-driven enter will not fire via the sweep. A context-aware gate (unsafe only for an event leaf
+  under AND/NOT) would recover those.
+
 ---
 
 ## Phase 6 — Bucket rollup (hot path) + segment metadata + prefilter
