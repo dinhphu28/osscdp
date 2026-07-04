@@ -4,9 +4,11 @@ package foundationtest
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,13 +26,93 @@ import (
 	"github.com/dinhphu28/osscdp/internal/tenant"
 )
 
-func TestMain(m *testing.M) {
-	// The Ryuk resource-reaper sidecar is not available in every Docker setup;
-	// container cleanup is handled explicitly via t.Cleanup below, so disable it.
+// Package-level shared PostgreSQL: one container is started for the whole package
+// (in TestMain) with the schema migrated into the "cdp" template database. Each
+// setup(t) clones that template into a fresh per-test database via CREATE DATABASE
+// … TEMPLATE — a fast file copy that gives every test a pristine schema without
+// paying the ~8s container spin-up per test.
+var (
+	pgTemplateDSN string        // DSN of the migrated "cdp" template database
+	adminPool     *pgxpool.Pool // connected to the "postgres" maintenance db for CREATE/DROP DATABASE
+	dbSeq         atomic.Uint64
+)
+
+func TestMain(m *testing.M) { os.Exit(runMain(m)) }
+
+// runMain owns the shared container so defers run on every bootstrap failure path
+// (Ryuk is disabled, so an orphaned container would otherwise leak).
+func runMain(m *testing.M) int {
 	if _, set := os.LookupEnv("TESTCONTAINERS_RYUK_DISABLED"); !set {
 		_ = os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 	}
-	os.Exit(m.Run())
+	ctx := context.Background()
+
+	container, err := tcpostgres.Run(ctx, "postgres:16",
+		tcpostgres.WithDatabase("cdp"),
+		tcpostgres.WithUsername("cdp"),
+		tcpostgres.WithPassword("cdp"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).WithStartupTimeout(60*time.Second)),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "start postgres container: %v\n", err)
+		return 1
+	}
+	defer func() { _ = container.Terminate(ctx) }()
+
+	pgTemplateDSN, err = container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "connection string: %v\n", err)
+		return 1
+	}
+	// Migrate the "cdp" database once; it becomes the clone template.
+	if err := migrate.Up(pgTemplateDSN); err != nil {
+		fmt.Fprintf(os.Stderr, "migrate template: %v\n", err)
+		return 1
+	}
+
+	adminCfg, err := pgxpool.ParseConfig(pgTemplateDSN)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse dsn: %v\n", err)
+		return 1
+	}
+	adminCfg.ConnConfig.Database = "postgres" // never connect to the template itself
+	adminPool, err = pgxpool.NewWithConfig(ctx, adminCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "admin pool: %v\n", err)
+		return 1
+	}
+	defer adminPool.Close()
+
+	// migrate.Up closes its client connection, but the PostgreSQL backend detaches
+	// asynchronously; CREATE DATABASE … TEMPLATE cdp refuses a template with any live
+	// backend. Wait for "cdp" to be fully idle before the first clone.
+	if err := waitTemplateIdle(ctx, adminPool); err != nil {
+		fmt.Fprintf(os.Stderr, "template not idle: %v\n", err)
+		return 1
+	}
+
+	return m.Run()
+}
+
+// waitTemplateIdle blocks until no backend is attached to the "cdp" template.
+func waitTemplateIdle(ctx context.Context, admin *pgxpool.Pool) error {
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var n int
+		if err := admin.QueryRow(ctx,
+			`SELECT count(*) FROM pg_stat_activity WHERE datname = 'cdp'`).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%d backend(s) still attached to template cdp", n)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 type fixture struct {
@@ -44,23 +126,24 @@ func setup(t *testing.T) fixture {
 	t.Helper()
 	ctx := context.Background()
 
-	container, err := tcpostgres.Run(ctx, "postgres:16",
-		tcpostgres.WithDatabase("cdp"),
-		tcpostgres.WithUsername("cdp"),
-		tcpostgres.WithPassword("cdp"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).WithStartupTimeout(60*time.Second)),
-	)
+	dbName := fmt.Sprintf("t_%d_%d", os.Getpid(), dbSeq.Add(1))
+	// Clone the migrated template into a fresh database for this test. Identifier is
+	// composed only of integers, so interpolation is safe (DDL cannot bind params).
+	if _, err := adminPool.Exec(ctx, "CREATE DATABASE "+dbName+" TEMPLATE cdp"); err != nil {
+		t.Fatalf("create test database %s: %v", dbName, err)
+	}
+	// LIFO cleanup: pool.Close runs first (below), then DROP … WITH (FORCE) drops the
+	// db even if a stray connection lingers.
+	t.Cleanup(func() {
+		if _, err := adminPool.Exec(context.Background(), "DROP DATABASE IF EXISTS "+dbName+" WITH (FORCE)"); err != nil {
+			t.Logf("drop test database %s: %v", dbName, err)
+		}
+	})
+
+	cfg, err := pgxpool.ParseConfig(pgTemplateDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = container.Terminate(ctx) })
-
-	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
-
-	require.NoError(t, migrate.Up(dsn))
-
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg.ConnConfig.Database = dbName
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
