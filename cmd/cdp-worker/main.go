@@ -123,7 +123,9 @@ func run() error {
 	profileSvc.OnUpdated = m.ProfileUpdated.Inc
 	profileSvc.Audit = audit.NewRecorder(pool)
 	profileSvc.Logger = logger
-	profileSvc.Behavior = behavior.NewRecorder() // Phase 2: durable behavioral_event log
+	behaviorRec := behavior.NewRecorder() // Phase 2: durable behavioral_event log
+	behaviorRec.PropsGate = behavior.ConsentPropsGate{} // Phase 7: gate props under analytics consent
+	profileSvc.Behavior = behaviorRec
 	profileConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-profile", []string{bus.TopicIdentityResolved}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err

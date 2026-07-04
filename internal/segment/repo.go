@@ -16,6 +16,7 @@ import (
 // Status values.
 const (
 	SegmentActive    = "active"
+	SegmentInactive  = "inactive"
 	VersionActive    = "active"
 	MembershipActive = "active"
 	MembershipExited = "exited"
@@ -137,10 +138,29 @@ func (r *Repo) UpdateSegment(ctx context.Context, tenantID, segmentID uuid.UUID,
 		verID, tenantID, segmentID, maxVer+1, ruleJSON, VersionActive, isStateful, hasStateless, events, int64(maxWindow.Seconds())); err != nil {
 		return Segment{}, fmt.Errorf("insert version: %w", err)
 	}
+	// Editing a segment also reactivates it (an edit implies it should be live) — this
+	// is the reactivation path for a retired segment and prevents a dead version on an
+	// inactive one (finding #25).
 	if _, err := tx.Exec(ctx,
-		`UPDATE segment SET current_version_id=$1, description=coalesce($2, description), updated_at=now() WHERE tenant_id=$3 AND id=$4`,
-		verID, nullString(description), tenantID, segmentID); err != nil {
+		`UPDATE segment SET current_version_id=$1, description=coalesce($2, description), status=$5, updated_at=now() WHERE tenant_id=$3 AND id=$4`,
+		verID, nullString(description), tenantID, segmentID, SegmentActive); err != nil {
 		return Segment{}, fmt.Errorf("repoint current: %w", err)
+	}
+	// Re-evaluate current members against the new rule (finding #24): enqueue each
+	// active member due-now so the sweeper re-checks and exits any who no longer match.
+	// Only sweep-safe rules — an event-gated rule cannot be swept, so its members
+	// re-evaluate at their next inbound event instead (no wasted enqueue). Newly
+	// qualifying profiles are covered by the seed on update.
+	if !referencesEvent(rule) {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO segment_pending_eval (tenant_id, segment_id, customer_profile_id, due_at, reason)
+			SELECT tenant_id, segment_id, customer_profile_id, now(), 'version_change'
+			FROM segment_membership WHERE tenant_id=$1 AND segment_id=$2 AND status=$3
+			ON CONFLICT (tenant_id, segment_id, customer_profile_id)
+			DO UPDATE SET due_at = LEAST(segment_pending_eval.due_at, now()), reason='version_change', claimed_at=NULL`,
+			tenantID, segmentID, MembershipActive); err != nil {
+			return Segment{}, fmt.Errorf("enqueue version_change: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Segment{}, err
@@ -218,6 +238,34 @@ func (r *Repo) SegmentsEpoch(ctx context.Context, tenantID uuid.UUID) (count int
 		maxUpdated = *updated
 	}
 	return count, maxUpdated, versionSum, nil
+}
+
+// DeactivateSegment retires a segment (finding #25): flips it to inactive (so the
+// edge no longer evaluates it and the sweeper drops its stranded due-rows) and purges
+// its segment_pending_eval rows. Buckets are kept (rule-agnostic, shared across
+// segments). Membership rows are frozen as historical — a drain-with-exit-emit is a
+// separate policy the service can apply. Idempotent.
+func (r *Repo) DeactivateSegment(ctx context.Context, tenantID, segmentID uuid.UUID) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ct, err := tx.Exec(ctx,
+		`UPDATE segment SET status=$3, updated_at=now() WHERE tenant_id=$1 AND id=$2`,
+		tenantID, segmentID, SegmentInactive)
+	if err != nil {
+		return fmt.Errorf("deactivate segment: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM segment_pending_eval WHERE tenant_id=$1 AND segment_id=$2`, tenantID, segmentID); err != nil {
+		return fmt.Errorf("purge pending on retire: %w", err)
+	}
+	return tx.Commit(ctx)
 }
 
 // ActiveVersionForSegment returns the current active rule version of one segment.
@@ -392,6 +440,7 @@ func (r *Repo) SafetyReEnqueue(ctx context.Context, dueAt time.Time, limit int) 
 		INSERT INTO segment_pending_eval (tenant_id, segment_id, customer_profile_id, due_at, reason)
 		SELECT m.tenant_id, m.segment_id, m.customer_profile_id, $1, 'safety_sweep'
 		FROM segment_membership m
+		JOIN segment sg ON sg.id = m.segment_id AND sg.status = 'active'
 		WHERE m.status='active'
 		  AND NOT EXISTS (
 		      SELECT 1 FROM segment_pending_eval p

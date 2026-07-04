@@ -141,6 +141,7 @@ func run() error {
 		// Segment management (Phase 7).
 		admin.With(auth.Require(rbac.PermSegmentWrite)).Post("/admin/v1/tenants/{tenantID}/segments", segmentHandler.Create)
 		admin.With(auth.Require(rbac.PermSegmentWrite)).Put("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Update)
+		admin.With(auth.Require(rbac.PermSegmentWrite)).Delete("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Deactivate)
 		admin.With(auth.Require(rbac.PermSegmentRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}", segmentHandler.Get)
 		admin.With(auth.Require(rbac.PermSegmentRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/members", segmentHandler.Members)
 		admin.With(auth.Require(rbac.PermDestinationRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/destinations", activationHandler.ListSegmentDestinations)
