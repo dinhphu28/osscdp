@@ -19,6 +19,7 @@ import (
 
 	"github.com/dinhphu28/osscdp/internal/activation"
 	"github.com/dinhphu28/osscdp/internal/audit"
+	"github.com/dinhphu28/osscdp/internal/behavior"
 	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/config"
 	"github.com/dinhphu28/osscdp/internal/consent"
@@ -115,6 +116,7 @@ func run() error {
 	profileSvc.OnUpdated = m.ProfileUpdated.Inc
 	profileSvc.Audit = audit.NewRecorder(pool)
 	profileSvc.Logger = logger
+	profileSvc.Behavior = behavior.NewRecorder() // Phase 2: durable behavioral_event log
 	profileConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-profile", []string{bus.TopicIdentityResolved}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err
