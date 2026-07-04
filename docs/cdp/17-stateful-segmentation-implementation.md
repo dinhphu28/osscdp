@@ -75,7 +75,7 @@ type BehaviorSpec struct {
 	EventName string         `json:"event_name,omitempty"` // required except sequence
 	Window    string         `json:"window,omitempty"`     // "7d","24h","30m" -> time.Duration
 	Op        string         `json:"op,omitempty"`         // count/frequency: gte|gt|lte|lt|eq
-	Value     float64        `json:"value,omitempty"`
+	Value     *float64       `json:"value,omitempty"`      // pointer: absent is distinct from 0; required for count/frequency
 	ValueProp string         `json:"value_prop,omitempty"` // frequency-of-value numeric property
 	Where     *Rule          `json:"where,omitempty"`      // OPTIONAL props filter (comparison-leaf grammar)
 	Steps     []BehaviorSpec `json:"steps,omitempty"`      // sequence: ordered A,B,...
