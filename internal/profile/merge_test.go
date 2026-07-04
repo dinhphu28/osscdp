@@ -61,6 +61,40 @@ func TestMergeReparent(t *testing.T) {
 	}
 }
 
+func TestMergeReparent_Recency(t *testing.T) {
+	early := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	late := time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC)
+
+	// Survivor was seen earlier; the loser was seen more recently.
+	survivor := &Profile{
+		Traits: map[string]any{},
+		ComputedAttributes: map[string]any{
+			AttrLastEventName: "page_viewed",
+			AttrLastOrderAt:   early.Format(time.RFC3339),
+		},
+		LastSeenAt: &early,
+	}
+	loser := Profile{
+		Traits: map[string]any{},
+		ComputedAttributes: map[string]any{
+			AttrLastEventName: "order_completed",
+			AttrLastOrderAt:   late.Format(time.RFC3339),
+		},
+		LastSeenAt: &late,
+	}
+
+	mergeReparent(survivor, loser)
+
+	// Loser seen more recently -> its last_event_name wins over the survivor's staler one.
+	if survivor.ComputedAttributes[AttrLastEventName] != "order_completed" {
+		t.Fatalf("last_event_name = %v, want order_completed (loser is newer)", survivor.ComputedAttributes[AttrLastEventName])
+	}
+	// last_order_at always takes the later timestamp.
+	if survivor.ComputedAttributes[AttrLastOrderAt] != late.Format(time.RFC3339) {
+		t.Fatalf("last_order_at = %v, want %v", survivor.ComputedAttributes[AttrLastOrderAt], late.Format(time.RFC3339))
+	}
+}
+
 func trackEnv(name string, props, ctxJSON, traits string) events.Envelope {
 	e := events.Envelope{
 		Type:      events.TypeTrack,

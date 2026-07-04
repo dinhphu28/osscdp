@@ -715,9 +715,11 @@ paths:
                 type: object
                 properties:
                   id: {type: string, format: uuid}
+                  tenant_id: {type: string, format: uuid}
                   destination_id: {type: string, format: uuid}
                   trigger_type: {type: string}
-                  segment_id: {type: string, format: uuid}
+                  segment_id: {type: string, format: uuid, nullable: true, description: "Absent for event-triggered subscriptions"}
+                  event_name: {type: string, description: "Present only for event-triggered subscriptions"}
                   status: {type: string, example: disabled}
         "400": {$ref: "#/components/responses/BadRequest"}
         "404": {$ref: "#/components/responses/NotFound"}

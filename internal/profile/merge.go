@@ -87,9 +87,29 @@ func mergeReparent(dst *Profile, src Profile) []string {
 			changed = append(changed, "computed_attributes."+key)
 		}
 	}
-	// Fill only the computed keys the survivor lacks (never clobber its latest values).
+	// The "last_*" activity block reflects the most recent event: take it from
+	// whichever profile was seen more recently, not fill-missing (which would keep
+	// a staler survivor value). Fill when the survivor lacks the key.
+	loserNewer := src.LastSeenAt != nil && (dst.LastSeenAt == nil || src.LastSeenAt.After(*dst.LastSeenAt))
+	for _, key := range []string{AttrLastEventName, AttrLastSourceID, AttrLastPageURL, AttrLastProductViewed} {
+		v, ok := src.ComputedAttributes[key]
+		if !ok {
+			continue
+		}
+		if _, has := dst.ComputedAttributes[key]; (!has || loserNewer) && dst.ComputedAttributes[key] != v {
+			dst.ComputedAttributes[key] = v
+			changed = append(changed, "computed_attributes."+key)
+		}
+	}
+	// last_order_at is a plain timestamp: keep the later of the two (RFC3339 sorts lexically).
+	if v := asString(src.ComputedAttributes[AttrLastOrderAt]); v != "" && v > asString(dst.ComputedAttributes[AttrLastOrderAt]) {
+		dst.ComputedAttributes[AttrLastOrderAt] = v
+		changed = append(changed, "computed_attributes."+AttrLastOrderAt)
+	}
+	// Any other computed key: fill only what the survivor lacks.
 	for k, v := range src.ComputedAttributes {
-		if k == AttrTotalEvents || k == AttrTotalOrders {
+		switch k {
+		case AttrTotalEvents, AttrTotalOrders, AttrLastEventName, AttrLastSourceID, AttrLastPageURL, AttrLastProductViewed, AttrLastOrderAt:
 			continue
 		}
 		if _, ok := dst.ComputedAttributes[k]; !ok {

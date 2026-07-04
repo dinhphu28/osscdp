@@ -113,6 +113,7 @@ func run() error {
 	profileSvc := profile.NewService(pool, producer, bus.TopicProfileUpdated)
 	profileSvc.OnUpdated = m.ProfileUpdated.Inc
 	profileSvc.Audit = audit.NewRecorder(pool)
+	profileSvc.Logger = logger
 	profileConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-profile", []string{bus.TopicIdentityResolved}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err
