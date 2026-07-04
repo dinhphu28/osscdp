@@ -144,6 +144,14 @@ func run() error {
 	segmentConsumer.OnRetry = m.ProcessingRetries.Inc
 	segmentHandler := makeSegmentHandler(segmentSvc)
 
+	// Deadline sweeper (Phase 5): fires absence/expiry/re-entry transitions with no
+	// inbound event by re-evaluating due segment_pending_eval rows fairly per tenant.
+	segmentRunner := segment.NewRunner(segmentSvc, cfg.SegmentSweepBatchSize, cfg.SegmentSweepPerTenantCap,
+		cfg.SegmentSweepSafetyBatch, cfg.SegmentSweepReclaimTimeout, cfg.SegmentSweepInterval, logger)
+	segmentRunner.OnClaimed = m.SweepClaimed.Inc
+	segmentRunner.OnTransition = m.SweepTransition.Inc
+	segmentRunner.OnError = m.SweepError.Inc
+
 	// Activation: consumes segment_membership_changed → creates tasks; a sender
 	// loop delivers them with retry/backoff. The consent gate skips denied sends.
 	activationSvc := activation.NewService(pool, profile.NewRepo(pool), consent.NewRepo(pool))
@@ -172,9 +180,10 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(9)
+	wg.Add(10)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
 	go func() { defer wg.Done(); memRelay.Run(ctx) }()
+	go func() { defer wg.Done(); segmentRunner.Run(ctx) }()
 	go func() { defer wg.Done(); activationRunner.Run(ctx) }()
 	go func() {
 		defer wg.Done()

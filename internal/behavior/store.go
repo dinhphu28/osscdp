@@ -3,11 +3,13 @@ package behavior
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -199,6 +201,45 @@ func (s *Store) SumValue(ctx context.Context, tenantID, profileID uuid.UUID, spe
 		}
 	}
 	return sum, rows.Err()
+}
+
+// LastAt returns the most recent occurred_at of eventName at or before `at`
+// (ok=false if the event never occurred). Used to compute absence/recency deadlines.
+func (s *Store) LastAt(ctx context.Context, tenantID, profileID uuid.UUID, eventName string, at time.Time) (time.Time, bool, error) {
+	var t *time.Time
+	err := s.pool.QueryRow(ctx, `
+		SELECT MAX(occurred_at) FROM behavioral_event
+		WHERE tenant_id=$1 AND customer_profile_id=$2 AND event_name=$3 AND occurred_at <= $4`,
+		tenantID, profileID, eventName, at).Scan(&t)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("last at: %w", err)
+	}
+	if t == nil {
+		return time.Time{}, false, nil
+	}
+	return *t, true, nil
+}
+
+// NthNewestInWindow returns the occurred_at of the n-th newest eventName within
+// (at-window, at] (ok=false if fewer than n exist). For a count>=K deadline: the
+// count drops below K when the K-th newest ages out, i.e. at NthNewest(K)+window.
+func (s *Store) NthNewestInWindow(ctx context.Context, tenantID, profileID uuid.UUID, eventName string, window time.Duration, n int, at time.Time) (time.Time, bool, error) {
+	if n < 1 {
+		return time.Time{}, false, nil
+	}
+	var t time.Time
+	err := s.pool.QueryRow(ctx, `
+		SELECT occurred_at FROM behavioral_event
+		WHERE tenant_id=$1 AND customer_profile_id=$2 AND event_name=$3 AND occurred_at >= $4 AND occurred_at <= $5
+		ORDER BY occurred_at DESC OFFSET $6 LIMIT 1`,
+		tenantID, profileID, eventName, at.Add(-window), at, n-1).Scan(&t)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("nth newest: %w", err)
+	}
+	return t, true, nil
 }
 
 func compareCount(op string, got, want float64) bool {

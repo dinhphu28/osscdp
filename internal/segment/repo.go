@@ -190,6 +190,191 @@ func (r *Repo) ActiveSegmentVersions(ctx context.Context, tenantID uuid.UUID) ([
 	return out, rows.Err()
 }
 
+// ActiveVersionForSegment returns the current active rule version of one segment.
+func (r *Repo) ActiveVersionForSegment(ctx context.Context, tenantID, segmentID uuid.UUID) (ActiveVersion, bool, error) {
+	var av ActiveVersion
+	var ruleJSON []byte
+	err := r.pool.QueryRow(ctx, `
+		SELECT s.id, v.id, v.version, v.rule_json
+		FROM segment s JOIN segment_version v ON v.id = s.current_version_id
+		WHERE s.tenant_id=$1 AND s.id=$2 AND s.status=$3`,
+		tenantID, segmentID, SegmentActive).Scan(&av.SegmentID, &av.VersionID, &av.Version, &ruleJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ActiveVersion{}, false, nil
+	}
+	if err != nil {
+		return ActiveVersion{}, false, fmt.Errorf("active version for segment: %w", err)
+	}
+	if err := json.Unmarshal(ruleJSON, &av.Rule); err != nil {
+		return ActiveVersion{}, false, fmt.Errorf("unmarshal rule: %w", err)
+	}
+	return av, true, nil
+}
+
+// PendingEval is a claimed deadline row the sweeper must re-evaluate.
+type PendingEval struct {
+	TenantID          uuid.UUID
+	SegmentID         uuid.UUID
+	CustomerProfileID uuid.UUID
+	Reason            string
+}
+
+// UpsertPendingTx arms/re-arms a deadline for (segment, profile). Re-arming clears
+// claimed_at so the sweeper can pick it up again at the new due_at.
+func (r *Repo) UpsertPendingTx(ctx context.Context, tx pgx.Tx, tenantID, segmentID, profileID uuid.UUID, dueAt time.Time, reason string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO segment_pending_eval (tenant_id, segment_id, customer_profile_id, due_at, reason)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (tenant_id, segment_id, customer_profile_id)
+		DO UPDATE SET due_at=$4, reason=$5, claimed_at=NULL`,
+		tenantID, segmentID, profileID, dueAt, reason)
+	if err != nil {
+		return fmt.Errorf("upsert pending: %w", err)
+	}
+	return nil
+}
+
+// DeferPending pushes a deadline forward and clears its claim, so a row whose sweep
+// keeps failing backs off instead of tight-looping on the reclaim and keeps its (now
+// later) due_at from monopolizing the tenant's fair-claim slots.
+func (r *Repo) DeferPending(ctx context.Context, tenantID, segmentID, profileID uuid.UUID, dueAt time.Time) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE segment_pending_eval SET due_at=$4, claimed_at=NULL WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3`,
+		tenantID, segmentID, profileID, dueAt)
+	if err != nil {
+		return fmt.Errorf("defer pending: %w", err)
+	}
+	return nil
+}
+
+// DeletePendingTx removes a deadline (no future elapse transition remains).
+func (r *Repo) DeletePendingTx(ctx context.Context, tx pgx.Tx, tenantID, segmentID, profileID uuid.UUID) error {
+	_, err := tx.Exec(ctx,
+		`DELETE FROM segment_pending_eval WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3`,
+		tenantID, segmentID, profileID)
+	if err != nil {
+		return fmt.Errorf("delete pending: %w", err)
+	}
+	return nil
+}
+
+// CurrentDueAt returns the stored due_at for a pending row (ok=false if none), so
+// the caller can coalesce a near-identical re-arm.
+func (r *Repo) CurrentDueAt(ctx context.Context, tenantID, segmentID, profileID uuid.UUID) (time.Time, bool, error) {
+	var t time.Time
+	err := r.pool.QueryRow(ctx,
+		`SELECT due_at FROM segment_pending_eval WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3`,
+		tenantID, segmentID, profileID).Scan(&t)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("current due_at: %w", err)
+	}
+	return t, true, nil
+}
+
+// ClaimDuePending atomically claims up to batchSize due rows, fairly across tenants
+// (ROW_NUMBER per tenant, capped at perTenantCap) so one busy tenant cannot starve
+// others. Rows claimed longer than reclaim ago are re-claimable (crash recovery).
+func (r *Repo) ClaimDuePending(ctx context.Context, now time.Time, batchSize, perTenantCap int, reclaim time.Duration) ([]PendingEval, error) {
+	rows, err := r.pool.Query(ctx, `
+		WITH ranked AS (
+			SELECT tenant_id, segment_id, customer_profile_id, due_at,
+			       ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY due_at) AS rn
+			FROM segment_pending_eval
+			WHERE due_at <= $1 AND (claimed_at IS NULL OR claimed_at < $2)
+		),
+		picked AS (
+			SELECT tenant_id, segment_id, customer_profile_id
+			FROM ranked WHERE rn <= $3 ORDER BY due_at LIMIT $4
+		),
+		locked AS (
+			SELECT p.ctid
+			FROM segment_pending_eval p
+			JOIN picked USING (tenant_id, segment_id, customer_profile_id)
+			WHERE p.due_at <= $1 AND (p.claimed_at IS NULL OR p.claimed_at < $2)
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE segment_pending_eval p SET claimed_at=$1
+		FROM locked l WHERE p.ctid = l.ctid
+		RETURNING p.tenant_id, p.segment_id, p.customer_profile_id, p.reason`,
+		now, now.Add(-reclaim), perTenantCap, batchSize)
+	if err != nil {
+		return nil, fmt.Errorf("claim due pending: %w", err)
+	}
+	defer rows.Close()
+	var out []PendingEval
+	for rows.Next() {
+		var p PendingEval
+		if err := rows.Scan(&p.TenantID, &p.SegmentID, &p.CustomerProfileID, &p.Reason); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+const seedPageSize = 1000
+
+// SeedPendingForSegment enqueues a due-at deadline for every profile of a tenant
+// (dormant "did-not-do" profiles included), so a newly active/updated stateful
+// segment evaluates the existing population without an inbound event. Idempotent
+// (an existing earlier deadline is preserved) and PAGED over customer_profile by id
+// in bounded per-page transactions — never one unbounded insert (doc 16 §Backfill).
+// Call it off the request path (see handler.seedIfSweepable) for large tenants.
+func (r *Repo) SeedPendingForSegment(ctx context.Context, tenantID, segmentID uuid.UUID, dueAt time.Time, reason string) (int, error) {
+	cursor := uuid.Nil // smallest UUID: id > cursor starts at the first profile
+	total := 0
+	for {
+		var maxID *uuid.UUID
+		var pageCount int
+		err := r.pool.QueryRow(ctx, `
+			WITH page AS (
+				SELECT id FROM customer_profile WHERE tenant_id=$1 AND id > $2 ORDER BY id LIMIT $3
+			), ins AS (
+				INSERT INTO segment_pending_eval (tenant_id, segment_id, customer_profile_id, due_at, reason)
+				SELECT $1, $4, id, $5, $6 FROM page
+				ON CONFLICT (tenant_id, segment_id, customer_profile_id)
+				DO UPDATE SET due_at = LEAST(segment_pending_eval.due_at, $5), reason=$6, claimed_at=NULL
+			)
+			SELECT (SELECT id FROM page ORDER BY id DESC LIMIT 1), (SELECT count(*) FROM page)`,
+			tenantID, cursor, seedPageSize, segmentID, dueAt, reason).Scan(&maxID, &pageCount)
+		if err != nil {
+			return total, fmt.Errorf("seed pending: %w", err)
+		}
+		total += pageCount
+		if maxID == nil || pageCount < seedPageSize {
+			break
+		}
+		cursor = *maxID
+	}
+	return total, nil
+}
+
+// SafetyReEnqueue re-arms a bounded page of active memberships that currently have
+// no pending deadline (due-now, reason='safety_sweep'), so a mis-computed or lost
+// due_at self-heals. Bounded per call and called at a low rate → a rolling sweep.
+// Event-gated / stateless rows the sweeper picks up are harmlessly dropped by
+// SweepEvaluate. Returns rows re-enqueued.
+func (r *Repo) SafetyReEnqueue(ctx context.Context, dueAt time.Time, limit int) (int, error) {
+	ct, err := r.pool.Exec(ctx, `
+		INSERT INTO segment_pending_eval (tenant_id, segment_id, customer_profile_id, due_at, reason)
+		SELECT m.tenant_id, m.segment_id, m.customer_profile_id, $1, 'safety_sweep'
+		FROM segment_membership m
+		WHERE m.status='active'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM segment_pending_eval p
+		      WHERE p.tenant_id=m.tenant_id AND p.segment_id=m.segment_id AND p.customer_profile_id=m.customer_profile_id)
+		LIMIT $2
+		ON CONFLICT (tenant_id, segment_id, customer_profile_id) DO NOTHING`,
+		dueAt, limit)
+	if err != nil {
+		return 0, fmt.Errorf("safety re-enqueue: %w", err)
+	}
+	return int(ct.RowsAffected()), nil
+}
+
 // MembershipStatus returns the current status of a membership ("" if none).
 func (r *Repo) MembershipStatus(ctx context.Context, tenantID, segmentID, profileID uuid.UUID) (string, error) {
 	var status string

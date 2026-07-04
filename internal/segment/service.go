@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dinhphu28/osscdp/internal/profile"
@@ -106,72 +107,201 @@ func (s *Service) Evaluate(ctx context.Context, pu profile.ProfileUpdated) error
 		if matched && stateful && s.OnStatefulMatched != nil {
 			s.OnStatefulMatched()
 		}
-		if err := s.applyMembership(ctx, pu, seg, matched); err != nil {
+		if err := s.applyMembership(ctx, pu, seg, ec, matched, at); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// applyMembership performs one (segment, profile) transition in a single tx: a
-// conditional flip (no read-then-write race) and, only when the status actually
-// flipped, the outbox insert — so flip + emit commit atomically. A redundant
-// transition (already active / already exited / never a member) emits nothing.
-func (s *Service) applyMembership(ctx context.Context, pu profile.ProfileUpdated, seg ActiveVersion, matched bool) error {
+// coalesceGranularity: skip re-arming a deadline when the new due_at is within this
+// of the stored one, to avoid write churn on repeated near-identical recomputes.
+const coalesceGranularity = time.Minute
+
+// flipAndEmit runs one conditional flip + (if it flipped) the outbox insert inside
+// tx, shared by the edge and sweep paths. tokenPrefix is the ReasonEventID prefix
+// ("<event_id>" on the edge, "sweep" on the sweeper); the token is "<prefix>:<seq>".
+// Does not commit. Returns whether a real transition flipped.
+func (s *Service) flipAndEmit(ctx context.Context, tx pgx.Tx, tenantID uuid.UUID, seg ActiveVersion, profileID uuid.UUID, canonical, tokenPrefix string, matched bool) (bool, error) {
+	var (
+		seq     int64
+		flipped bool
+		change  string
+		err     error
+	)
+	if matched {
+		change = ChangeEntered
+		if seq, flipped, err = s.repo.EnterTx(ctx, tx, tenantID, seg.SegmentID, profileID, seg.Version); err != nil {
+			return false, err
+		}
+		if !flipped {
+			// Already a member: record the evaluation, emit nothing.
+			return false, s.repo.TouchEvaluatedTx(ctx, tx, tenantID, seg.SegmentID, profileID, seg.Version)
+		}
+	} else {
+		change = ChangeExited
+		if seq, flipped, err = s.repo.ExitTx(ctx, tx, tenantID, seg.SegmentID, profileID); err != nil {
+			return false, err
+		}
+		if !flipped {
+			return false, nil // not a member / already exited
+		}
+	}
+
+	payload := MembershipChanged{
+		EventType:         "segment_membership_changed",
+		TenantID:          tenantID,
+		SegmentID:         seg.SegmentID,
+		SegmentVersionID:  seg.VersionID,
+		CustomerProfileID: profileID,
+		Change:            change,
+		ReasonEventID:     fmt.Sprintf("%s:%d", tokenPrefix, seq),
+		TransitionSeq:     seq,
+		ChangedAt:         time.Now().UTC(),
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return false, fmt.Errorf("marshal membership change: %w", err)
+	}
+	return true, s.repo.InsertMembershipOutbox(ctx, tx, tenantID, tenantID.String()+"|"+canonical, b)
+}
+
+// applyMembership is the edge path: flip + emit atomically, then arm the elapse
+// deadline (segment_pending_eval) for sweep-safe rules so an absence/expiry/re-entry
+// transition still fires later with no inbound event. All in one tx.
+func (s *Service) applyMembership(ctx context.Context, pu profile.ProfileUpdated, seg ActiveVersion, ec EvalContext, matched bool, at time.Time) error {
+	due, hasDue, arm, err := s.planDeadline(ctx, seg, ec, pu.TenantID, pu.CustomerProfileID, at)
+	if err != nil {
+		return err
+	}
 	tx, err := s.repo.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var (
-		seq     int64
-		flipped bool
-		change  string
-	)
-	if matched {
-		change = ChangeEntered
-		if seq, flipped, err = s.repo.EnterTx(ctx, tx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID, seg.Version); err != nil {
-			return err
-		}
-		if !flipped {
-			// Already a member: record the evaluation, emit nothing.
-			if err := s.repo.TouchEvaluatedTx(ctx, tx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID, seg.Version); err != nil {
-				return err
-			}
-			return tx.Commit(ctx)
-		}
-	} else {
-		change = ChangeExited
-		if seq, flipped, err = s.repo.ExitTx(ctx, tx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID); err != nil {
-			return err
-		}
-		if !flipped {
-			return tx.Commit(ctx) // not a member / already exited
-		}
+	if _, err := s.flipAndEmit(ctx, tx, pu.TenantID, seg, pu.CustomerProfileID, pu.CanonicalUserID, pu.EventID, matched); err != nil {
+		return err
 	}
-
-	// ReasonEventID is a unique per-flip token (<event_id>:<seq>) so activation's
-	// idempotency key is distinct per real transition (finding #27) while replays
-	// of the same flip dedup.
-	payload := MembershipChanged{
-		EventType:         "segment_membership_changed",
-		TenantID:          pu.TenantID,
-		SegmentID:         seg.SegmentID,
-		SegmentVersionID:  seg.VersionID,
-		CustomerProfileID: pu.CustomerProfileID,
-		Change:            change,
-		ReasonEventID:     fmt.Sprintf("%s:%d", pu.EventID, seq),
-		TransitionSeq:     seq,
-		ChangedAt:         time.Now().UTC(),
-	}
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal membership change: %w", err)
-	}
-	key := pu.TenantID.String() + "|" + pu.CanonicalUserID
-	if err := s.repo.InsertMembershipOutbox(ctx, tx, pu.TenantID, key, b); err != nil {
+	if err := s.armDeadline(ctx, tx, pu.TenantID, seg.SegmentID, pu.CustomerProfileID, due, hasDue, arm, "absence_deadline"); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// planDeadline computes the next elapse deadline for a sweep-safe rule and whether
+// to re-arm it (coalescing a near-identical existing due_at). Reads only; the write
+// happens in the caller's tx via armDeadline.
+func (s *Service) planDeadline(ctx context.Context, seg ActiveVersion, ec EvalContext, tenantID, profileID uuid.UUID, at time.Time) (due time.Time, hasDue, arm bool, err error) {
+	if referencesEvent(seg.Rule) {
+		return time.Time{}, false, false, nil // event-gated rule: edge-only, no deadline
+	}
+	due, hasDue, err = nextDueAt(ctx, seg.Rule, ec, s.store, at)
+	if err != nil || !hasDue {
+		return time.Time{}, false, false, err
+	}
+	arm = true
+	if cur, ok, err := s.repo.CurrentDueAt(ctx, tenantID, seg.SegmentID, profileID); err != nil {
+		return time.Time{}, false, false, err
+	} else if ok && absDuration(cur.Sub(due)) < coalesceGranularity {
+		arm = false // near-identical deadline already stored; leave it
+	}
+	return due, true, arm, nil
+}
+
+// armDeadline upserts/deletes the deadline row inside tx per the plan.
+func (s *Service) armDeadline(ctx context.Context, tx pgx.Tx, tenantID, segmentID, profileID uuid.UUID, due time.Time, hasDue, arm bool, reason string) error {
+	switch {
+	case hasDue && arm:
+		return s.repo.UpsertPendingTx(ctx, tx, tenantID, segmentID, profileID, due, reason)
+	case !hasDue:
+		return s.repo.DeletePendingTx(ctx, tx, tenantID, segmentID, profileID)
+	default:
+		return nil // coalesced: keep the existing deadline
+	}
+}
+
+// SweepEvaluate re-evaluates one claimed (segment, profile) deadline at at=now()
+// with NO triggering event, flips through the same atomic path (token "sweep:<seq>"),
+// and unconditionally re-arms the next deadline across all leaves (finding #6). This
+// is the flagship: absence/expiry transitions fire without an inbound event.
+func (s *Service) SweepEvaluate(ctx context.Context, row PendingEval, at time.Time) error {
+	av, ok, err := s.repo.ActiveVersionForSegment(ctx, row.TenantID, row.SegmentID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return s.dropDeadline(ctx, row) // segment inactive/deleted
+	}
+	if referencesEvent(av.Rule) {
+		// Event-gated rule cannot be evaluated without a triggering event; a deadline
+		// should never have been armed for it. Drop the stray row (defensive: the
+		// safety sweep may enqueue broadly).
+		return s.dropDeadline(ctx, row)
+	}
+	prof, err := s.profiles.GetByID(ctx, row.TenantID, row.CustomerProfileID)
+	if errors.Is(err, profile.ErrNotFound) {
+		return s.dropDeadline(ctx, row)
+	}
+	if err != nil {
+		return err
+	}
+	ec := EvalContext{Profile: prof} // sweep has no triggering event
+	matched, err := Evaluate(ctx, av.Rule, ec, s.store, at)
+	if err != nil {
+		return err
+	}
+	due, hasDue, err := nextDueAt(ctx, av.Rule, ec, s.store, at)
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.repo.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := s.flipAndEmit(ctx, tx, row.TenantID, av, prof.ID, prof.CanonicalUserID, "sweep", matched); err != nil {
+		return err
+	}
+	// Unconditional re-arm (no coalesce): the row was just claimed, so re-arming
+	// clears claimed_at and sets the recomputed next deadline (or deletes it).
+	if err := s.armDeadline(ctx, tx, row.TenantID, av.SegmentID, prof.ID, due, hasDue, true, "absence_deadline"); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Service) dropDeadline(ctx context.Context, row PendingEval) error {
+	tx, err := s.repo.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.repo.DeletePendingTx(ctx, tx, row.TenantID, row.SegmentID, row.CustomerProfileID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// SeedSegment enqueues a due-now deadline for every profile of the tenant when the
+// segment is a sweep-safe stateful rule, so the existing population (including
+// dormant "did-not-do" profiles) is evaluated without an inbound event. No-op for
+// stateless or event-gated segments. Returns rows seeded.
+func (s *Service) SeedSegment(ctx context.Context, tenantID, segmentID uuid.UUID, at time.Time, reason string) (int, error) {
+	av, ok, err := s.repo.ActiveVersionForSegment(ctx, tenantID, segmentID)
+	if err != nil || !ok {
+		return 0, err
+	}
+	if !hasBehavior(av.Rule) || referencesEvent(av.Rule) {
+		return 0, nil
+	}
+	return s.repo.SeedPendingForSegment(ctx, tenantID, segmentID, at, reason)
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
