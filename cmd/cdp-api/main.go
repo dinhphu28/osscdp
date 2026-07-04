@@ -99,7 +99,7 @@ func run() error {
 	segmentHandler := segment.NewHandler(segment.NewRepo(pool))
 	activationHandler := activation.NewHandler(activation.NewRepo(pool), cipher)
 	consentHandler := consent.NewHandler(consent.NewRepo(pool), profile.NewRepo(pool))
-	governanceHandler := governance.NewHandler(governance.NewService(pool, recorder))
+	governanceHandler := governance.NewHandler(governance.NewService(pool, recorder, cipher))
 	rbacRepo := rbac.NewRepo(pool)
 	tokenHandler := auth.NewTokenHandler(rbacRepo, recorder)
 	dlqRepo := dlq.NewRepo(pool)

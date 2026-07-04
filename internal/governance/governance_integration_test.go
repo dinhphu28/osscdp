@@ -95,7 +95,7 @@ func seedPerson(t *testing.T, ctx context.Context, pool *pgxpool.Pool, nodes map
 func TestIdentifiers(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
-	svc := NewService(pool, audit.NewRecorder(pool))
+	svc := NewService(pool, audit.NewRecorder(pool), nil)
 
 	// A person with two emails, three phones, one user_id.
 	tenantID, canonical := seedPerson(t, ctx, pool, map[string]int{"email": 2, "phone": 3, "user_id": 1})
@@ -110,7 +110,7 @@ func TestIdentifiers(t *testing.T) {
 func TestIdentifiers_NotFound(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
-	svc := NewService(pool, audit.NewRecorder(pool))
+	svc := NewService(pool, audit.NewRecorder(pool), nil)
 
 	// Seed a person so the tenant exists, then query an unknown canonical id.
 	tenantID, _ := seedPerson(t, ctx, pool, map[string]int{"email": 1})
@@ -122,7 +122,7 @@ func TestIdentifiers_NotFound(t *testing.T) {
 func TestIdentifiers_EmptyCluster(t *testing.T) {
 	ctx := context.Background()
 	pool := newPool(t)
-	svc := NewService(pool, audit.NewRecorder(pool))
+	svc := NewService(pool, audit.NewRecorder(pool), nil)
 
 	// A profile whose cluster has no identity nodes yet.
 	tenantID, canonical := seedPerson(t, ctx, pool, map[string]int{})

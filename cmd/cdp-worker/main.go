@@ -102,6 +102,7 @@ func run() error {
 	identitySvc := identity.NewService(pool, producer, bus.TopicIdentityResolved)
 	identitySvc.OnResolved = m.IdentityResolved.Inc
 	identitySvc.OnMerge = m.IdentityMerge.Inc
+	identitySvc.Cipher = cipher // Tier 2: encrypt identifier plaintext at ingest
 	identityConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-identity", []string{bus.TopicEvents}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err

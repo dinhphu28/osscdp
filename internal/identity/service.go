@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/dinhphu28/osscdp/internal/crypto"
 	"github.com/dinhphu28/osscdp/internal/events"
 )
 
@@ -53,6 +54,10 @@ type Service struct {
 	// Metric hooks (nil-safe).
 	OnResolved func()
 	OnMerge    func()
+	// Cipher, when set, encrypts each identifier's plaintext into
+	// identity_node.value_encrypted at ingest (Enhancement C Tier 2). Nil-safe:
+	// unset leaves nodes hash-only (the pre-Tier-2 behavior).
+	Cipher *crypto.Cipher
 }
 
 // NewService constructs a Service.
@@ -91,7 +96,15 @@ func (s *Service) resolveTx(ctx context.Context, env events.Envelope, ids []Iden
 
 	nodeIDs := make([]uuid.UUID, 0, len(ids))
 	for _, id := range ids {
-		nid, err := s.repo.upsertNode(ctx, tx, env.TenantID, id.Namespace, ValueHash(env.TenantID, id.Namespace, id.Value))
+		var enc string
+		if s.Cipher != nil {
+			e, encErr := s.Cipher.Encrypt(id.Value)
+			if encErr != nil {
+				return Result{}, fmt.Errorf("encrypt identifier: %w", encErr)
+			}
+			enc = e
+		}
+		nid, err := s.repo.upsertNode(ctx, tx, env.TenantID, id.Namespace, ValueHash(env.TenantID, id.Namespace, id.Value), enc)
 		if err != nil {
 			return Result{}, err
 		}

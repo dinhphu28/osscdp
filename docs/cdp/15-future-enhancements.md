@@ -129,7 +129,7 @@ ORDER BY d.name;"
 
 ---
 
-## Enhancement C — View all of a person's identifiers · Tier 1 ✅ Implemented
+## Enhancement C — View all of a person's identifiers · ✅ Implemented (Tier 1 + Tier 2)
 
 Show every phone/email/`user_id` a person has ever used, not just the latest trait value.
 
@@ -151,8 +151,20 @@ What was added (Tier 1):
   → `ErrNotFound`.
 - **Spec** — documented in `api/openapi.yaml`.
 
-**Tier 2 (real plaintext values) is still pending** — see below. Tier 1 answers "how many, which
-namespaces"; it does not reveal the identifier strings.
+**Tier 2 (real plaintext values) is now shipped** (forward-only). The same endpoint additionally
+returns `values` — the decrypted plaintext per namespace — **masked unless the caller holds
+`pii:read`**. Identity resolution encrypts each identifier into `identity_node.value_encrypted` at
+ingest (`internal/identity` `Service.Cipher`, opportunistically backfilled on re-ingest via
+`COALESCE`); the inventory decrypts them (`internal/governance` `Service.cipher`) and the handler
+masks per namespace (email/phone format-aware, else first-char) unless `pii:read`. Nodes ingested
+before Tier 2 have no ciphertext and contribute a count but no value; no historical backfill was run.
+
+Example (`pii:read`): `{"total":6,"by_namespace":{"email":2,"phone":3,"user_id":1},"values":{"email":["a@x.com","b@y.com"],"phone":[...]}}`.
+Without `pii:read`: `"values":{"email":["a***@x.com", ...]}`.
+
+Tests: `internal/foundationtest/governance_test.go` `TestIdentifiers_Tier2Values` (encrypt at ingest →
+decrypt in inventory; nil-cipher omits `values`) and `internal/governance/mask_test.go`
+`TestMaskIdentifierValues`.
 
 **Today (for Tier 2):** The profile endpoints (`cmd/cdp-api/main.go:133-134`) return only last-write-wins traits
 (`customer_profile.traits_json` — one `phone`, one `email`) plus computed attributes. The `List`
@@ -172,18 +184,18 @@ Constraints to be aware of:
   (`migrations/00003_raw_event.sql`), exposed via `GET .../events` — but keyed by event, not joined
   to a canonical ID.
 
-**Two tiers (Tier 1 done, Tier 2 pending):**
+**Two tiers (both shipped):**
 
 - **Tier 1 — count inventory (small). ✅ Implemented** as `GET .../profiles/{canonicalUserID}/identifiers`
   (see status above). Returns every node grouped by namespace with counts, reusing the Export
-  cluster-node join, behind `PermProfileRead`. Answers "how many, which namespaces" but not the
-  plaintext values.
-- **Tier 2 — real values (larger). Pending.** Start populating `identity_node.value_encrypted` in `upsertNode`
-  (`internal/identity/repo.go:32-44`) using the existing `crypto.Cipher` (already used for encrypting
-  destination secrets — see `internal/activation/handler.go`), then decrypt on read behind a
-  PII-scoped permission with masking (mirror `maskTraits` in `internal/profile`).
-  **Caveat:** this only covers identifiers ingested *after* the change; historical nodes remain
-  hash-only unless backfilled by re-hashing plaintext recovered from `raw_event.payload_json`.
+  cluster-node join, behind `PermProfileRead`. Answers "how many, which namespaces".
+- **Tier 2 — real values. ✅ Implemented (forward-only).** `identity_node.value_encrypted` is populated
+  in `upsertNode` using the existing `crypto.Cipher` (wired via `identity.Service.Cipher` in the
+  worker); the inventory decrypts it (`governance.Service.cipher`) into `values`, and the handler masks
+  per namespace unless the caller holds `pii:read`.
+  **Caveat (by design):** only identifiers ingested *after* the change carry ciphertext; historical
+  nodes stay hash-only (counted, no value). A one-off backfill from `raw_event.payload_json` was not
+  run — re-ingesting an identifier opportunistically fills its `value_encrypted`.
 
 **Interim workaround (no code):** Call the Export endpoint for the hashed node inventory, or inspect
 `raw_event.payload_json` via `GET .../events` for plaintext values (not joined to the canonical ID):
@@ -262,5 +274,5 @@ WHERE p.identity_cluster_id = ic.id
 |---|------------|---------------|------|--------------------|
 | A | Unsubscribe / disable a subscription | ✅ Implemented (`DELETE …/subscriptions/{subscriptionID}`) | Small | `UPDATE destination_subscription SET status='disabled'` |
 | B | List destinations by segment | ✅ Implemented (`GET …/segments/{segmentID}/destinations`) | Small | JOIN query on `destination_subscription` + `destination` |
-| C | View all of a person's identifiers | ✅ Tier 1 (`GET …/profiles/{id}/identifiers`, counts); Tier 2 (plaintext) pending | Tier 1 small / Tier 2 larger | Export endpoint (hashed) or `raw_event.payload_json` |
+| C | View all of a person's identifiers | ✅ Implemented — Tier 1 counts + Tier 2 decrypted `values` (masked without `pii:read`), forward-only | Tier 1 small / Tier 2 larger | Export endpoint (hashed) or `raw_event.payload_json` |
 | D | Reparent profiles on cluster merge | ✅ Implemented (merge folds loser into survivor + deletes it) | Larger | Delete orphan rows under `merged` clusters |
