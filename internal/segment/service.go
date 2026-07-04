@@ -337,7 +337,9 @@ func (s *Service) SeedSegment(ctx context.Context, tenantID, segmentID uuid.UUID
 	if err != nil || !ok {
 		return 0, err
 	}
-	if !hasBehavior(av.Rule) || referencesEvent(av.Rule) {
+	// Seed any sweep-safe rule (no stateless event.* leaf) — behavioural or trait-only —
+	// so a loosened trait rule also admits newly-qualifying profiles (finding #24).
+	if referencesEvent(av.Rule) {
 		return 0, nil
 	}
 	return s.repo.SeedPendingForSegment(ctx, tenantID, segmentID, at, reason)

@@ -172,10 +172,14 @@ func (s *Service) Identifiers(ctx context.Context, tenantID uuid.UUID, canonical
 
 // DeleteCounts reports rows removed per table.
 type DeleteCounts struct {
-	Profile       int64 `json:"customer_profile"`
-	Memberships   int64 `json:"segment_memberships"`
-	Consent       int64 `json:"consent"`
-	IdentityNodes int64 `json:"identity_nodes"`
+	Profile         int64 `json:"customer_profile"`
+	Memberships     int64 `json:"segment_memberships"`
+	Consent         int64 `json:"consent"`
+	IdentityNodes   int64 `json:"identity_nodes"`
+	BehavioralEvent int64 `json:"behavioral_event"`
+	BehaviorBucket  int64 `json:"profile_behavior_bucket"`
+	PendingEval     int64 `json:"segment_pending_eval"`
+	OutboxEmits     int64 `json:"segment_membership_outbox"`
 }
 
 // ErrNotFound is returned when the customer profile does not exist.
@@ -239,6 +243,23 @@ func (s *Service) Delete(ctx context.Context, tenantID uuid.UUID, canonicalUserI
 		return DeleteCounts{}, err
 	}
 	if counts.Consent, err = exec(`DELETE FROM customer_consent WHERE tenant_id=$1 AND customer_profile_id=$2`, tenantID, p.ID); err != nil {
+		return DeleteCounts{}, err
+	}
+	// Level-3 behavioral data (behavioral_event.props_json is a second verbatim copy
+	// of raw event PII). Erase it before the profile row, same tx (findings #22, #24).
+	if counts.PendingEval, err = exec(`DELETE FROM segment_pending_eval WHERE tenant_id=$1 AND customer_profile_id=$2`, tenantID, p.ID); err != nil {
+		return DeleteCounts{}, err
+	}
+	if counts.BehavioralEvent, err = exec(`DELETE FROM behavioral_event WHERE tenant_id=$1 AND customer_profile_id=$2`, tenantID, p.ID); err != nil {
+		return DeleteCounts{}, err
+	}
+	if counts.BehaviorBucket, err = exec(`DELETE FROM profile_behavior_bucket WHERE tenant_id=$1 AND customer_profile_id=$2`, tenantID, p.ID); err != nil {
+		return DeleteCounts{}, err
+	}
+	// The membership-change outbox embeds the profile id (payload) and canonical_user_id
+	// (partition_key), so un-drained/published rows would survive erasure. Match on the
+	// stable profile id (robust across a canonical change from an earlier merge).
+	if counts.OutboxEmits, err = exec(`DELETE FROM segment_membership_outbox WHERE tenant_id=$1 AND payload_json->>'customer_profile_id' = $2`, tenantID, p.ID.String()); err != nil {
 		return DeleteCounts{}, err
 	}
 	if counts.Profile, err = exec(`DELETE FROM customer_profile WHERE tenant_id=$1 AND id=$2`, tenantID, p.ID); err != nil {

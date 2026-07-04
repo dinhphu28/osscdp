@@ -750,6 +750,23 @@ sweep guard that deletes claimed due-rows whose segment is no longer active.
 
 **Ship:** right-to-be-forgotten and segment retirement are correct across the new tables.
 
+**Implementation notes (adversarial-review-confirmed):**
+
+- **Erasure also purges `segment_membership_outbox`** — its `payload_json` (profile id) and
+  `partition_key` (canonical_user_id, a direct identifier) would otherwise survive RTBF. Matched on the
+  stable profile id (robust across a canonical change from an earlier merge).
+- **Consent-gated capture** — `Recorder.PropsGate` (wired to `ConsentPropsGate`) drops `props_json` when
+  analytics consent is explicitly denied, so an opted-out subject's verbatim PII cannot be re-captured;
+  the event is still counted.
+- **Recompute both directions** — `UpdateSegment` enqueues active members (tightened → sweep exits
+  stale ones) and, for sweep-safe rules (behavioural OR trait-only), the seed enumerates the population
+  (loosened → newly-qualifying profiles enter). Event-gated rules re-evaluate at their next edge event.
+- **Retire is reversible** — editing an inactive segment reactivates it; the name uniqueness is now a
+  partial index on `status='active'`, so a retired name frees up for reuse. `DeactivateSegment` purges
+  the segment's due-rows; `SafetyReEnqueue` skips inactive segments (no churn); the sweeper drops any
+  stranded due-row. Members are **frozen** (kept as historical) — a drain-with-exit-emit is a policy the
+  service could add.
+
 ---
 
 ## Phase 8 — Retention + schema-version + observability + docs

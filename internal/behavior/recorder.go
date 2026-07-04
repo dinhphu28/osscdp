@@ -17,7 +17,31 @@ import (
 // so the append shares the profile's idempotency ledger (exactly-once counters).
 // (The BehaviorEventsAppended metric is wired post-commit in Phase 8, not here —
 // firing it inside the tx would over-count on rollback.)
-type Recorder struct{}
+type Recorder struct {
+	// PropsGate (nil-safe) decides whether verbatim event props may be persisted. When
+	// it denies, the event is still counted but props_json is dropped, so an opted-out
+	// or erased subject's PII cannot be (re-)captured via behavioural writes.
+	PropsGate PropsGate
+}
+
+// PropsGate authorizes persisting behavioral props for a profile.
+type PropsGate interface {
+	Allowed(ctx context.Context, tx pgx.Tx, tenantID, profileID uuid.UUID) (bool, error)
+}
+
+// ConsentPropsGate drops behavioral props when the profile has an explicit 'denied'
+// analytics consent (channel-agnostic). Granted/absent consent stores props, matching
+// the system's default-allow consent model.
+type ConsentPropsGate struct{}
+
+// Allowed reports false only when analytics consent is explicitly denied.
+func (ConsentPropsGate) Allowed(ctx context.Context, tx pgx.Tx, tenantID, profileID uuid.UUID) (bool, error) {
+	var denied bool
+	err := tx.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM customer_consent WHERE tenant_id=$1 AND customer_profile_id=$2 AND purpose='analytics' AND status='denied')`,
+		tenantID, profileID).Scan(&denied)
+	return !denied, err
+}
 
 // NewRecorder constructs a Recorder.
 func NewRecorder() *Recorder { return &Recorder{} }
@@ -40,6 +64,16 @@ func (r *Recorder) Append(ctx context.Context, tx pgx.Tx, profileID uuid.UUID, e
 	var props any
 	if p := bytes.TrimSpace(env.Properties); len(p) > 0 && !bytes.Equal(p, []byte("null")) {
 		props = []byte(env.Properties)
+	}
+	// Consent gate: drop the verbatim props for an opted-out subject (still count it).
+	if props != nil && r.PropsGate != nil {
+		allowed, err := r.PropsGate.Allowed(ctx, tx, env.TenantID, profileID)
+		if err != nil {
+			return fmt.Errorf("props consent gate: %w", err)
+		}
+		if !allowed {
+			props = nil
+		}
 	}
 	ct, err := tx.Exec(ctx, `
 		INSERT INTO behavioral_event
