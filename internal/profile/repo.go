@@ -103,26 +103,104 @@ func (r *Repo) update(ctx context.Context, q querier, p Profile, fromVersion int
 	return nil
 }
 
-// deleteProfileCascade removes a profile and all its customer-scoped child rows
-// in FK-safe order (children before parent). Used when a cluster merge reparents
-// a loser profile into the survivor. Identity nodes/clusters are owned by the
-// identity package and are not touched here — the merge already moved the nodes
-// to the survivor cluster.
-func (r *Repo) deleteProfileCascade(ctx context.Context, q querier, tenantID, profileID uuid.UUID) error {
-	children := []string{
-		`DELETE FROM activation_delivery WHERE tenant_id=$1 AND customer_profile_id=$2`,
-		`DELETE FROM activation_task WHERE tenant_id=$1 AND customer_profile_id=$2`,
+// resolveSurvivorCluster follows the merge chain from clusterID to the surviving
+// active cluster, returning its canonical_user_id + id and whether a redirect is
+// needed. redirected is false when clusterID is itself active (or unknown) — the
+// caller then behaves as before. Used to stop a late/duplicate loser event from
+// resurrecting a profile for a cluster that has already been merged away.
+func (r *Repo) resolveSurvivorCluster(ctx context.Context, q querier, tenantID, clusterID uuid.UUID) (canonical string, survivor uuid.UUID, redirected bool, err error) {
+	err = q.QueryRow(ctx, `
+		WITH RECURSIVE chain AS (
+			SELECT c.id, c.canonical_user_id, c.status
+			FROM identity_cluster c
+			WHERE c.tenant_id=$1 AND c.id=$2
+			UNION ALL
+			SELECT c.id, c.canonical_user_id, c.status
+			FROM identity_merge_history h
+			JOIN identity_cluster c ON c.tenant_id=h.tenant_id AND c.id=h.to_cluster_id
+			JOIN chain ON chain.id=h.from_cluster_id
+			WHERE h.tenant_id=$1
+		)
+		SELECT id, canonical_user_id FROM chain WHERE status='active' LIMIT 1`,
+		tenantID, clusterID).Scan(&survivor, &canonical)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", uuid.Nil, false, nil // unknown/no active survivor — caller creates as before
+	}
+	if err != nil {
+		return "", uuid.Nil, false, fmt.Errorf("resolve survivor cluster: %w", err)
+	}
+	return canonical, survivor, survivor != clusterID, nil
+}
+
+// reparentProfileChildren migrates a loser profile's customer-scoped child rows
+// to the survivor, then deletes the loser customer_profile row. Used when a
+// cluster merge folds a loser profile into the survivor. Unlike a plain delete,
+// this preserves the idempotency ledger, consent opt-outs, segment memberships,
+// and activation history/queue — deleting only what the survivor already has.
+// Identity nodes/clusters are owned by the identity package and untouched here.
+func (r *Repo) reparentProfileChildren(ctx context.Context, q querier, tenantID, loserID, survivorID uuid.UUID) error {
+	// customer_profile_history is the idempotency ledger (alreadyApplied checks it
+	// by event_id). Re-key rows whose event_id the survivor lacks so the survivor
+	// inherits the loser's dedup records; leftovers are dropped below.
+	if _, err := q.Exec(ctx, `
+		UPDATE customer_profile_history h
+		SET customer_profile_id=$3
+		WHERE h.tenant_id=$1 AND h.customer_profile_id=$2
+		  AND NOT EXISTS (SELECT 1 FROM customer_profile_history s
+		                  WHERE s.tenant_id=$1 AND s.customer_profile_id=$3 AND s.event_id=h.event_id)`,
+		tenantID, loserID, survivorID); err != nil {
+		return fmt.Errorf("reparent history: %w", err)
+	}
+
+	// customer_consent: merge with denied-wins so an opt-out is never weakened.
+	if _, err := q.Exec(ctx, `
+		INSERT INTO customer_consent (id, tenant_id, customer_profile_id, channel, purpose, status, source, updated_at)
+		SELECT gen_random_uuid(), tenant_id, $3, channel, purpose, status, source, now()
+		FROM customer_consent
+		WHERE tenant_id=$1 AND customer_profile_id=$2
+		ON CONFLICT (tenant_id, customer_profile_id, channel, purpose) DO UPDATE
+		SET status = CASE WHEN customer_consent.status='denied' OR EXCLUDED.status='denied'
+		                  THEN 'denied' ELSE EXCLUDED.status END,
+		    updated_at = now()`,
+		tenantID, loserID, survivorID); err != nil {
+		return fmt.Errorf("reparent consent: %w", err)
+	}
+
+	// segment_membership: union onto the survivor; keep the survivor's row on conflict.
+	if _, err := q.Exec(ctx, `
+		UPDATE segment_membership m
+		SET customer_profile_id=$3
+		WHERE m.tenant_id=$1 AND m.customer_profile_id=$2
+		  AND NOT EXISTS (SELECT 1 FROM segment_membership s
+		                  WHERE s.tenant_id=$1 AND s.customer_profile_id=$3 AND s.segment_id=m.segment_id)`,
+		tenantID, loserID, survivorID); err != nil {
+		return fmt.Errorf("reparent memberships: %w", err)
+	}
+
+	// activation rows: re-key (idempotency_key is unchanged; no unique on
+	// customer_profile_id). Re-keying instead of deleting keeps pending sends and
+	// the delivery audit trail, and avoids an FK race with an in-flight sender.
+	for _, tbl := range []string{"activation_delivery", "activation_task"} {
+		if _, err := q.Exec(ctx,
+			`UPDATE `+tbl+` SET customer_profile_id=$3 WHERE tenant_id=$1 AND customer_profile_id=$2`,
+			tenantID, loserID, survivorID); err != nil {
+			return fmt.Errorf("reparent %s: %w", tbl, err)
+		}
+	}
+
+	// Drop the loser's leftover child rows that conflicted with the survivor
+	// (children before parent for FK-safety), then the loser profile itself.
+	for _, sql := range []string{
 		`DELETE FROM customer_profile_history WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM segment_membership WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM customer_consent WHERE tenant_id=$1 AND customer_profile_id=$2`,
-	}
-	for _, sql := range children {
-		if _, err := q.Exec(ctx, sql, tenantID, profileID); err != nil {
-			return fmt.Errorf("reparent delete child: %w", err)
+	} {
+		if _, err := q.Exec(ctx, sql, tenantID, loserID); err != nil {
+			return fmt.Errorf("reparent cleanup: %w", err)
 		}
 	}
-	if _, err := q.Exec(ctx, `DELETE FROM customer_profile WHERE tenant_id=$1 AND id=$2`, tenantID, profileID); err != nil {
-		return fmt.Errorf("reparent delete profile: %w", err)
+	if _, err := q.Exec(ctx, `DELETE FROM customer_profile WHERE tenant_id=$1 AND id=$2`, tenantID, loserID); err != nil {
+		return fmt.Errorf("reparent delete loser: %w", err)
 	}
 	return nil
 }

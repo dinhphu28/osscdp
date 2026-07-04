@@ -110,6 +110,11 @@ func (s *Service) resolveTx(ctx context.Context, env events.Envelope, ids []Iden
 		if clusterIDs, err = s.repo.clustersForNodes(ctx, tx, env.TenantID, nodeIDs); err != nil {
 			return Result{}, err
 		}
+		// Lock again so any cluster the re-read surfaced (a concurrent merge moved a
+		// node into a cluster we had not locked) is also held before pickSurvivor/merge.
+		if err := s.repo.lockClusters(ctx, tx, env.TenantID, clusterIDs); err != nil {
+			return Result{}, err
+		}
 	}
 
 	var (

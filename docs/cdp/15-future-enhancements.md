@@ -201,32 +201,45 @@ curl -s -X GET 'http://localhost:18080/admin/v1/tenants/<tenant>/profiles/<canon
 Removes the root cause of orphan profiles described in the background section. This is a pipeline
 behavior change — no new HTTP endpoint.
 
-**Status:** Shipped (option (a), full reparent). When a resolution merges clusters, the loser
-profile is folded into the survivor and deleted in the same transaction — no orphan row is left.
+**Status:** Shipped. When a resolution merges clusters, the loser profile's data is folded into the
+survivor and its child rows are **migrated** (not dropped) to the survivor in the same transaction —
+no orphan row is left, and nothing the loser carried (consent, memberships, activations, idempotency
+records) is silently lost.
 
 Flow:
 
 1. **identity** (`internal/identity`) — on merge, `resolveTx` reads the loser clusters'
    `canonical_user_id`s (`canonicalsFor`) and includes them on the emitted event as
-   `IdentityResolved.MergedCanonicalUserIDs`.
+   `IdentityResolved.MergedCanonicalUserIDs`. The cluster set is re-locked after the under-lock
+   re-read so every cluster mutated by the merge is held `FOR UPDATE`.
 2. **profile** (`internal/profile`) — `Service.Update` receives those ids and, inside its existing
-   update transaction, for each loser: locks the loser profile, folds it into the survivor via
-   `mergeReparent` (`merge.go`), and `deleteProfileCascade` (`repo.go`) removes the loser profile and
-   its FK children (activation deliveries/tasks, history, segment memberships, consent) in FK-safe
-   order. The survivor is then re-evaluated for segments by the same triggering event downstream.
-3. **audit** — a `reparent` entry (actor `system`) is recorded after commit
-   (`Service.Audit`, wired in `cmd/cdp-worker`).
+   update transaction, for each loser: locks the loser profile, folds its attributes into the
+   survivor via `mergeReparent` (`merge.go`), then `reparentProfileChildren` (`repo.go`) **re-keys**
+   the loser's child rows to the survivor and deletes only the loser `customer_profile` row.
+3. **redirect** — if a `customer_profile` is missing for the event's canonical and that cluster has
+   been `merged` away (a loser event arriving after — or redelivered past — its merge, since
+   `identity_resolved` is partitioned by canonical over 6 partitions), `updateTx` follows the merge
+   chain (`resolveSurvivorCluster`) and applies the event to the **survivor** instead of resurrecting
+   a zombie profile.
+4. **audit** — a best-effort `reparent` entry (actor `system`) is recorded after commit; a failure is
+   logged but never gates the `profile_updated` emit. The durable merge record is
+   `identity_merge_history` (written in the identity transaction).
 
-**Reparent policy (`mergeReparent`), non-destructive to the survivor:** traits and computed
-attributes fill only keys the survivor is missing (survivor's own values win); `total_events` /
-`total_orders` are summed; `first_seen`/`last_seen` are widened. **Trade-offs:** the loser's
-activation-delivery history is deleted, and its segment memberships are dropped (the survivor
-re-enters on the triggering event's evaluation). Idempotent — on reprocess the losers are already gone.
+**Fold policy (`mergeReparent`):** traits fill keys the survivor is missing; `total_events` /
+`total_orders` are summed; `first_seen`/`last_seen` are widened; the `last_*` activity block and
+`last_order_at` take the **more-recent** value (by `last_seen` / timestamp) rather than fill-missing.
 
-**Tests:** `internal/profile/merge_test.go` (`TestMergeReparent`, policy) and
-`internal/foundationtest/profile_test.go` (`TestProfile_ReparentOnMerge`, end-to-end: two clusters
-merge → loser profile deleted, survivor folds in the loser's phone/email, `total_events` summed,
-`reparent` audited).
+**Child migration (`reparentProfileChildren`):** `customer_profile_history` (the idempotency ledger)
+is re-keyed so redelivered loser events still de-dup; `customer_consent` merges with **denied-wins**
+so an opt-out is never weakened; `segment_membership` is unioned onto the survivor; `activation_task`
+/ `activation_delivery` are re-keyed (preserving pending sends + audit trail and avoiding an FK race
+with an in-flight sender). Idempotent — on reprocess the loser is already gone and the redirect
+recognizes the event as already applied.
+
+**Tests:** `internal/profile/merge_test.go` (`TestMergeReparent`, `TestMergeReparent_Recency`) and
+`internal/foundationtest/profile_test.go` — `TestProfile_ReparentOnMerge`, `…ThreeWayMerge`,
+`…RedirectsReorderedLoserEvent` (no zombie), `…DedupsRedeliveredLoserEvent`,
+`…PreservesConsentAndMembership` (denied-wins + membership migration), `…AuditFailureStillEmits`.
 
 **Interim workaround (historical — merges now self-clean):** delete orphan profile rows left by
 merges that predate this change (they point to `merged`, zero-node clusters and receive no live

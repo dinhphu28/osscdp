@@ -168,3 +168,42 @@ func TestDisableSubscription_NotFound(t *testing.T) {
 	_, err = repo.DisableSubscription(ctx, tenantID, uuid.New(), subID)
 	require.ErrorIs(t, err, ErrNotFound)
 }
+
+func TestDisableSubscription_TenantIsolation(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	repo := NewRepo(pool)
+	tenantA, destA, subA, segA := seedSubscription(t, ctx, pool)
+	tenantB, _, _, _ := seedSubscription(t, ctx, pool)
+
+	// Tenant B cannot disable tenant A's subscription.
+	_, err := repo.DisableSubscription(ctx, tenantB, destA, subA)
+	require.ErrorIs(t, err, ErrNotFound)
+
+	// A's subscription is untouched (still dispatched).
+	active, err := repo.ActiveSubscriptionsForSegment(ctx, tenantA, segA)
+	require.NoError(t, err)
+	require.Len(t, active, 1)
+	require.Equal(t, subA, active[0].ID)
+}
+
+func TestSubscriptionsBySegment_TenantIsolation(t *testing.T) {
+	ctx := context.Background()
+	pool := newPool(t)
+	repo := NewRepo(pool)
+	tenantA, _, subA, segA := seedSubscription(t, ctx, pool)
+
+	// A second tenant with a subscription on the SAME segment id.
+	tnB, err := tenant.NewService(tenant.NewRepository(pool), audit.NewRecorder(pool)).Create(ctx, "acmeB")
+	require.NoError(t, err)
+	destB, err := repo.CreateDestination(ctx, tnB.ID, TypeWebhook, "destB", json.RawMessage(`{"url":"http://b.test"}`), "")
+	require.NoError(t, err)
+	_, err = repo.CreateSubscription(ctx, tnB.ID, destB.ID, TriggerSegmentMembership, &segA)
+	require.NoError(t, err)
+
+	// Tenant A sees only its own subscription on that segment.
+	got, err := repo.SubscriptionsBySegment(ctx, tenantA, segA)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, subA, got[0].SubscriptionID)
+}

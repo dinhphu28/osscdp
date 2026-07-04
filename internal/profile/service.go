@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,6 +44,11 @@ type Result struct {
 	// ReparentedIDs are the loser canonical_user_ids whose profiles were folded
 	// into this survivor and deleted during a cluster merge (audited after commit).
 	ReparentedIDs []string
+	// CanonicalUserID / ClusterID are the *effective* survivor after any merge
+	// redirect — the emit + audit use these, which may differ from the event's
+	// original (retired) canonical when a late loser event was redirected.
+	CanonicalUserID string
+	ClusterID       uuid.UUID
 }
 
 // Service updates customer profiles and emits profile_updated.
@@ -56,6 +62,8 @@ type Service struct {
 	OnUpdated func()
 	// Audit records reparent events (nil-safe; unset in unit tests).
 	Audit *audit.Recorder
+	// Logger reports best-effort failures (e.g. reparent audit); nil-safe.
+	Logger *slog.Logger
 }
 
 // NewService constructs a Service.
@@ -77,17 +85,22 @@ func (s *Service) Update(ctx context.Context, canonicalUserID string, clusterID 
 	if s.OnUpdated != nil {
 		s.OnUpdated()
 	}
+	// Reparent audit is best-effort: identity_merge_history is the durable, in-tx
+	// record of the merge, so a transient audit failure must not gate the emit
+	// (which the segment/activation workers depend on). Returning an error here
+	// would retry and then hit the alreadyApplied short-circuit, permanently
+	// dropping profile_updated.
 	if len(res.ReparentedIDs) > 0 && s.Audit != nil {
 		tenantID := env.TenantID
 		if err := s.Audit.Record(ctx, audit.Entry{
 			TenantID: &tenantID, ActorType: audit.ActorSystem, Action: "reparent",
 			ResourceType: "customer_profile", ResourceID: res.ProfileID.String(),
-			After: map[string]any{"survivor": canonicalUserID, "merged_from": res.ReparentedIDs},
-		}); err != nil {
-			return fmt.Errorf("audit reparent: %w", err)
+			After: map[string]any{"survivor": res.CanonicalUserID, "merged_from": res.ReparentedIDs},
+		}); err != nil && s.Logger != nil {
+			s.Logger.Warn("reparent audit failed", "error", err.Error(), "profile_id", res.ProfileID.String())
 		}
 	}
-	return s.emit(ctx, canonicalUserID, clusterID, env, res)
+	return s.emit(ctx, res.CanonicalUserID, res.ClusterID, env, res)
 }
 
 func (s *Service) updateTx(ctx context.Context, canonicalUserID string, clusterID uuid.UUID, mergedCanonicalIDs []string, env events.Envelope) (Result, error) {
@@ -102,17 +115,33 @@ func (s *Service) updateTx(ctx context.Context, canonicalUserID string, clusterI
 		return Result{}, err
 	}
 	if !found {
-		prof = Profile{
-			ID:                 uuid.New(),
-			TenantID:           env.TenantID,
-			CanonicalUserID:    canonicalUserID,
-			IdentityClusterID:  clusterID,
-			Traits:             map[string]any{},
-			ComputedAttributes: map[string]any{},
-			Version:            0,
-		}
-		if err := s.repo.create(ctx, tx, prof); err != nil {
+		// The canonical has no profile. If its cluster was merged away, redirect
+		// the event onto the surviving profile instead of resurrecting a zombie
+		// for a dead cluster (identity_resolved is partitioned by canonical, so a
+		// loser event can arrive after — or be redelivered past — its merge).
+		survCanonical, survCluster, redirected, err := s.repo.resolveSurvivorCluster(ctx, tx, env.TenantID, clusterID)
+		if err != nil {
 			return Result{}, err
+		}
+		if redirected {
+			canonicalUserID, clusterID = survCanonical, survCluster
+			if prof, found, err = s.repo.getForUpdate(ctx, tx, env.TenantID, canonicalUserID); err != nil {
+				return Result{}, err
+			}
+		}
+		if !found {
+			prof = Profile{
+				ID:                 uuid.New(),
+				TenantID:           env.TenantID,
+				CanonicalUserID:    canonicalUserID,
+				IdentityClusterID:  clusterID,
+				Traits:             map[string]any{},
+				ComputedAttributes: map[string]any{},
+				Version:            0,
+			}
+			if err := s.repo.create(ctx, tx, prof); err != nil {
+				return Result{}, err
+			}
 		}
 	}
 
@@ -145,7 +174,7 @@ func (s *Service) updateTx(ctx context.Context, canonicalUserID string, clusterI
 			continue
 		}
 		reparentChanged = append(reparentChanged, mergeReparent(&prof, loser)...)
-		if err := s.repo.deleteProfileCascade(ctx, tx, env.TenantID, loser.ID); err != nil {
+		if err := s.repo.reparentProfileChildren(ctx, tx, env.TenantID, loser.ID, prof.ID); err != nil {
 			return Result{}, err
 		}
 		reparented = append(reparented, lc)
@@ -173,7 +202,10 @@ func (s *Service) updateTx(ctx context.Context, canonicalUserID string, clusterI
 	if err := tx.Commit(ctx); err != nil {
 		return Result{}, fmt.Errorf("commit: %w", err)
 	}
-	return Result{ProfileID: prof.ID, Version: prof.Version, ChangedFields: changed, Applied: true, ReparentedIDs: reparented}, nil
+	return Result{
+		ProfileID: prof.ID, Version: prof.Version, ChangedFields: changed, Applied: true,
+		ReparentedIDs: reparented, CanonicalUserID: canonicalUserID, ClusterID: clusterID,
+	}, nil
 }
 
 func (s *Service) emit(ctx context.Context, canonicalUserID string, clusterID uuid.UUID, env events.Envelope, res Result) error {
