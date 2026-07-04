@@ -162,7 +162,7 @@ func run() error {
 
 	// Durable population-seed runner: drains segment_seed_job (resumable), seeding the
 	// existing population for newly created/updated sweep-safe segments.
-	seedRunner := segment.NewSeedRunner(segment.NewRepo(pool), cfg.SeedJobPagesPerClaim, cfg.SeedJobReclaimTimeout, cfg.SeedJobInterval, logger)
+	seedRunner := segment.NewSeedRunner(segmentSvc.Repo(), cfg.SeedJobPagesPerClaim, cfg.SeedJobReclaimTimeout, cfg.SeedJobInterval, logger)
 	seedRunner.OnSeededPage = m.SeedPages.Inc
 	seedRunner.OnJobDone = m.SeedJobsDone.Inc
 

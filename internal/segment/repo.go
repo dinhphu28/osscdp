@@ -277,6 +277,12 @@ func (r *Repo) DeactivateSegment(ctx context.Context, tenantID, segmentID uuid.U
 		`DELETE FROM segment_pending_eval WHERE tenant_id=$1 AND segment_id=$2`, tenantID, segmentID); err != nil {
 		return fmt.Errorf("purge pending on retire: %w", err)
 	}
+	// Cancel any in-flight seed job too, so the runner doesn't resurrect the pending
+	// rows we just purged for the now-inactive segment.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM segment_seed_job WHERE tenant_id=$1 AND segment_id=$2`, tenantID, segmentID); err != nil {
+		return fmt.Errorf("cancel seed job on retire: %w", err)
+	}
 	return tx.Commit(ctx)
 }
 
@@ -426,7 +432,8 @@ const seedPageSize = 1000
 // segment evaluates the existing population without an inbound event. Idempotent
 // (an existing earlier deadline is preserved) and PAGED over customer_profile by id
 // in bounded per-page transactions — never one unbounded insert (doc 16 §Backfill).
-// Call it off the request path (see handler.seedIfSweepable) for large tenants.
+// Test/utility helper for an immediate synchronous seed; production seeds durably via
+// EnqueueSeedJobTx + the SeedRunner.
 func (r *Repo) SeedPendingForSegment(ctx context.Context, tenantID, segmentID uuid.UUID, dueAt time.Time, reason string) (int, error) {
 	cursor := uuid.Nil // smallest UUID: id > cursor starts at the first profile
 	total := 0
@@ -457,12 +464,16 @@ func (r *Repo) SeedPendingForSegment(ctx context.Context, tenantID, segmentID uu
 }
 
 // SeedJob is a durable, resumable population-seed request the seed runner drains.
+// ClaimedAt is the fence captured at claim time: the runner's mutations only apply
+// while the row still carries it, so a concurrent re-enqueue (claimed_at→NULL) or a
+// reclaim by another replica (new claimed_at) makes the stale runner's writes no-ops.
 type SeedJob struct {
 	TenantID  uuid.UUID
 	SegmentID uuid.UUID
 	Reason    string
 	DueAt     time.Time
 	Cursor    uuid.UUID
+	ClaimedAt time.Time
 }
 
 // EnqueueSeedJobTx records (or supersedes) a durable seed job in tx, so a crash after
@@ -490,8 +501,8 @@ func (r *Repo) ClaimSeedJob(ctx context.Context, now time.Time, reclaim time.Dur
 			SELECT tenant_id, segment_id FROM segment_seed_job
 			WHERE claimed_at IS NULL OR claimed_at < $2
 			ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
-		RETURNING tenant_id, segment_id, reason, due_at, cursor`,
-		now, now.Add(-reclaim)).Scan(&j.TenantID, &j.SegmentID, &j.Reason, &j.DueAt, &j.Cursor)
+		RETURNING tenant_id, segment_id, reason, due_at, cursor, claimed_at`,
+		now, now.Add(-reclaim)).Scan(&j.TenantID, &j.SegmentID, &j.Reason, &j.DueAt, &j.Cursor, &j.ClaimedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return SeedJob{}, false, nil
 	}
@@ -501,9 +512,12 @@ func (r *Repo) ClaimSeedJob(ctx context.Context, now time.Time, reclaim time.Dur
 	return j, true, nil
 }
 
-// SeedJobPage enqueues one page of pending deadlines for profiles after cursor and
-// returns the new cursor + whether the population is fully seeded.
-func (r *Repo) SeedJobPage(ctx context.Context, j SeedJob) (nextCursor uuid.UUID, done bool, err error) {
+// SeedJobPage enqueues one page (pageSize profiles after the cursor) of pending
+// deadlines and returns the new cursor + whether the population is fully seeded. It
+// only ever covers profiles present when their id-range is scanned; a profile inserted
+// during the drain whose random id sorts below the cursor is handled by the ingest
+// path instead (matches the prior seed behaviour).
+func (r *Repo) SeedJobPage(ctx context.Context, j SeedJob, pageSize int) (nextCursor uuid.UUID, done bool, err error) {
 	var maxID *uuid.UUID
 	var pageCount int
 	err = r.pool.QueryRow(ctx, `
@@ -516,40 +530,46 @@ func (r *Repo) SeedJobPage(ctx context.Context, j SeedJob) (nextCursor uuid.UUID
 			DO UPDATE SET due_at = LEAST(segment_pending_eval.due_at, $5), reason=$6, claimed_at=NULL
 		)
 		SELECT (SELECT id FROM page ORDER BY id DESC LIMIT 1), (SELECT count(*) FROM page)`,
-		j.TenantID, j.Cursor, seedPageSize, j.SegmentID, j.DueAt, j.Reason).Scan(&maxID, &pageCount)
+		j.TenantID, j.Cursor, pageSize, j.SegmentID, j.DueAt, j.Reason).Scan(&maxID, &pageCount)
 	if err != nil {
 		return j.Cursor, false, fmt.Errorf("seed job page: %w", err)
 	}
-	if maxID == nil || pageCount < seedPageSize {
+	if maxID == nil || pageCount < pageSize {
 		return j.Cursor, true, nil
 	}
 	return *maxID, false, nil
 }
 
 // SetSeedJobCursor persists mid-drain progress (keeps the claim) so a crash resumes.
-func (r *Repo) SetSeedJobCursor(ctx context.Context, tenantID, segmentID, cursor uuid.UUID) error {
+// Fenced on claimedAt: a no-op if the job was re-enqueued or reclaimed meanwhile.
+func (r *Repo) SetSeedJobCursor(ctx context.Context, tenantID, segmentID, cursor uuid.UUID, claimedAt time.Time) error {
 	_, err := r.pool.Exec(ctx,
-		`UPDATE segment_seed_job SET cursor=$3 WHERE tenant_id=$1 AND segment_id=$2`, tenantID, segmentID, cursor)
+		`UPDATE segment_seed_job SET cursor=$3 WHERE tenant_id=$1 AND segment_id=$2 AND claimed_at=$4`,
+		tenantID, segmentID, cursor, claimedAt)
 	if err != nil {
 		return fmt.Errorf("set seed cursor: %w", err)
 	}
 	return nil
 }
 
-// ReleaseSeedJob unclaims a partially-drained job so the next tick continues it.
-func (r *Repo) ReleaseSeedJob(ctx context.Context, tenantID, segmentID uuid.UUID) error {
+// ReleaseSeedJob unclaims a partially-drained job so the next tick continues it, and
+// bumps created_at so it rotates behind other jobs (round-robin fairness). Fenced.
+func (r *Repo) ReleaseSeedJob(ctx context.Context, tenantID, segmentID uuid.UUID, claimedAt time.Time) error {
 	_, err := r.pool.Exec(ctx,
-		`UPDATE segment_seed_job SET claimed_at=NULL WHERE tenant_id=$1 AND segment_id=$2`, tenantID, segmentID)
+		`UPDATE segment_seed_job SET claimed_at=NULL, created_at=now() WHERE tenant_id=$1 AND segment_id=$2 AND claimed_at=$3`,
+		tenantID, segmentID, claimedAt)
 	if err != nil {
 		return fmt.Errorf("release seed job: %w", err)
 	}
 	return nil
 }
 
-// CompleteSeedJob removes a fully-drained job.
-func (r *Repo) CompleteSeedJob(ctx context.Context, tenantID, segmentID uuid.UUID) error {
+// CompleteSeedJob removes a fully-drained job. Fenced: a job re-enqueued or reclaimed
+// during the drain is NOT deleted (so a mid-drain re-seed is not silently lost).
+func (r *Repo) CompleteSeedJob(ctx context.Context, tenantID, segmentID uuid.UUID, claimedAt time.Time) error {
 	_, err := r.pool.Exec(ctx,
-		`DELETE FROM segment_seed_job WHERE tenant_id=$1 AND segment_id=$2`, tenantID, segmentID)
+		`DELETE FROM segment_seed_job WHERE tenant_id=$1 AND segment_id=$2 AND claimed_at=$3`,
+		tenantID, segmentID, claimedAt)
 	if err != nil {
 		return fmt.Errorf("complete seed job: %w", err)
 	}

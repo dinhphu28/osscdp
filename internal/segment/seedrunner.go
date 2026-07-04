@@ -14,6 +14,7 @@ import (
 type SeedRunner struct {
 	repo          *Repo
 	pagesPerClaim int
+	pageSize      int
 	reclaim       time.Duration
 	interval      time.Duration
 	logger        *slog.Logger
@@ -28,13 +29,16 @@ type SeedRunner struct {
 // tick (so one huge population spreads over ticks); reclaim time-boxes a crashed claim.
 func NewSeedRunner(repo *Repo, pagesPerClaim int, reclaim, interval time.Duration, logger *slog.Logger) *SeedRunner {
 	return &SeedRunner{
-		repo: repo, pagesPerClaim: pagesPerClaim, reclaim: reclaim, interval: interval, logger: logger,
+		repo: repo, pagesPerClaim: pagesPerClaim, pageSize: seedPageSize, reclaim: reclaim, interval: interval, logger: logger,
 		now: func() time.Time { return time.Now().UTC() },
 	}
 }
 
 // WithClock overrides the clock (tests).
 func (r *SeedRunner) WithClock(now func() time.Time) *SeedRunner { r.now = now; return r }
+
+// WithPageSize overrides the per-page profile count (tests exercise real multi-page drains).
+func (r *SeedRunner) WithPageSize(n int) *SeedRunner { r.pageSize = n; return r }
 
 // Run drains seed jobs each tick until ctx is canceled.
 func (r *SeedRunner) Run(ctx context.Context) {
@@ -65,7 +69,7 @@ func (r *SeedRunner) RunOnce(ctx context.Context) (idle bool, err error) {
 	}
 
 	for p := 0; p < r.pagesPerClaim; p++ {
-		nextCursor, done, err := r.repo.SeedJobPage(ctx, job)
+		nextCursor, done, err := r.repo.SeedJobPage(ctx, job, r.pageSize)
 		if err != nil {
 			// Leave the claim set; the time-boxed reclaim resumes from the last cursor.
 			return false, err
@@ -75,7 +79,7 @@ func (r *SeedRunner) RunOnce(ctx context.Context) (idle bool, err error) {
 		}
 		job.Cursor = nextCursor
 		if done {
-			if err := r.repo.CompleteSeedJob(ctx, job.TenantID, job.SegmentID); err != nil {
+			if err := r.repo.CompleteSeedJob(ctx, job.TenantID, job.SegmentID, job.ClaimedAt); err != nil {
 				return false, err
 			}
 			if r.OnJobDone != nil {
@@ -83,10 +87,10 @@ func (r *SeedRunner) RunOnce(ctx context.Context) (idle bool, err error) {
 			}
 			return false, nil
 		}
-		if err := r.repo.SetSeedJobCursor(ctx, job.TenantID, job.SegmentID, job.Cursor); err != nil {
+		if err := r.repo.SetSeedJobCursor(ctx, job.TenantID, job.SegmentID, job.Cursor, job.ClaimedAt); err != nil {
 			return false, err
 		}
 	}
 	// Bounded pages reached; more remain — unclaim so the next tick continues it.
-	return false, r.repo.ReleaseSeedJob(ctx, job.TenantID, job.SegmentID)
+	return false, r.repo.ReleaseSeedJob(ctx, job.TenantID, job.SegmentID, job.ClaimedAt)
 }

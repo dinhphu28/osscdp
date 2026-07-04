@@ -22,6 +22,93 @@ func countSeedJobs(t *testing.T, f fixture, tid, segID uuid.UUID) int {
 	return n
 }
 
+func countPending(t *testing.T, f fixture, tid, segID uuid.UUID) int {
+	t.Helper()
+	var n int
+	require.NoError(t, f.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM segment_pending_eval WHERE tenant_id=$1 AND segment_id=$2`, tid, segID).Scan(&n))
+	return n
+}
+
+// TestSeedJob_MultiPageDrainAcrossTicks exercises the REAL paging loop: with a page
+// size of 1 and one page per claim, the job drains one profile per tick, persisting
+// the cursor between ticks, and only completes once the population is exhausted.
+func TestSeedJob_MultiPageDrainAcrossTicks(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	repo := segment.NewRepo(f.pool)
+	for i := 0; i < 3; i++ {
+		seedProfile(t, f, tid, sid, fmt.Sprintf("e%d", i), "page_view", fmt.Sprintf("u%d", i), "")
+	}
+	seg, err := repo.CreateSegment(ctx, tid, "no-order", "", absenceRule())
+	require.NoError(t, err)
+
+	sr := segment.NewSeedRunner(repo, 1, time.Minute, time.Second, testLogger()).WithPageSize(1)
+	for i := 1; i <= 3; i++ {
+		idle, err := sr.RunOnce(ctx)
+		require.NoError(t, err)
+		require.False(t, idle)
+		require.Equal(t, i, countPending(t, f, tid, seg.ID), "one profile seeded per tick")
+		require.Equal(t, 1, countSeedJobs(t, f, tid, seg.ID), "job persists (released) mid-drain")
+	}
+	// One more tick: the empty page signals completion → the job is removed.
+	_, err = sr.RunOnce(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 3, countPending(t, f, tid, seg.ID))
+	require.Equal(t, 0, countSeedJobs(t, f, tid, seg.ID), "job completes after the population is drained")
+}
+
+// TestSeedJob_UpdateReEnqueues: updating a sweep-safe segment re-arms the seed job as
+// a version_change re-seed of the whole population.
+func TestSeedJob_UpdateReEnqueues(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, _ := mkTenant(t, f, "acme")
+	repo := segment.NewRepo(f.pool)
+	seg, err := repo.CreateSegment(ctx, tid, "no-order", "", absenceRule())
+	require.NoError(t, err)
+
+	_, err = repo.UpdateSegment(ctx, tid, seg.ID, "",
+		segment.Rule{Behavior: &segment.BehaviorSpec{Kind: segment.BehaviorRecency, EventName: "login", Window: "24h"}})
+	require.NoError(t, err)
+
+	var reason string
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT reason FROM segment_seed_job WHERE tenant_id=$1 AND segment_id=$2`, tid, seg.ID).Scan(&reason))
+	require.Equal(t, "version_change", reason, "an update re-arms the seed job for the whole population")
+}
+
+// TestSeedJob_ReArmNotClobberedByStaleClaimant: a re-enqueue during an in-flight drain
+// must survive the original claimant's completion (the claim fence protects it).
+func TestSeedJob_ReArmNotClobberedByStaleClaimant(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, _ := mkTenant(t, f, "acme")
+	repo := segment.NewRepo(f.pool)
+	seg, err := repo.CreateSegment(ctx, tid, "no-order", "", absenceRule())
+	require.NoError(t, err)
+
+	now := time.Now().UTC()
+	job, ok, err := repo.ClaimSeedJob(ctx, now, time.Minute)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// A concurrent UpdateSegment re-arms the same row (clears the claim, new reason).
+	tx, err := f.pool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, repo.EnqueueSeedJobTx(ctx, tx, tid, seg.ID, "version_change", now))
+	require.NoError(t, tx.Commit(ctx))
+
+	// The original claimant completes with its stale fence — must be a no-op.
+	require.NoError(t, repo.CompleteSeedJob(ctx, tid, seg.ID, job.ClaimedAt))
+	require.Equal(t, 1, countSeedJobs(t, f, tid, seg.ID), "re-armed job is not deleted by the stale claimant")
+	var reason string
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT reason FROM segment_seed_job WHERE tenant_id=$1 AND segment_id=$2`, tid, seg.ID).Scan(&reason))
+	require.Equal(t, "version_change", reason, "the fresh re-seed survives")
+}
+
 // TestSeedJob_EnqueuedForSweepSafeOnly: creating a sweep-safe segment records a durable
 // seed job; an event-gated one does not (it re-evaluates at the edge).
 func TestSeedJob_EnqueuedForSweepSafeOnly(t *testing.T) {
