@@ -34,6 +34,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/rbac"
 	"github.com/dinhphu28/osscdp/internal/segment"
 	"github.com/dinhphu28/osscdp/internal/source"
+	"github.com/dinhphu28/osscdp/internal/stats"
 	"github.com/dinhphu28/osscdp/internal/tenant"
 )
 
@@ -96,8 +97,11 @@ func run() error {
 	rawRepo := rawevent.NewRepo(pool)
 	rawHandler := rawevent.NewHandler(rawRepo, rawevent.NewReplayer(rawRepo, producer, bus.TopicEvents, logger))
 	profileHandler := profile.NewHandler(profile.NewRepo(pool))
-	segmentHandler := segment.NewHandler(segment.NewRepo(pool))
+	segmentRepo := segment.NewRepo(pool)
+	segmentHandler := segment.NewHandler(segmentRepo)
 	activationHandler := activation.NewHandler(activation.NewRepo(pool), cipher)
+	auditHandler := audit.NewHandler(audit.NewReader(pool))
+	statsHandler := stats.NewHandler(pool, segmentRepo)
 	consentHandler := consent.NewHandler(consent.NewRepo(pool), profile.NewRepo(pool))
 	governanceHandler := governance.NewHandler(governance.NewService(pool, recorder, cipher))
 	rbacRepo := rbac.NewRepo(pool)
@@ -118,6 +122,15 @@ func run() error {
 	// authorize per-route by permission + tenant scope (RBAC, Phase 9b).
 	r.Group(func(admin chi.Router) {
 		admin.Use(auth.Authenticate(cfg.AdminAPIToken, rbacRepo))
+
+		// Admin console read endpoints (browsable console).
+		admin.Get("/admin/v1/whoami", auth.Whoami)
+		admin.With(auth.RequireSuperAdmin()).Get("/admin/v1/tenants", tenantHandler.List)
+		admin.With(auth.Require(rbac.PermSourceRead)).Get("/admin/v1/tenants/{tenantID}/sources", sourceHandler.List)
+		admin.With(auth.Require(rbac.PermSegmentRead)).Get("/admin/v1/tenants/{tenantID}/segments", segmentHandler.List)
+		admin.With(auth.Require(rbac.PermDestinationRead)).Get("/admin/v1/tenants/{tenantID}/destinations", activationHandler.ListDestinations)
+		admin.With(auth.Require(rbac.PermAuditRead)).Get("/admin/v1/tenants/{tenantID}/audit", auditHandler.List)
+		admin.With(auth.Require(rbac.PermSourceRead)).Get("/admin/v1/tenants/{tenantID}/stats", statsHandler.Stats)
 
 		admin.With(auth.RequireSuperAdmin()).Post("/admin/v1/tenants", tenantHandler.Create)
 		admin.With(auth.Require(rbac.PermAdminWrite)).Post("/admin/v1/admin-tokens", tokenHandler.Create)

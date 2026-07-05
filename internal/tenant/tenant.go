@@ -68,6 +68,25 @@ func (r *Repository) Get(ctx context.Context, id uuid.UUID) (Tenant, error) {
 	return t, nil
 }
 
+// List returns all tenants, newest first (super-admin browse; capped at 500).
+func (r *Repository) List(ctx context.Context) ([]Tenant, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, name, status, created_at, updated_at FROM tenant ORDER BY created_at DESC LIMIT 500`)
+	if err != nil {
+		return nil, fmt.Errorf("list tenants: %w", err)
+	}
+	defer rows.Close()
+	out := []Tenant{}
+	for rows.Next() {
+		var t Tenant
+		if err := rows.Scan(&t.ID, &t.Name, &t.Status, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // Service holds tenant business logic.
 type Service struct {
 	repo  *Repository
@@ -111,4 +130,9 @@ func (s *Service) Create(ctx context.Context, name string) (Tenant, error) {
 // Get loads a tenant by ID.
 func (s *Service) Get(ctx context.Context, id uuid.UUID) (Tenant, error) {
 	return s.repo.Get(ctx, id)
+}
+
+// List returns all tenants for the super-admin browse view.
+func (s *Service) List(ctx context.Context) ([]Tenant, error) {
+	return s.repo.List(ctx)
 }

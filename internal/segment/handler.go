@@ -27,6 +27,24 @@ type createRequest struct {
 	Rule        Rule   `json:"rule"`
 }
 
+type listResponse struct {
+	Segments []Segment `json:"segments"`
+}
+
+// List handles GET /admin/v1/tenants/{tenantID}/segments.
+func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := parseTenant(w, r)
+	if !ok {
+		return
+	}
+	segments, err := h.repo.ListSegments(r.Context(), tenantID)
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, listResponse{Segments: segments})
+}
+
 // Create handles POST /admin/v1/tenants/{tenantID}/segments.
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := parseTenant(w, r)

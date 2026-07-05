@@ -27,6 +27,25 @@ type createRequest struct {
 	Type string `json:"type"`
 }
 
+type listResponse struct {
+	Sources []Source `json:"sources"`
+}
+
+// List handles GET /admin/v1/tenants/{tenantID}/sources.
+func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	tenantID, err := uuid.Parse(chi.URLParam(r, "tenantID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid tenant id")
+		return
+	}
+	sources, err := h.svc.List(r.Context(), tenantID)
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, listResponse{Sources: sources})
+}
+
 // RotateKey handles POST /admin/v1/tenants/{tenantID}/sources/{sourceID}/rotate-key.
 func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	tenantID, err := uuid.Parse(chi.URLParam(r, "tenantID"))

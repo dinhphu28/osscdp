@@ -15,6 +15,7 @@ servers:
 
 tags:
   - name: Ingress
+  - name: Admin
   - name: Tenants & Sources
   - name: Admin Tokens
   - name: Raw Events
@@ -24,6 +25,7 @@ tags:
   - name: Segments
   - name: Destinations
   - name: DLQ
+  - name: Audit
 
 security:
   - AdminToken: []
@@ -124,7 +126,43 @@ paths:
         "413": {$ref: "#/components/responses/PayloadTooLarge"}
         "429": {$ref: "#/components/responses/RateLimited"}
 
+  /admin/v1/whoami:
+    get:
+      tags: [Admin]
+      summary: Resolve the authenticated admin principal
+      description: |
+        Returns the caller's role and tenant scope so the console can drop its
+        "declare your own role" flow. Any authenticated admin may call it; it never
+        takes a `{tenantID}`. `tenant_id` is null for a cross-tenant super-admin.
+      responses:
+        "200":
+          description: The authenticated principal
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  role: {type: string}
+                  tenant_id: {type: string, format: uuid, nullable: true}
+                  is_super_admin: {type: boolean}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
   /admin/v1/tenants:
+    get:
+      tags: [Tenants & Sources]
+      summary: List tenants (super-admin)
+      description: "Requires SUPER_ADMIN."
+      responses:
+        "200":
+          description: All tenants
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenants: {type: array, items: {$ref: "#/components/schemas/Tenant"}}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
     post:
       tags: [Tenants & Sources]
       summary: Create a tenant
@@ -180,6 +218,21 @@ paths:
         "403": {$ref: "#/components/responses/Forbidden"}
 
   /admin/v1/tenants/{tenantID}/sources:
+    get:
+      tags: [Tenants & Sources]
+      summary: List a tenant's sources
+      description: "Requires `source:read`. Secrets (API key hash) are never returned."
+      parameters: [{$ref: "#/components/parameters/TenantID"}]
+      responses:
+        "200":
+          description: The tenant's sources
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sources: {type: array, items: {$ref: "#/components/schemas/Source"}}
+        "403": {$ref: "#/components/responses/Forbidden"}
     post:
       tags: [Tenants & Sources]
       summary: Create a source (returns the ingest API key once)
@@ -470,6 +523,21 @@ paths:
         "404": {$ref: "#/components/responses/NotFound"}
 
   /admin/v1/tenants/{tenantID}/segments:
+    get:
+      tags: [Segments]
+      summary: List a tenant's segments
+      description: "Requires `segment:read`. Each segment carries its current rule version."
+      parameters: [{$ref: "#/components/parameters/TenantID"}]
+      responses:
+        "200":
+          description: The tenant's segments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  segments: {type: array, items: {$ref: "#/components/schemas/Segment"}}
+        "403": {$ref: "#/components/responses/Forbidden"}
     post:
       tags: [Segments]
       summary: Create a segment (rule validated; version 1)
@@ -594,6 +662,21 @@ paths:
                         destination_status: {type: string}
 
   /admin/v1/tenants/{tenantID}/destinations:
+    get:
+      tags: [Destinations]
+      summary: List a tenant's destinations
+      description: "Requires `destination:read`. The secret is never serialized."
+      parameters: [{$ref: "#/components/parameters/TenantID"}]
+      responses:
+        "200":
+          description: The tenant's destinations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  destinations: {type: array, items: {$ref: "#/components/schemas/Destination"}}
+        "403": {$ref: "#/components/responses/Forbidden"}
     post:
       tags: [Destinations]
       summary: Create a destination (webhook or kafka)
@@ -759,6 +842,52 @@ paths:
                         error_message: {type: string}
                         attempt_count: {type: integer}
                         idempotency_key: {type: string}
+
+  /admin/v1/tenants/{tenantID}/audit:
+    get:
+      tags: [Audit]
+      summary: List a tenant's audit entries (keyset-paginated, metadata only)
+      description: |
+        Requires `audit:read`. Metadata only — the `before`/`after` bodies are never
+        returned (they may hold traits/consent/secrets). Keyset-paginated newest-first.
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {name: limit, in: query, schema: {type: integer, default: 50, maximum: 500}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        "200":
+          description: A page of audit entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries: {type: array, items: {$ref: "#/components/schemas/AuditEntry"}}
+                  next_cursor: {type: string}
+        "403": {$ref: "#/components/responses/Forbidden"}
+
+  /admin/v1/tenants/{tenantID}/stats:
+    get:
+      tags: [Admin]
+      summary: Per-tenant dashboard counts
+      description: |
+        Requires `source:read`. Flat counts for the dashboard. Best-effort: a failed
+        sub-count returns `-1` for that field and never fails the whole response.
+      parameters: [{$ref: "#/components/parameters/TenantID"}]
+      responses:
+        "200":
+          description: Resource counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dlq_open: {type: integer}
+                  sources: {type: integer}
+                  segments: {type: integer}
+                  destinations: {type: integer}
+                  profiles: {type: integer}
+        "403": {$ref: "#/components/responses/Forbidden"}
 
   /admin/v1/tenants/{tenantID}/dlq:
     get:
@@ -947,6 +1076,18 @@ components:
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
 
+    Source:
+      type: object
+      description: "An authenticated event source. The API key hash is never serialized."
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        name: {type: string}
+        type: {type: string}
+        status: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
     SourceCreated:
       type: object
       properties:
@@ -1029,6 +1170,17 @@ components:
         config: {type: object, additionalProperties: true}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+
+    AuditEntry:
+      type: object
+      description: "Metadata-only audit record; before/after bodies are never exposed here."
+      properties:
+        id: {type: string, format: uuid}
+        actor_type: {type: string}
+        action: {type: string}
+        resource_type: {type: string}
+        resource_id: {type: string}
+        created_at: {type: string, format: date-time}
 
     DLQEvent:
       type: object

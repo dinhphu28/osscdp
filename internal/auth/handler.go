@@ -13,6 +13,28 @@ import (
 	"github.com/dinhphu28/osscdp/pkg/apierror"
 )
 
+// Whoami handles GET /admin/v1/whoami. It reports the authenticated admin
+// principal's role and tenant scope so the console can drop its "declare your
+// own role" flow. Any authenticated admin may call it (no permission required);
+// it never takes a {tenantID}. tenant_id is null for cross-tenant (super-admin).
+func Whoami(w http.ResponseWriter, r *http.Request) {
+	p, ok := PrincipalFromContext(r.Context())
+	if !ok {
+		apierror.Unauthorized(w, "not authenticated")
+		return
+	}
+	var tenantID *string
+	if p.TenantID != nil {
+		s := p.TenantID.String()
+		tenantID = &s
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"role":           p.Role,
+		"tenant_id":      tenantID,
+		"is_super_admin": p.IsSuperAdmin(),
+	})
+}
+
 // AdminTokenCreator mints admin tokens.
 type AdminTokenCreator interface {
 	CreateToken(ctx context.Context, tenantID *uuid.UUID, name, role string) (string, error)

@@ -23,6 +23,20 @@ type createRequest struct {
 	Name string `json:"name"`
 }
 
+type listResponse struct {
+	Tenants []Tenant `json:"tenants"`
+}
+
+// List handles GET /admin/v1/tenants (super-admin only).
+func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	tenants, err := h.svc.List(r.Context())
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, listResponse{Tenants: tenants})
+}
+
 // Create handles POST /admin/v1/tenants.
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	var req createRequest
