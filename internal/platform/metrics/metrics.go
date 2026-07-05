@@ -30,9 +30,14 @@ type Metrics struct {
 	SweepClaimed          prometheus.Counter
 	SweepTransition       prometheus.Counter
 	SweepError            prometheus.Counter
+	SweepParked           prometheus.Counter
 	SweepLagSeconds       prometheus.Histogram
 	PendingBacklog        prometheus.Gauge
+	PendingParked         prometheus.Gauge
 	BehaviorRetention     prometheus.Counter
+	SchemaDrift           prometheus.Counter
+	SeedPages             prometheus.Counter
+	SeedJobsDone          prometheus.Counter
 	ActivationSent        prometheus.Counter
 	ActivationFailed      prometheus.Counter
 	ActivationSkipped     prometheus.Counter
@@ -106,6 +111,9 @@ func New() *Metrics {
 		SweepError: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "segment_sweep_error_total", Help: "Deadline re-evaluations that errored (deferred for retry).",
 		}),
+		SweepParked: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_sweep_parked_total", Help: "Deadline rows dead-lettered after exhausting sweep retries.",
+		}),
 		SweepLagSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "segment_sweep_lag_seconds",
 			Help: "Seconds between a deadline's due_at and when the sweeper claimed it.",
@@ -115,8 +123,20 @@ func New() *Metrics {
 		PendingBacklog: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "segment_pending_backlog", Help: "Due, unclaimed segment_pending_eval rows at the last sweep tick.",
 		}),
+		PendingParked: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "segment_pending_parked", Help: "Currently dead-lettered (parked) segment_pending_eval rows.",
+		}),
 		BehaviorRetention: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "behavior_retention_pruned_total", Help: "Behavioral partitions dropped + residue rows deleted by retention.",
+		}),
+		SchemaDrift: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "behavior_schema_drift_total", Help: "Windowed evaluations where a rule-referenced event property changed JSON type across the window.",
+		}),
+		SeedPages: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_seed_pages_total", Help: "Population-seed pages enqueued by the seed runner.",
+		}),
+		SeedJobsDone: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "segment_seed_jobs_done_total", Help: "Population-seed jobs fully drained.",
 		}),
 		ActivationSent: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "activation_sent_total", Help: "Activation deliveries that succeeded.",
@@ -145,7 +165,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.EventsPublished, m.EventsConsumed, m.ProcessingRetries,
 		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond, m.IdentityResolved, m.IdentityMerge,
-		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.StatefulEvaluated, m.StatefulMatched, m.MembershipPublished, m.MembershipPublishFail, m.SweepClaimed, m.SweepTransition, m.SweepError, m.SweepLagSeconds, m.PendingBacklog, m.BehaviorRetention, m.ActivationSent, m.ActivationFailed,
+		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.StatefulEvaluated, m.StatefulMatched, m.MembershipPublished, m.MembershipPublishFail, m.SweepClaimed, m.SweepTransition, m.SweepError, m.SweepParked, m.SweepLagSeconds, m.PendingBacklog, m.PendingParked, m.BehaviorRetention, m.SchemaDrift, m.SeedPages, m.SeedJobsDone, m.ActivationSent, m.ActivationFailed,
 		m.ActivationSkipped, m.ActivationCircuitOpen,
 		m.EventsReceived, m.EventsValidated, m.EventsRejected, m.EventsRateLimited)
 	return m

@@ -1,7 +1,6 @@
 package segment
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -56,28 +55,9 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		apierror.Internal(w)
 		return
 	}
-	h.seedIfSweepable(tenantID, seg.ID, req.Rule, "seed")
+	// CreateSegment durably records a seed job in-tx for sweep-safe rules (drained by
+	// the seed runner), so no fire-and-forget goroutine is needed here.
 	httpx.WriteJSON(w, http.StatusCreated, seg)
-}
-
-// seedIfSweepable enqueues due-now deadlines for the tenant's profiles when the
-// segment is a sweep-safe stateful rule, so the existing population (including
-// dormant "did-not-do" profiles) is evaluated by the sweeper without an inbound
-// event. Runs OFF the request path (own context, paged) so a large population never
-// blocks or is cancelled with the admin response. Best-effort; re-issuing
-// create/update re-seeds. (A durable job queue is the production-grade follow-up.)
-func (h *Handler) seedIfSweepable(tenantID, segmentID uuid.UUID, rule Rule, reason string) {
-	// Seed any sweep-safe rule (no stateless event.* leaf) — behavioural OR trait-only.
-	// A loosened trait rule (e.g. dropping a condition) admits newly-qualifying profiles
-	// the same way; the sweeper evaluates each at now() with no event (finding #24).
-	if referencesEvent(rule) {
-		return
-	}
-	go func() {
-		bg, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		_, _ = h.repo.SeedPendingForSegment(bg, tenantID, segmentID, time.Now().UTC(), reason)
-	}()
 }
 
 type updateRequest struct {
@@ -114,7 +94,6 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		apierror.Internal(w)
 		return
 	}
-	h.seedIfSweepable(tenantID, seg.ID, req.Rule, "version_change")
 	httpx.WriteJSON(w, http.StatusOK, seg)
 }
 
@@ -184,6 +163,59 @@ func (h *Handler) Members(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, membersResponse{Members: members})
+}
+
+type parkedResponse struct {
+	Parked []ParkedRow `json:"parked"`
+}
+
+// ListParked handles GET /admin/v1/tenants/{tenantID}/segments/{segmentID}/pending/parked:
+// the dead-lettered deadline rows (with last_error) an operator can inspect and retry.
+func (h *Handler) ListParked(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := parseTenant(w, r)
+	if !ok {
+		return
+	}
+	segmentID, err := uuid.Parse(chi.URLParam(r, "segmentID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid segment id")
+		return
+	}
+	parked, err := h.repo.ListParked(r.Context(), tenantID, segmentID, 200)
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, parkedResponse{Parked: parked})
+}
+
+// RetryParked handles POST /admin/v1/tenants/{tenantID}/segments/{segmentID}/pending/{profileID}/retry:
+// clears the dead-letter and re-arms the row for an immediate retry with a fresh budget.
+func (h *Handler) RetryParked(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := parseTenant(w, r)
+	if !ok {
+		return
+	}
+	segmentID, err := uuid.Parse(chi.URLParam(r, "segmentID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid segment id")
+		return
+	}
+	profileID, err := uuid.Parse(chi.URLParam(r, "profileID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid profile id")
+		return
+	}
+	found, err := h.repo.UnparkPending(r.Context(), tenantID, segmentID, profileID, time.Now().UTC())
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	if !found {
+		apierror.NotFound(w, "no parked deadline for that profile")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func parseTenant(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {

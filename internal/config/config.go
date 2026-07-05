@@ -33,9 +33,16 @@ type Config struct {
 	SegmentSweepPerTenantCap   int
 	SegmentSweepReclaimTimeout time.Duration
 	SegmentSweepSafetyBatch    int
+	SegmentSweepBackoffBase    time.Duration
+	SegmentSweepBackoffCap     time.Duration
+	SegmentSweepMaxAttempts    int
 
 	BehaviorRetention         time.Duration
 	BehaviorRetentionInterval time.Duration
+
+	SeedJobInterval       time.Duration
+	SeedJobPagesPerClaim  int
+	SeedJobReclaimTimeout time.Duration
 
 	RateLimitRPS     float64
 	RateLimitBurst   int
@@ -73,9 +80,16 @@ func Load() (Config, error) {
 		SegmentSweepPerTenantCap:   getEnvInt("SEGMENT_SWEEP_PER_TENANT_CAP", 50),
 		SegmentSweepReclaimTimeout: getEnvDuration("SEGMENT_SWEEP_RECLAIM_TIMEOUT", time.Minute),
 		SegmentSweepSafetyBatch:    getEnvInt("SEGMENT_SWEEP_SAFETY_BATCH", 20),
+		SegmentSweepBackoffBase:    getEnvDuration("SEGMENT_SWEEP_BACKOFF_BASE", 30*time.Second),
+		SegmentSweepBackoffCap:     getEnvDuration("SEGMENT_SWEEP_BACKOFF_CAP", time.Hour),
+		SegmentSweepMaxAttempts:    getEnvInt("SEGMENT_SWEEP_MAX_ATTEMPTS", 10),
 
 		BehaviorRetention:         getEnvDuration("BEHAVIOR_RETENTION", 40*24*time.Hour),
 		BehaviorRetentionInterval: getEnvDuration("BEHAVIOR_RETENTION_INTERVAL", 6*time.Hour),
+
+		SeedJobInterval:       getEnvDuration("SEED_JOB_INTERVAL", 5*time.Second),
+		SeedJobPagesPerClaim:  getEnvInt("SEED_JOB_PAGES_PER_CLAIM", 10),
+		SeedJobReclaimTimeout: getEnvDuration("SEED_JOB_RECLAIM_TIMEOUT", time.Minute),
 
 		RateLimitRPS:       getEnvFloat("RATE_LIMIT_RPS", 50),
 		RateLimitBurst:     getEnvInt("RATE_LIMIT_BURST", 100),

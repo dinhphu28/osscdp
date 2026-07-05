@@ -592,6 +592,7 @@ the flagship rule works end-to-end.
 - **Poison rows.** A `(segment, profile)` whose sweep persistently errors is deferred with a fixed
   backoff (`DeferPending`) so it neither tight-loops nor starves its tenant's fair-claim slots, but there
   is no attempt counter / dead-letter yet — it retries indefinitely. Add an attempts column + park-after-N.
+  → **Designed in detail:** [18 §B — Poison-row dead-letter](18-stateful-segmentation-followups.md).
 - **Sweep-safety gate is conservative.** `referencesEvent` keeps any rule with a stateless `event.*` leaf
   edge-only. This is safe (never a spurious sweep) but over-broad for `OR(event.x, behaviour)`, whose
   elapse-driven enter will not fire via the sweep. A context-aware gate (unsafe only for an event leaf
@@ -691,7 +692,9 @@ document this rather than silently summing the wrong thing.
   out-of-order commits cannot leave a stale rule cached.
 - **Hour boundaries assume a UTC DB session** (`date_trunc('hour', …)` on both write and read).
 - **Follow-ups:** a durable per-tenant re-analyze pass to repopulate metadata for old segments before
-  `is_stateful` becomes load-bearing; bucket-accelerated recency/absence with an exact boundary landmark.
+  `is_stateful` becomes load-bearing; bucket-accelerated recency/absence with an exact boundary landmark
+  → **evaluated & declined** (net-negative vs. the existing `O(1)` seek; exact recipe on file):
+  [18 §C](18-stateful-segmentation-followups.md).
 
 ---
 
@@ -792,8 +795,9 @@ Rationale: doc 16 §Retention, §Observability, findings #9, #33. Operational co
 - **Schema-version** (finding #33) — **DEFERRED (not shipped).** `behavioral_event.schema_version` is
   stamped (Phase 2) but never read; there is no `BehaviorSchemaDrift` metric and no
   property-shape-change enforcement. Event property-shape drift can therefore silently mis-evaluate
-  in-flight `where`/`value_prop` windows — a documented known limitation (doc 06 §Level 3), to be
-  implemented in a follow-up.
+  in-flight `where`/`value_prop` windows — a documented known limitation (doc 06 §Level 3).
+  → **Designed in detail** (stamp a shape fingerprint + observe/WARN on in-window type drift, no
+  migration, admin-in-the-loop): [18 §A — Schema-version drift detection](18-stateful-segmentation-followups.md).
 - **Metrics** on `metrics.Metrics` (`metrics.go:12`) + nil-safe hooks (doc 16 §Observability):
   `SegmentStatefulEvaluated`, `SegmentStatefulMatched`, `BehaviorEventsAppended`,
   `BehaviorBucketsUpserted`, `SegmentSweepClaimed`, `SegmentSweepTransitions`, `SegmentSweepLagSeconds`

@@ -134,7 +134,9 @@ func run() error {
 	profileHandler := makeProfileHandler(profileSvc)
 
 	// Segmentation: consumes profile_updated, maintains segment membership.
-	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), behavior.NewStore(pool))
+	behaviorStore := behavior.NewStore(pool)
+	behaviorStore.OnSchemaDrift = m.SchemaDrift.Inc // finding #33: in-window event-property type drift (doc 18 §A)
+	segmentSvc := segment.NewService(pool, profile.NewRepo(pool), behaviorStore)
 	segmentSvc.OnEvaluated = m.SegmentEvaluated.Inc
 	segmentSvc.OnMatched = m.SegmentMatched.Inc
 	segmentSvc.OnStatefulEvaluated = m.StatefulEvaluated.Inc
@@ -149,16 +151,25 @@ func run() error {
 	// Deadline sweeper (Phase 5): fires absence/expiry/re-entry transitions with no
 	// inbound event by re-evaluating due segment_pending_eval rows fairly per tenant.
 	segmentRunner := segment.NewRunner(segmentSvc, cfg.SegmentSweepBatchSize, cfg.SegmentSweepPerTenantCap,
-		cfg.SegmentSweepSafetyBatch, cfg.SegmentSweepReclaimTimeout, cfg.SegmentSweepInterval, logger)
+		cfg.SegmentSweepSafetyBatch, cfg.SegmentSweepReclaimTimeout, cfg.SegmentSweepInterval, logger).
+		WithParkPolicy(cfg.SegmentSweepBackoffBase, cfg.SegmentSweepBackoffCap, cfg.SegmentSweepMaxAttempts)
 	segmentRunner.OnClaimed = m.SweepClaimed.Inc
 	segmentRunner.OnTransition = m.SweepTransition.Inc
 	segmentRunner.OnError = m.SweepError.Inc
 	segmentRunner.OnSweepLag = m.SweepLagSeconds.Observe
 	segmentRunner.OnBacklog = func(n int) { m.PendingBacklog.Set(float64(n)) }
+	segmentRunner.OnParked = m.SweepParked.Inc
+	segmentRunner.OnParkedBacklog = func(n int) { m.PendingParked.Set(float64(n)) }
 
 	// Retention (Phase 8): prune aged behavioral_event / bucket partitions.
 	retention := behavior.NewRetention(pool, cfg.BehaviorRetention, cfg.BehaviorRetentionInterval, logger)
 	retention.OnPruned = func(n int) { m.BehaviorRetention.Add(float64(n)) }
+
+	// Durable population-seed runner: drains segment_seed_job (resumable), seeding the
+	// existing population for newly created/updated sweep-safe segments.
+	seedRunner := segment.NewSeedRunner(segmentSvc.Repo(), cfg.SeedJobPagesPerClaim, cfg.SeedJobReclaimTimeout, cfg.SeedJobInterval, logger)
+	seedRunner.OnSeededPage = m.SeedPages.Inc
+	seedRunner.OnJobDone = m.SeedJobsDone.Inc
 
 	// Activation: consumes segment_membership_changed → creates tasks; a sender
 	// loop delivers them with retry/backoff. The consent gate skips denied sends.
@@ -188,11 +199,12 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(11)
+	wg.Add(12)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
 	go func() { defer wg.Done(); memRelay.Run(ctx) }()
 	go func() { defer wg.Done(); segmentRunner.Run(ctx) }()
 	go func() { defer wg.Done(); retention.Run(ctx) }()
+	go func() { defer wg.Done(); seedRunner.Run(ctx) }()
 	go func() { defer wg.Done(); activationRunner.Run(ctx) }()
 	go func() {
 		defer wg.Done()

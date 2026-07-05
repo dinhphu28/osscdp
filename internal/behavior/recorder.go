@@ -5,7 +5,10 @@ package behavior
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"sort"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -62,8 +65,10 @@ func (r *Recorder) Append(ctx context.Context, tx pgx.Tx, profileID uuid.UUID, e
 		occurredAt = env.ReceivedAt
 	}
 	var props any
+	var propsBytes []byte // the bytes actually stored (nil when empty/dropped) — stamps the shape fingerprint
 	if p := bytes.TrimSpace(env.Properties); len(p) > 0 && !bytes.Equal(p, []byte("null")) {
-		props = []byte(env.Properties)
+		propsBytes = []byte(env.Properties)
+		props = propsBytes
 	}
 	// Consent gate: drop the verbatim props for an opted-out subject (still count it).
 	if props != nil && r.PropsGate != nil {
@@ -73,16 +78,17 @@ func (r *Recorder) Append(ctx context.Context, tx pgx.Tx, profileID uuid.UUID, e
 		}
 		if !allowed {
 			props = nil
+			propsBytes = nil // a dropped-props row stamps the empty fingerprint, never manufacturing drift
 		}
 	}
 	ct, err := tx.Exec(ctx, `
 		INSERT INTO behavioral_event
-			(tenant_id, customer_profile_id, event_id, event_name, occurred_at, props_json)
-		SELECT $1,$2,$3,$4,$5,$6
+			(tenant_id, customer_profile_id, event_id, event_name, occurred_at, props_json, schema_version)
+		SELECT $1,$2,$3,$4,$5,$6,$7
 		WHERE NOT EXISTS (
 			SELECT 1 FROM behavioral_event
 			WHERE tenant_id=$1 AND customer_profile_id=$2 AND event_id=$3)`,
-		env.TenantID, profileID, env.EventID, env.EventName, occurredAt, props)
+		env.TenantID, profileID, env.EventID, env.EventName, occurredAt, props, propsShapeVersion(propsBytes))
 	if err != nil {
 		return fmt.Errorf("append behavioral_event: %w", err)
 	}
@@ -103,4 +109,58 @@ func (r *Recorder) Append(ctx context.Context, tx pgx.Tx, profileID uuid.UUID, e
 		return fmt.Errorf("upsert behavior bucket: %w", err)
 	}
 	return nil
+}
+
+// propsShapeVersion is a stable 31-bit fingerprint of the TOP-LEVEL shape of a props
+// object: the sorted set of (key -> JSON type) pairs. Same shape -> same value; a key
+// changing JSON type (number->string, number->object, ...) -> a different value.
+// Empty/absent/non-object props map to 1, matching the behavioral_event.schema_version
+// DEFAULT so pre-stamp rows and genuinely-empty rows agree. Key-order independent. It
+// does NOT distinguish two numbers of different magnitude/unit (both "number") — unit
+// drift is undetectable by shape and is a documented limitation (doc 18 §A). The column
+// therefore holds a shape fingerprint, not a monotonic version; nothing else reads it.
+func propsShapeVersion(raw []byte) int32 {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 1
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil || len(m) == 0 {
+		return 1 // non-object (array/scalar) or unparseable: shape-neutral
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := fnv.New32a()
+	for _, k := range keys {
+		fmt.Fprintf(h, "%s:%s;", k, jsonKind(m[k]))
+	}
+	v := int32(h.Sum32() & 0x7fffffff) // fit a positive signed INT
+	if v == 0 {
+		v = 1
+	}
+	return v
+}
+
+// jsonKind reports the JSON type of a raw value from its first non-space byte.
+func jsonKind(raw json.RawMessage) string {
+	b := bytes.TrimSpace(raw)
+	if len(b) == 0 {
+		return "null"
+	}
+	switch b[0] {
+	case '{':
+		return "object"
+	case '[':
+		return "array"
+	case '"':
+		return "string"
+	case 't', 'f':
+		return "bool"
+	case 'n':
+		return "null"
+	default:
+		return "number"
+	}
 }

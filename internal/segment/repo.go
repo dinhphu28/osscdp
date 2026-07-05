@@ -105,6 +105,13 @@ func (r *Repo) CreateSegment(ctx context.Context, tenantID uuid.UUID, name, desc
 		`UPDATE segment SET current_version_id=$1, updated_at=now() WHERE id=$2`, verID, segID); err != nil {
 		return Segment{}, fmt.Errorf("set current version: %w", err)
 	}
+	// Durably seed the existing population for a sweep-safe rule (dormant profiles
+	// enter without an inbound event); the seed runner drains it, resumable on crash.
+	if !referencesEvent(rule) {
+		if err := r.EnqueueSeedJobTx(ctx, tx, tenantID, segID, "seed", time.Now().UTC()); err != nil {
+			return Segment{}, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Segment{}, err
 	}
@@ -157,9 +164,14 @@ func (r *Repo) UpdateSegment(ctx context.Context, tenantID, segmentID uuid.UUID,
 			SELECT tenant_id, segment_id, customer_profile_id, now(), 'version_change'
 			FROM segment_membership WHERE tenant_id=$1 AND segment_id=$2 AND status=$3
 			ON CONFLICT (tenant_id, segment_id, customer_profile_id)
-			DO UPDATE SET due_at = LEAST(segment_pending_eval.due_at, now()), reason='version_change', claimed_at=NULL`,
+			DO UPDATE SET due_at = LEAST(segment_pending_eval.due_at, now()), reason='version_change', claimed_at=NULL, parked_at=NULL, attempts=0, last_error=NULL`,
 			tenantID, segmentID, MembershipActive); err != nil {
 			return Segment{}, fmt.Errorf("enqueue version_change: %w", err)
+		}
+		// Durably re-seed the whole population so newly-qualifying non-members of a
+		// loosened rule enter (the version_change enqueue above only covers members).
+		if err := r.EnqueueSeedJobTx(ctx, tx, tenantID, segmentID, "version_change", time.Now().UTC()); err != nil {
+			return Segment{}, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -265,6 +277,12 @@ func (r *Repo) DeactivateSegment(ctx context.Context, tenantID, segmentID uuid.U
 		`DELETE FROM segment_pending_eval WHERE tenant_id=$1 AND segment_id=$2`, tenantID, segmentID); err != nil {
 		return fmt.Errorf("purge pending on retire: %w", err)
 	}
+	// Cancel any in-flight seed job too, so the runner doesn't resurrect the pending
+	// rows we just purged for the now-inactive segment.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM segment_seed_job WHERE tenant_id=$1 AND segment_id=$2`, tenantID, segmentID); err != nil {
+		return fmt.Errorf("cancel seed job on retire: %w", err)
+	}
 	return tx.Commit(ctx)
 }
 
@@ -303,7 +321,7 @@ type PendingEval struct {
 func (r *Repo) PendingBacklog(ctx context.Context, now time.Time, reclaim time.Duration) (int64, error) {
 	var n int64
 	err := r.pool.QueryRow(ctx,
-		`SELECT count(*) FROM segment_pending_eval WHERE due_at <= $1 AND (claimed_at IS NULL OR claimed_at < $2)`,
+		`SELECT count(*) FROM segment_pending_eval WHERE due_at <= $1 AND parked_at IS NULL AND (claimed_at IS NULL OR claimed_at < $2)`,
 		now, now.Add(-reclaim)).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("pending backlog: %w", err)
@@ -312,13 +330,15 @@ func (r *Repo) PendingBacklog(ctx context.Context, now time.Time, reclaim time.D
 }
 
 // UpsertPendingTx arms/re-arms a deadline for (segment, profile). Re-arming clears
-// claimed_at so the sweeper can pick it up again at the new due_at.
+// claimed_at so the sweeper can pick it up again at the new due_at, and clears the
+// dead-letter (parked_at/attempts/last_error) — an active re-arm is a real new
+// evaluation and earns a fresh retry budget (doc 18 §B auto-unpark).
 func (r *Repo) UpsertPendingTx(ctx context.Context, tx pgx.Tx, tenantID, segmentID, profileID uuid.UUID, dueAt time.Time, reason string) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO segment_pending_eval (tenant_id, segment_id, customer_profile_id, due_at, reason)
 		VALUES ($1,$2,$3,$4,$5)
 		ON CONFLICT (tenant_id, segment_id, customer_profile_id)
-		DO UPDATE SET due_at=$4, reason=$5, claimed_at=NULL`,
+		DO UPDATE SET due_at=$4, reason=$5, claimed_at=NULL, parked_at=NULL, attempts=0, last_error=NULL`,
 		tenantID, segmentID, profileID, dueAt, reason)
 	if err != nil {
 		return fmt.Errorf("upsert pending: %w", err)
@@ -326,17 +346,95 @@ func (r *Repo) UpsertPendingTx(ctx context.Context, tx pgx.Tx, tenantID, segment
 	return nil
 }
 
-// DeferPending pushes a deadline forward and clears its claim, so a row whose sweep
-// keeps failing backs off instead of tight-looping on the reclaim and keeps its (now
-// later) due_at from monopolizing the tenant's fair-claim slots.
-func (r *Repo) DeferPending(ctx context.Context, tenantID, segmentID, profileID uuid.UUID, dueAt time.Time) error {
-	_, err := r.pool.Exec(ctx,
-		`UPDATE segment_pending_eval SET due_at=$4, claimed_at=NULL WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3`,
-		tenantID, segmentID, profileID, dueAt)
-	if err != nil {
-		return fmt.Errorf("defer pending: %w", err)
+// FailPending records a failed sweep of (segment, profile): it bumps attempts, stores
+// the (truncated) error, and either backs the row off exponentially or — once attempts
+// reach maxAttempts — PARKS it (parked_at set) so ClaimDuePending stops re-claiming it.
+// It always clears claimed_at so the row is scheduled purely by due_at, never also by
+// the time-boxed reclaim. Returns the new attempt count and whether the row is now
+// parked. (Replaces the old fixed-backoff DeferPending; doc 18 §B.)
+func (r *Repo) FailPending(ctx context.Context, tenantID, segmentID, profileID uuid.UUID,
+	now time.Time, errMsg string, base, cap time.Duration, maxAttempts int) (attempts int, parked bool, err error) {
+
+	const maxErrLen = 500
+	if len(errMsg) > maxErrLen {
+		errMsg = errMsg[:maxErrLen]
 	}
-	return nil
+	err = r.pool.QueryRow(ctx, `
+		UPDATE segment_pending_eval SET
+			attempts   = attempts + 1,
+			last_error = $5,
+			claimed_at = NULL,
+			parked_at  = CASE WHEN attempts + 1 >= $6 THEN $4::timestamptz ELSE NULL END,
+			-- back off exponentially on the PRE-increment attempts: base*2^0, base*2^1, … capped.
+			-- Cap in double precision so a large 2^attempts never overflows; interval * float8.
+			due_at     = CASE WHEN attempts + 1 >= $6 THEN due_at
+			                  ELSE $4::timestamptz + interval '1 second' * LEAST($8::double precision, $7::double precision * power(2, attempts))
+			             END
+		WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3
+		RETURNING attempts, parked_at IS NOT NULL`,
+		tenantID, segmentID, profileID, now, errMsg, maxAttempts,
+		int64(base.Seconds()), int64(cap.Seconds())).Scan(&attempts, &parked)
+	if err != nil {
+		return 0, false, fmt.Errorf("fail pending: %w", err)
+	}
+	return attempts, parked, nil
+}
+
+// ParkedCount counts currently-parked (dead-lettered) rows — the gauge depth.
+func (r *Repo) ParkedCount(ctx context.Context) (int64, error) {
+	var n int64
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM segment_pending_eval WHERE parked_at IS NOT NULL`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("parked count: %w", err)
+	}
+	return n, nil
+}
+
+// ParkedRow is one dead-lettered deadline surfaced to an operator.
+type ParkedRow struct {
+	SegmentID         uuid.UUID `json:"segment_id"`
+	CustomerProfileID uuid.UUID `json:"customer_profile_id"`
+	Reason            string    `json:"reason"`
+	LastError         string    `json:"last_error"`
+	Attempts          int       `json:"attempts"`
+	DueAt             time.Time `json:"due_at"`
+	ParkedAt          time.Time `json:"parked_at"`
+}
+
+// ListParked returns a segment's parked rows (most-recently parked first) for the admin
+// view — it rides the idx_segment_pending_parked (tenant_id, segment_id) partial index.
+func (r *Repo) ListParked(ctx context.Context, tenantID, segmentID uuid.UUID, limit int) ([]ParkedRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT segment_id, customer_profile_id, reason, COALESCE(last_error,''), attempts, due_at, parked_at
+		FROM segment_pending_eval
+		WHERE tenant_id=$1 AND segment_id=$2 AND parked_at IS NOT NULL
+		ORDER BY parked_at DESC LIMIT $3`, tenantID, segmentID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list parked: %w", err)
+	}
+	defer rows.Close()
+	var out []ParkedRow
+	for rows.Next() {
+		var p ParkedRow
+		if err := rows.Scan(&p.SegmentID, &p.CustomerProfileID, &p.Reason, &p.LastError, &p.Attempts, &p.DueAt, &p.ParkedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// UnparkPending clears the dead-letter and re-arms the row for an immediate retry with a
+// fresh budget (manual operator retry). Returns false if the row was not parked.
+func (r *Repo) UnparkPending(ctx context.Context, tenantID, segmentID, profileID uuid.UUID, now time.Time) (bool, error) {
+	ct, err := r.pool.Exec(ctx, `
+		UPDATE segment_pending_eval
+		SET parked_at=NULL, attempts=0, last_error=NULL, due_at=$4, claimed_at=NULL
+		WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3 AND parked_at IS NOT NULL`,
+		tenantID, segmentID, profileID, now)
+	if err != nil {
+		return false, fmt.Errorf("unpark pending: %w", err)
+	}
+	return ct.RowsAffected() > 0, nil
 }
 
 // DeletePendingTx removes a deadline (no future elapse transition remains).
@@ -350,20 +448,22 @@ func (r *Repo) DeletePendingTx(ctx context.Context, tx pgx.Tx, tenantID, segment
 	return nil
 }
 
-// CurrentDueAt returns the stored due_at for a pending row (ok=false if none), so
-// the caller can coalesce a near-identical re-arm.
-func (r *Repo) CurrentDueAt(ctx context.Context, tenantID, segmentID, profileID uuid.UUID) (time.Time, bool, error) {
+// CurrentDueAt returns the stored due_at for a pending row (ok=false if none) and
+// whether it is parked (dead-lettered), so the caller can coalesce a near-identical
+// re-arm but NEVER coalesce a parked row (an active re-arm must unpark it — doc 18 §B).
+func (r *Repo) CurrentDueAt(ctx context.Context, tenantID, segmentID, profileID uuid.UUID) (dueAt time.Time, parked bool, ok bool, err error) {
 	var t time.Time
-	err := r.pool.QueryRow(ctx,
-		`SELECT due_at FROM segment_pending_eval WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3`,
-		tenantID, segmentID, profileID).Scan(&t)
+	var pk bool
+	err = r.pool.QueryRow(ctx,
+		`SELECT due_at, parked_at IS NOT NULL FROM segment_pending_eval WHERE tenant_id=$1 AND segment_id=$2 AND customer_profile_id=$3`,
+		tenantID, segmentID, profileID).Scan(&t, &pk)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return time.Time{}, false, nil
+		return time.Time{}, false, false, nil
 	}
 	if err != nil {
-		return time.Time{}, false, fmt.Errorf("current due_at: %w", err)
+		return time.Time{}, false, false, fmt.Errorf("current due_at: %w", err)
 	}
-	return t, true, nil
+	return t, pk, true, nil
 }
 
 // ClaimDuePending atomically claims up to batchSize due rows, fairly across tenants
@@ -375,7 +475,7 @@ func (r *Repo) ClaimDuePending(ctx context.Context, now time.Time, batchSize, pe
 			SELECT tenant_id, segment_id, customer_profile_id, due_at,
 			       ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY due_at) AS rn
 			FROM segment_pending_eval
-			WHERE due_at <= $1 AND (claimed_at IS NULL OR claimed_at < $2)
+			WHERE due_at <= $1 AND parked_at IS NULL AND (claimed_at IS NULL OR claimed_at < $2)
 		),
 		picked AS (
 			SELECT tenant_id, segment_id, customer_profile_id
@@ -385,7 +485,7 @@ func (r *Repo) ClaimDuePending(ctx context.Context, now time.Time, batchSize, pe
 			SELECT p.ctid
 			FROM segment_pending_eval p
 			JOIN picked USING (tenant_id, segment_id, customer_profile_id)
-			WHERE p.due_at <= $1 AND (p.claimed_at IS NULL OR p.claimed_at < $2)
+			WHERE p.due_at <= $1 AND p.parked_at IS NULL AND (p.claimed_at IS NULL OR p.claimed_at < $2)
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE segment_pending_eval p SET claimed_at=$1
@@ -414,7 +514,8 @@ const seedPageSize = 1000
 // segment evaluates the existing population without an inbound event. Idempotent
 // (an existing earlier deadline is preserved) and PAGED over customer_profile by id
 // in bounded per-page transactions — never one unbounded insert (doc 16 §Backfill).
-// Call it off the request path (see handler.seedIfSweepable) for large tenants.
+// Test/utility helper for an immediate synchronous seed; production seeds durably via
+// EnqueueSeedJobTx + the SeedRunner.
 func (r *Repo) SeedPendingForSegment(ctx context.Context, tenantID, segmentID uuid.UUID, dueAt time.Time, reason string) (int, error) {
 	cursor := uuid.Nil // smallest UUID: id > cursor starts at the first profile
 	total := 0
@@ -428,7 +529,7 @@ func (r *Repo) SeedPendingForSegment(ctx context.Context, tenantID, segmentID uu
 				INSERT INTO segment_pending_eval (tenant_id, segment_id, customer_profile_id, due_at, reason)
 				SELECT $1, $4, id, $5, $6 FROM page
 				ON CONFLICT (tenant_id, segment_id, customer_profile_id)
-				DO UPDATE SET due_at = LEAST(segment_pending_eval.due_at, $5), reason=$6, claimed_at=NULL
+				DO UPDATE SET due_at = LEAST(segment_pending_eval.due_at, $5), reason=$6, claimed_at=NULL, parked_at=NULL, attempts=0, last_error=NULL
 			)
 			SELECT (SELECT id FROM page ORDER BY id DESC LIMIT 1), (SELECT count(*) FROM page)`,
 			tenantID, cursor, seedPageSize, segmentID, dueAt, reason).Scan(&maxID, &pageCount)
@@ -442,6 +543,119 @@ func (r *Repo) SeedPendingForSegment(ctx context.Context, tenantID, segmentID uu
 		cursor = *maxID
 	}
 	return total, nil
+}
+
+// SeedJob is a durable, resumable population-seed request the seed runner drains.
+// ClaimedAt is the fence captured at claim time: the runner's mutations only apply
+// while the row still carries it, so a concurrent re-enqueue (claimed_at→NULL) or a
+// reclaim by another replica (new claimed_at) makes the stale runner's writes no-ops.
+type SeedJob struct {
+	TenantID  uuid.UUID
+	SegmentID uuid.UUID
+	Reason    string
+	DueAt     time.Time
+	Cursor    uuid.UUID
+	ClaimedAt time.Time
+}
+
+// EnqueueSeedJobTx records (or supersedes) a durable seed job in tx, so a crash after
+// commit still seeds the population. Re-arming restarts the cursor and unclaims.
+func (r *Repo) EnqueueSeedJobTx(ctx context.Context, tx pgx.Tx, tenantID, segmentID uuid.UUID, reason string, dueAt time.Time) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO segment_seed_job (tenant_id, segment_id, reason, due_at)
+		VALUES ($1,$2,$3,$4)
+		ON CONFLICT (tenant_id, segment_id)
+		DO UPDATE SET reason=$3, due_at=$4, cursor=$5, claimed_at=NULL, created_at=now()`,
+		tenantID, segmentID, reason, dueAt, uuid.Nil)
+	if err != nil {
+		return fmt.Errorf("enqueue seed job: %w", err)
+	}
+	return nil
+}
+
+// ClaimSeedJob claims one drainable seed job (unclaimed, or a claim older than
+// reclaim — crash recovery), marking claimed_at=now. ok=false if none.
+func (r *Repo) ClaimSeedJob(ctx context.Context, now time.Time, reclaim time.Duration) (SeedJob, bool, error) {
+	var j SeedJob
+	err := r.pool.QueryRow(ctx, `
+		UPDATE segment_seed_job SET claimed_at=$1
+		WHERE (tenant_id, segment_id) IN (
+			SELECT tenant_id, segment_id FROM segment_seed_job
+			WHERE claimed_at IS NULL OR claimed_at < $2
+			ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+		RETURNING tenant_id, segment_id, reason, due_at, cursor, claimed_at`,
+		now, now.Add(-reclaim)).Scan(&j.TenantID, &j.SegmentID, &j.Reason, &j.DueAt, &j.Cursor, &j.ClaimedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SeedJob{}, false, nil
+	}
+	if err != nil {
+		return SeedJob{}, false, fmt.Errorf("claim seed job: %w", err)
+	}
+	return j, true, nil
+}
+
+// SeedJobPage enqueues one page (pageSize profiles after the cursor) of pending
+// deadlines and returns the new cursor + whether the population is fully seeded. It
+// only ever covers profiles present when their id-range is scanned; a profile inserted
+// during the drain whose random id sorts below the cursor is handled by the ingest
+// path instead (matches the prior seed behaviour).
+func (r *Repo) SeedJobPage(ctx context.Context, j SeedJob, pageSize int) (nextCursor uuid.UUID, done bool, err error) {
+	var maxID *uuid.UUID
+	var pageCount int
+	err = r.pool.QueryRow(ctx, `
+		WITH page AS (
+			SELECT id FROM customer_profile WHERE tenant_id=$1 AND id > $2 ORDER BY id LIMIT $3
+		), ins AS (
+			INSERT INTO segment_pending_eval (tenant_id, segment_id, customer_profile_id, due_at, reason)
+			SELECT $1, $4, id, $5, $6 FROM page
+			ON CONFLICT (tenant_id, segment_id, customer_profile_id)
+			DO UPDATE SET due_at = LEAST(segment_pending_eval.due_at, $5), reason=$6, claimed_at=NULL, parked_at=NULL, attempts=0, last_error=NULL
+		)
+		SELECT (SELECT id FROM page ORDER BY id DESC LIMIT 1), (SELECT count(*) FROM page)`,
+		j.TenantID, j.Cursor, pageSize, j.SegmentID, j.DueAt, j.Reason).Scan(&maxID, &pageCount)
+	if err != nil {
+		return j.Cursor, false, fmt.Errorf("seed job page: %w", err)
+	}
+	if maxID == nil || pageCount < pageSize {
+		return j.Cursor, true, nil
+	}
+	return *maxID, false, nil
+}
+
+// SetSeedJobCursor persists mid-drain progress (keeps the claim) so a crash resumes.
+// Fenced on claimedAt: a no-op if the job was re-enqueued or reclaimed meanwhile.
+func (r *Repo) SetSeedJobCursor(ctx context.Context, tenantID, segmentID, cursor uuid.UUID, claimedAt time.Time) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE segment_seed_job SET cursor=$3 WHERE tenant_id=$1 AND segment_id=$2 AND claimed_at=$4`,
+		tenantID, segmentID, cursor, claimedAt)
+	if err != nil {
+		return fmt.Errorf("set seed cursor: %w", err)
+	}
+	return nil
+}
+
+// ReleaseSeedJob unclaims a partially-drained job so the next tick continues it, and
+// bumps created_at so it rotates behind other jobs (round-robin fairness). Fenced.
+func (r *Repo) ReleaseSeedJob(ctx context.Context, tenantID, segmentID uuid.UUID, claimedAt time.Time) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE segment_seed_job SET claimed_at=NULL, created_at=now() WHERE tenant_id=$1 AND segment_id=$2 AND claimed_at=$3`,
+		tenantID, segmentID, claimedAt)
+	if err != nil {
+		return fmt.Errorf("release seed job: %w", err)
+	}
+	return nil
+}
+
+// CompleteSeedJob removes a fully-drained job. Fenced: a job re-enqueued or reclaimed
+// during the drain is NOT deleted (so a mid-drain re-seed is not silently lost).
+func (r *Repo) CompleteSeedJob(ctx context.Context, tenantID, segmentID uuid.UUID, claimedAt time.Time) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM segment_seed_job WHERE tenant_id=$1 AND segment_id=$2 AND claimed_at=$3`,
+		tenantID, segmentID, claimedAt)
+	if err != nil {
+		return fmt.Errorf("complete seed job: %w", err)
+	}
+	return nil
 }
 
 // SafetyReEnqueue re-arms a bounded page of active memberships that currently have

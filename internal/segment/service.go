@@ -245,10 +245,10 @@ func (s *Service) planDeadline(ctx context.Context, seg ActiveVersion, ec EvalCo
 		return time.Time{}, false, false, err
 	}
 	arm = true
-	if cur, ok, err := s.repo.CurrentDueAt(ctx, tenantID, seg.SegmentID, profileID); err != nil {
+	if cur, parked, ok, err := s.repo.CurrentDueAt(ctx, tenantID, seg.SegmentID, profileID); err != nil {
 		return time.Time{}, false, false, err
-	} else if ok && absDuration(cur.Sub(due)) < coalesceGranularity {
-		arm = false // near-identical deadline already stored; leave it
+	} else if ok && !parked && absDuration(cur.Sub(due)) < coalesceGranularity {
+		arm = false // near-identical deadline already stored; leave it (never coalesce a parked row)
 	}
 	return due, true, arm, nil
 }
