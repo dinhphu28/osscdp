@@ -86,6 +86,27 @@ func (r *Repo) GetDestination(ctx context.Context, tenantID, id uuid.UUID) (Dest
 	return d, nil
 }
 
+// ListDestinations returns a tenant's destinations, newest first (admin browse;
+// capped at 500, no cursor). Reuses destCols/scanDestination, so secret_ref is
+// loaded into the unexported field that the JSON encoding drops.
+func (r *Repo) ListDestinations(ctx context.Context, tenantID uuid.UUID) ([]Destination, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+destCols+` FROM destination WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 500`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list destinations: %w", err)
+	}
+	defer rows.Close()
+	out := []Destination{}
+	for rows.Next() {
+		d, err := scanDestination(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // CreateSubscription connects a segment to a destination.
 func (r *Repo) CreateSubscription(ctx context.Context, tenantID, destinationID uuid.UUID, triggerType string, segmentID *uuid.UUID) (Subscription, error) {
 	s := Subscription{

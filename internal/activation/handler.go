@@ -24,6 +24,24 @@ func NewHandler(repo *Repo, cipher *crypto.Cipher) *Handler {
 	return &Handler{repo: repo, cipher: cipher}
 }
 
+type destinationsResponse struct {
+	Destinations []Destination `json:"destinations"`
+}
+
+// ListDestinations handles GET /admin/v1/tenants/{tenantID}/destinations.
+func (h *Handler) ListDestinations(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := parseTenant(w, r)
+	if !ok {
+		return
+	}
+	dests, err := h.repo.ListDestinations(r.Context(), tenantID)
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, destinationsResponse{Destinations: dests})
+}
+
 type createDestinationRequest struct {
 	Type    string          `json:"type"`
 	Name    string          `json:"name"`

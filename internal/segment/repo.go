@@ -203,6 +203,35 @@ func (r *Repo) GetSegment(ctx context.Context, tenantID, segmentID uuid.UUID) (S
 	return s, nil
 }
 
+// ListSegments returns every segment for a tenant with its current rule, newest
+// first (admin browse; capped at 500, no cursor). Mirrors GetSegment's JOIN minus
+// the id filter, so a segment always surfaces its live version's rule.
+func (r *Repo) ListSegments(ctx context.Context, tenantID uuid.UUID) ([]Segment, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT s.id, s.tenant_id, s.name, COALESCE(s.description, ''), s.status, s.current_version_id,
+		       v.version, v.rule_json, s.created_at, s.updated_at
+		FROM segment s
+		JOIN segment_version v ON v.id = s.current_version_id
+		WHERE s.tenant_id=$1
+		ORDER BY s.created_at DESC LIMIT 500`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list segments: %w", err)
+	}
+	defer rows.Close()
+	out := []Segment{}
+	for rows.Next() {
+		var s Segment
+		var ruleJSON []byte
+		if err := rows.Scan(&s.ID, &s.TenantID, &s.Name, &s.Description, &s.Status, &s.CurrentVersionID,
+			&s.CurrentVersion, &ruleJSON, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(ruleJSON, &s.Rule)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // ActiveSegmentVersions returns the current rule version of every active segment.
 func (r *Repo) ActiveSegmentVersions(ctx context.Context, tenantID uuid.UUID) ([]ActiveVersion, error) {
 	rows, err := r.pool.Query(ctx, `

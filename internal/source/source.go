@@ -71,6 +71,27 @@ func (r *Repository) Insert(ctx context.Context, s Source, apiKeyHash string) er
 	return nil
 }
 
+// List returns a tenant's sources, newest first. Low-cardinality admin config,
+// so it is capped at 500 with no cursor. The API key hash is never selected.
+func (r *Repository) List(ctx context.Context, tenantID uuid.UUID) ([]Source, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, tenant_id, name, type, status, created_at, updated_at
+		FROM source WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 500`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list sources: %w", err)
+	}
+	defer rows.Close()
+	out := []Source{}
+	for rows.Next() {
+		var s Source
+		if err := rows.Scan(&s.ID, &s.TenantID, &s.Name, &s.Type, &s.Status, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // UpdateAPIKeyHash sets a new API key hash for a source. Returns false if the
 // source does not exist for the tenant.
 func (r *Repository) UpdateAPIKeyHash(ctx context.Context, tenantID, sourceID uuid.UUID, apiKeyHash string) (bool, error) {
@@ -152,6 +173,11 @@ func (s *Service) Create(ctx context.Context, tenantID uuid.UUID, name, typ stri
 		return CreateResult{}, fmt.Errorf("audit source create: %w", err)
 	}
 	return CreateResult{Source: src, APIKey: plaintext}, nil
+}
+
+// List returns a tenant's sources for the admin browse view.
+func (s *Service) List(ctx context.Context, tenantID uuid.UUID) ([]Source, error) {
+	return s.repo.List(ctx, tenantID)
 }
 
 // Authenticate resolves a source from an API key plaintext.
