@@ -134,9 +134,12 @@ func run() error {
 
 		admin.With(auth.RequireSuperAdmin()).Post("/admin/v1/tenants", tenantHandler.Create)
 		admin.With(auth.Require(rbac.PermAdminWrite)).Post("/admin/v1/admin-tokens", tokenHandler.Create)
+		admin.With(auth.Require(rbac.PermAdminWrite)).Get("/admin/v1/admin-tokens", tokenHandler.List)
+		admin.With(auth.Require(rbac.PermAdminWrite)).Post("/admin/v1/admin-tokens/{tokenID}/revoke", tokenHandler.Revoke)
 
 		admin.With(auth.Require(rbac.PermSourceWrite)).Post("/admin/v1/tenants/{tenantID}/sources", sourceHandler.Create)
 		admin.With(auth.Require(rbac.PermSourceWrite)).Post("/admin/v1/tenants/{tenantID}/sources/{sourceID}/rotate-key", sourceHandler.RotateKey)
+		admin.With(auth.Require(rbac.PermSourceWrite)).Post("/admin/v1/tenants/{tenantID}/sources/{sourceID}/disable", sourceHandler.Disable)
 		// Raw event query + replay (Phase 4).
 		admin.With(auth.Require(rbac.PermEventRead)).Get("/admin/v1/tenants/{tenantID}/events", rawHandler.List)
 		admin.With(auth.Require(rbac.PermEventRead)).Get("/admin/v1/tenants/{tenantID}/events/{eventID}", rawHandler.Get)

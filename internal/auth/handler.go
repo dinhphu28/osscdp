@@ -3,8 +3,10 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/dinhphu28/osscdp/internal/audit"
@@ -35,9 +37,13 @@ func Whoami(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// AdminTokenCreator mints admin tokens.
+// AdminTokenCreator mints and manages admin tokens. ListTokens/GetTokenTenant
+// never expose the token hash.
 type AdminTokenCreator interface {
 	CreateToken(ctx context.Context, tenantID *uuid.UUID, name, role string) (string, error)
+	ListTokens(ctx context.Context, tenantID *uuid.UUID) ([]rbac.TokenSummary, error)
+	GetTokenTenant(ctx context.Context, id uuid.UUID) (*uuid.UUID, error)
+	RevokeToken(ctx context.Context, id uuid.UUID) error
 }
 
 // TokenHandler exposes admin-token management.
@@ -107,4 +113,80 @@ func (h *TokenHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"api_token": plaintext, "role": req.Role})
+}
+
+type listTokensResponse struct {
+	Tokens []rbac.TokenSummary `json:"tokens"`
+}
+
+// List handles GET /admin/v1/admin-tokens. SUPER_ADMIN sees every tenant's
+// tokens; a non-super principal sees only its own tenant's. The token hash is
+// never returned.
+func (h *TokenHandler) List(w http.ResponseWriter, r *http.Request) {
+	caller, ok := PrincipalFromContext(r.Context())
+	if !ok {
+		apierror.Unauthorized(w, "not authenticated")
+		return
+	}
+	var scope *uuid.UUID
+	if !caller.IsSuperAdmin() {
+		scope = caller.TenantID
+	}
+	tokens, err := h.repo.ListTokens(r.Context(), scope)
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, listTokensResponse{Tokens: tokens})
+}
+
+// Revoke handles POST /admin/v1/admin-tokens/{tokenID}/revoke. A non-super
+// principal may revoke only tokens belonging to its own tenant; SUPER_ADMIN may
+// revoke any. Revoking immediately invalidates the token (auth resolves only
+// active tokens).
+func (h *TokenHandler) Revoke(w http.ResponseWriter, r *http.Request) {
+	caller, ok := PrincipalFromContext(r.Context())
+	if !ok {
+		apierror.Unauthorized(w, "not authenticated")
+		return
+	}
+	tokenID, err := uuid.Parse(chi.URLParam(r, "tokenID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid token id")
+		return
+	}
+
+	targetTenant, err := h.repo.GetTokenTenant(r.Context(), tokenID)
+	if errors.Is(err, rbac.ErrNotFound) {
+		apierror.NotFound(w, "admin token not found")
+		return
+	}
+	if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	// Tenant scope: a non-super principal may only revoke its own tenant's tokens.
+	if !caller.IsSuperAdmin() {
+		if targetTenant == nil || caller.TenantID == nil || *targetTenant != *caller.TenantID {
+			apierror.Forbidden(w, "tenant scope violation")
+			return
+		}
+	}
+
+	if err := h.repo.RevokeToken(r.Context(), tokenID); errors.Is(err, rbac.ErrNotFound) {
+		apierror.NotFound(w, "admin token not found")
+		return
+	} else if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	if err := h.audit.Record(r.Context(), audit.Entry{
+		TenantID: targetTenant, ActorType: audit.ActorAdmin, Action: "revoke",
+		ResourceType: "admin_token", ResourceID: tokenID.String(),
+		After: map[string]string{"status": rbac.StatusRevoked},
+	}); err != nil {
+		apierror.Internal(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"id": tokenID.String(), "status": rbac.StatusRevoked})
 }
