@@ -70,6 +70,28 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"api_key": key})
 }
 
+// Disable handles POST /admin/v1/tenants/{tenantID}/sources/{sourceID}/disable.
+func (h *Handler) Disable(w http.ResponseWriter, r *http.Request) {
+	tenantID, err := uuid.Parse(chi.URLParam(r, "tenantID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid tenant id")
+		return
+	}
+	sourceID, err := uuid.Parse(chi.URLParam(r, "sourceID"))
+	if err != nil {
+		apierror.BadRequest(w, "invalid source id")
+		return
+	}
+	if err := h.svc.Disable(r.Context(), tenantID, sourceID); errors.Is(err, ErrNotFound) {
+		apierror.NotFound(w, "source not found")
+		return
+	} else if err != nil {
+		apierror.Internal(w)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"id": sourceID.String(), "status": StatusDisabled})
+}
+
 type createResponse struct {
 	ID       uuid.UUID `json:"id"`
 	TenantID uuid.UUID `json:"tenant_id"`

@@ -185,6 +185,22 @@ paths:
         "403": {$ref: "#/components/responses/Forbidden"}
 
   /admin/v1/admin-tokens:
+    get:
+      tags: [Admin Tokens]
+      summary: List admin tokens
+      description: |
+        Requires `admin:write`. SUPER_ADMIN sees every tenant's tokens; a
+        TENANT_ADMIN sees only its own tenant's. The token hash is never returned.
+      responses:
+        "200":
+          description: Admin tokens (no secrets)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens: {type: array, items: {$ref: "#/components/schemas/AdminToken"}}
+        "403": {$ref: "#/components/responses/Forbidden"}
     post:
       tags: [Admin Tokens]
       summary: Mint an admin token
@@ -216,6 +232,28 @@ paths:
                   role: {type: string}
         "400": {$ref: "#/components/responses/BadRequest"}
         "403": {$ref: "#/components/responses/Forbidden"}
+
+  /admin/v1/admin-tokens/{tokenID}/revoke:
+    post:
+      tags: [Admin Tokens]
+      summary: Revoke an admin token (invalidated immediately)
+      description: |
+        Requires `admin:write`. SUPER_ADMIN may revoke any token; a TENANT_ADMIN
+        may revoke only its own tenant's tokens (403 otherwise). Revoking takes
+        effect immediately since auth resolves only active tokens.
+      parameters: [{$ref: "#/components/parameters/TokenID"}]
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+                  status: {type: string, example: revoked}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
 
   /admin/v1/tenants/{tenantID}/sources:
     get:
@@ -273,6 +311,29 @@ paths:
               schema:
                 type: object
                 properties: {api_key: {type: string}}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{tenantID}/sources/{sourceID}/disable:
+    post:
+      tags: [Tenants & Sources]
+      summary: Disable a source (ingest blocked immediately)
+      description: |
+        Requires `source:write`. Sets the source to `disabled`; because auth
+        resolves only active sources, its API key stops authenticating at once.
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/SourceID"}
+      responses:
+        "200":
+          description: Disabled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+                  status: {type: string, example: disabled}
         "403": {$ref: "#/components/responses/Forbidden"}
         "404": {$ref: "#/components/responses/NotFound"}
 
@@ -981,6 +1042,11 @@ components:
       in: path
       required: true
       schema: {type: string, format: uuid}
+    TokenID:
+      name: tokenID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
 
   responses:
     Ingested:
@@ -1087,6 +1153,17 @@ components:
         status: {type: string}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+
+    AdminToken:
+      type: object
+      description: "An admin token read model. The token hash is never serialized."
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        role: {type: string}
+        tenant_id: {type: string, format: uuid, nullable: true, description: "null for a cross-tenant SUPER_ADMIN token."}
+        status: {type: string, enum: [active, revoked]}
+        created_at: {type: string, format: date-time}
 
     SourceCreated:
       type: object

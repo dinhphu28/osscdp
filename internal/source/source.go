@@ -104,6 +104,21 @@ func (r *Repository) UpdateAPIKeyHash(ctx context.Context, tenantID, sourceID uu
 	return ct.RowsAffected() == 1, nil
 }
 
+// SetStatus updates a source's status (e.g. "disabled"). Returns ErrNotFound if
+// no row matches the tenant + source.
+func (r *Repository) SetStatus(ctx context.Context, tenantID, sourceID uuid.UUID, status string) error {
+	ct, err := r.pool.Exec(ctx,
+		`UPDATE source SET status=$3, updated_at=now() WHERE tenant_id=$1 AND id=$2`,
+		tenantID, sourceID, status)
+	if err != nil {
+		return fmt.Errorf("set source status: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // FindByAPIKeyHash resolves the source that owns the given key hash. Only active
 // sources are returned. The lookup is global-by-hash but each hash maps to
 // exactly one (tenant, source) row, so tenant scope is preserved by the result.
@@ -212,4 +227,24 @@ func (s *Service) RotateKey(ctx context.Context, tenantID, sourceID uuid.UUID) (
 		return "", fmt.Errorf("audit rotate key: %w", err)
 	}
 	return plaintext, nil
+}
+
+// Disable sets a source's status to "disabled", immediately blocking its ingest
+// (auth resolves only active sources), and audits the change. Returns
+// ErrNotFound if the source does not exist for the tenant.
+func (s *Service) Disable(ctx context.Context, tenantID, sourceID uuid.UUID) error {
+	if err := s.repo.SetStatus(ctx, tenantID, sourceID, StatusDisabled); err != nil {
+		return err
+	}
+	if err := s.audit.Record(ctx, audit.Entry{
+		TenantID:     &tenantID,
+		ActorType:    audit.ActorAdmin,
+		Action:       "disable",
+		ResourceType: "source",
+		ResourceID:   sourceID.String(),
+		After:        map[string]string{"status": StatusDisabled},
+	}); err != nil {
+		return fmt.Errorf("audit disable source: %w", err)
+	}
+	return nil
 }
