@@ -66,7 +66,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		apierror.BadRequest(w, "email or phone query parameter is required")
 		return
 	}
-	profiles, err := h.repo.ListByTrait(r.Context(), tenantID, key, value)
+	profiles, err := h.repo.ResolveByIdentifier(r.Context(), tenantID, key, value)
 	if err != nil {
 		apierror.Internal(w)
 		return
