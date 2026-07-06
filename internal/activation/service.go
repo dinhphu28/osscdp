@@ -61,35 +61,58 @@ func (s *Service) OnMembershipChanged(ctx context.Context, mc segment.Membership
 		return err
 	}
 	for _, sub := range subs {
-		status, lastErr := TaskPending, ""
-		if s.consent != nil {
-			denied, err := s.consentDeniedFor(ctx, mc.TenantID, mc.CustomerProfileID, sub.DestinationID)
-			if err != nil {
-				return err
-			}
-			if denied {
-				status, lastErr = TaskSkipped, "consent_denied"
-			}
-		}
-
-		key := IdempotencyKey(mc.TenantID, sub.DestinationID, sub.ID, mc.CustomerProfileID, mc.ReasonEventID, mc.Change)
-		created, err := s.repo.CreateTask(ctx, Task{
-			TenantID:          mc.TenantID,
-			DestinationID:     sub.DestinationID,
-			SubscriptionID:    sub.ID,
-			CustomerProfileID: mc.CustomerProfileID,
-			SourceEventID:     mc.ReasonEventID,
-			IdempotencyKey:    key,
-			Payload:           payload,
-		}, status, lastErr)
-		if err != nil {
+		if _, err := s.EnqueueSend(ctx, mc.TenantID, sub.DestinationID, sub.ID,
+			mc.CustomerProfileID, mc.ReasonEventID, mc.Change, payload); err != nil {
 			return err
-		}
-		if created && status == TaskSkipped && s.OnSkipped != nil {
-			s.OnSkipped()
 		}
 	}
 	return nil
+}
+
+// EnqueueSend idempotently creates one activation task for a (destination,
+// subscription, profile) send, applying the consent gate (a denied send is recorded
+// as a skipped task, never delivered). Extracted from OnMembershipChanged so journey
+// send steps reuse the exact same consent + idempotency discipline. Returns whether a
+// task row was created.
+func (s *Service) EnqueueSend(ctx context.Context, tenantID, destinationID, subscriptionID, profileID uuid.UUID, sourceEventID, change string, payload []byte) (bool, error) {
+	status, lastErr := TaskPending, ""
+	if s.consent != nil {
+		denied, err := s.consentDeniedFor(ctx, tenantID, profileID, destinationID)
+		if err != nil {
+			return false, err
+		}
+		if denied {
+			status, lastErr = TaskSkipped, "consent_denied"
+		}
+	}
+	key := IdempotencyKey(tenantID, destinationID, subscriptionID, profileID, sourceEventID, change)
+	created, err := s.repo.CreateTask(ctx, Task{
+		TenantID:          tenantID,
+		DestinationID:     destinationID,
+		SubscriptionID:    subscriptionID,
+		CustomerProfileID: profileID,
+		SourceEventID:     sourceEventID,
+		IdempotencyKey:    key,
+		Payload:           payload,
+	}, status, lastErr)
+	if err != nil {
+		return false, err
+	}
+	if created && status == TaskSkipped && s.OnSkipped != nil {
+		s.OnSkipped()
+	}
+	return created, nil
+}
+
+// EnqueueJourneySend delivers a journey send step: it get-or-creates the destination's
+// journey subscription (satisfying activation_task's FK) then enqueues through the same
+// consent-gated, idempotent EnqueueSend path. Satisfies journey.Sender.
+func (s *Service) EnqueueJourneySend(ctx context.Context, tenantID, destinationID, profileID uuid.UUID, sourceEventID, change string, payload []byte) (bool, error) {
+	subID, err := s.repo.EnsureJourneySubscription(ctx, tenantID, destinationID)
+	if err != nil {
+		return false, err
+	}
+	return s.EnqueueSend(ctx, tenantID, destinationID, subID, profileID, sourceEventID, change, payload)
 }
 
 // consentDeniedFor reports whether consent is denied for the destination's

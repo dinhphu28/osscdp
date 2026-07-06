@@ -146,6 +146,30 @@ func (r *Repo) DisableSubscription(ctx context.Context, tenantID, destinationID,
 	return s, nil
 }
 
+// EnsureJourneySubscription returns the id of the destination's single reusable
+// journey subscription (trigger_type='journey'), creating it if absent. Race-safe via
+// the idx_destination_subscription_journey partial unique index. Journey send steps
+// use this so activation_task's NOT-NULL subscription_id FK is satisfied without a
+// per-send-step subscription row.
+func (r *Repo) EnsureJourneySubscription(ctx context.Context, tenantID, destinationID uuid.UUID) (uuid.UUID, error) {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO destination_subscription (id, tenant_id, destination_id, trigger_type, status)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (tenant_id, destination_id) WHERE trigger_type='journey' DO NOTHING`,
+		uuid.New(), tenantID, destinationID, TriggerJourney, StatusActive)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("ensure journey subscription: %w", err)
+	}
+	var id uuid.UUID
+	err = r.pool.QueryRow(ctx,
+		`SELECT id FROM destination_subscription WHERE tenant_id=$1 AND destination_id=$2 AND trigger_type=$3`,
+		tenantID, destinationID, TriggerJourney).Scan(&id)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("get journey subscription: %w", err)
+	}
+	return id, nil
+}
+
 // ActiveSubscriptionsForSegment returns active subscriptions on active
 // destinations triggered by membership of the given segment.
 func (r *Repo) ActiveSubscriptionsForSegment(ctx context.Context, tenantID, segmentID uuid.UUID) ([]Subscription, error) {

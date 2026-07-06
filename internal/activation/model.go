@@ -25,6 +25,9 @@ const (
 // Trigger types.
 const (
 	TriggerSegmentMembership = "segment_membership"
+	// TriggerJourney marks the single reusable subscription per destination that
+	// journey send steps deliver through (get-or-created; see EnsureJourneySubscription).
+	TriggerJourney = "journey"
 )
 
 // Activation task statuses.
