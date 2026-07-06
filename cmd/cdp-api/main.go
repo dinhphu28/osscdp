@@ -23,6 +23,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/dlq"
 	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/governance"
+	"github.com/dinhphu28/osscdp/internal/journey"
 	"github.com/dinhphu28/osscdp/internal/platform/database"
 	"github.com/dinhphu28/osscdp/internal/platform/httpx"
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
@@ -99,6 +100,7 @@ func run() error {
 	profileHandler := profile.NewHandler(profile.NewRepo(pool))
 	segmentRepo := segment.NewRepo(pool)
 	segmentHandler := segment.NewHandler(segmentRepo)
+	journeyHandler := journey.NewHandler(journey.NewRepo(pool))
 	activationHandler := activation.NewHandler(activation.NewRepo(pool), cipher)
 	auditHandler := audit.NewHandler(audit.NewReader(pool))
 	statsHandler := stats.NewHandler(pool, segmentRepo)
@@ -163,6 +165,14 @@ func run() error {
 		admin.With(auth.Require(rbac.PermSegmentRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/pending/parked", segmentHandler.ListParked)
 		admin.With(auth.Require(rbac.PermSegmentWrite)).Post("/admin/v1/tenants/{tenantID}/segments/{segmentID}/pending/{profileID}/retry", segmentHandler.RetryParked)
 		admin.With(auth.Require(rbac.PermDestinationRead)).Get("/admin/v1/tenants/{tenantID}/segments/{segmentID}/destinations", activationHandler.ListSegmentDestinations)
+		// Journey orchestration (Phase 1): segment-entry -> wait -> send flows.
+		admin.With(auth.Require(rbac.PermJourneyRead)).Get("/admin/v1/tenants/{tenantID}/journeys", journeyHandler.List)
+		admin.With(auth.Require(rbac.PermJourneyWrite)).Post("/admin/v1/tenants/{tenantID}/journeys", journeyHandler.Create)
+		admin.With(auth.Require(rbac.PermJourneyWrite)).Put("/admin/v1/tenants/{tenantID}/journeys/{journeyID}", journeyHandler.Update)
+		admin.With(auth.Require(rbac.PermJourneyWrite)).Delete("/admin/v1/tenants/{tenantID}/journeys/{journeyID}", journeyHandler.Deactivate)
+		admin.With(auth.Require(rbac.PermJourneyRead)).Get("/admin/v1/tenants/{tenantID}/journeys/{journeyID}", journeyHandler.Get)
+		admin.With(auth.Require(rbac.PermJourneyRead)).Get("/admin/v1/tenants/{tenantID}/journeys/{journeyID}/enrollments/parked", journeyHandler.ListParked)
+		admin.With(auth.Require(rbac.PermJourneyWrite)).Post("/admin/v1/tenants/{tenantID}/journeys/{journeyID}/enrollments/{profileID}/retry", journeyHandler.RetryParked)
 		// Activation: destinations, subscriptions, delivery log (Phase 8).
 		admin.With(auth.Require(rbac.PermDestinationWrite)).Post("/admin/v1/tenants/{tenantID}/destinations", activationHandler.CreateDestination)
 		admin.With(auth.Require(rbac.PermDestinationWrite)).Put("/admin/v1/tenants/{tenantID}/destinations/{destinationID}", activationHandler.UpdateDestination)

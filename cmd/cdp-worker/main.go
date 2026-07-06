@@ -27,6 +27,7 @@ import (
 	"github.com/dinhphu28/osscdp/internal/dlq"
 	"github.com/dinhphu28/osscdp/internal/events"
 	"github.com/dinhphu28/osscdp/internal/identity"
+	"github.com/dinhphu28/osscdp/internal/journey"
 	"github.com/dinhphu28/osscdp/internal/platform/database"
 	"github.com/dinhphu28/osscdp/internal/platform/logging"
 	"github.com/dinhphu28/osscdp/internal/platform/metrics"
@@ -192,6 +193,22 @@ func run() error {
 	activationRunner.OnFailed = m.ActivationFailed.Inc
 	activationRunner.OnCircuitOpen = m.ActivationCircuitOpen.Inc
 
+	// Journey orchestration (Phase 1): a second consumer group on
+	// segment_membership_changed enrolls entered profiles into journeys that enter on
+	// that segment; a step sweeper (segment.Runner clone) advances each enrollment
+	// through its wait/send steps, sending via the activation stack. Reuses the segment
+	// sweep tuning knobs.
+	journeySvc := journey.NewService(pool, profile.NewRepo(pool), activationSvc)
+	journeyEnrollConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-journey", []string{bus.TopicSegmentMembershipChanged}, cfg.MaxRetries, logger)
+	if err != nil {
+		return err
+	}
+	journeyEnrollConsumer.OnRetry = m.ProcessingRetries.Inc
+	journeyEnrollHandler := makeJourneyEnrollHandler(journeySvc)
+	journeyRunner := journey.NewRunner(journeySvc, cfg.SegmentSweepBatchSize, cfg.SegmentSweepPerTenantCap,
+		cfg.SegmentSweepReclaimTimeout, cfg.SegmentSweepInterval, logger).
+		WithParkPolicy(cfg.SegmentSweepBackoffBase, cfg.SegmentSweepBackoffCap, cfg.SegmentSweepMaxAttempts)
+
 	metricsSrv := &http.Server{
 		Addr:              cfg.MetricsAddr,
 		Handler:           metricsMux(m),
@@ -199,13 +216,14 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(12)
+	wg.Add(14)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
 	go func() { defer wg.Done(); memRelay.Run(ctx) }()
 	go func() { defer wg.Done(); segmentRunner.Run(ctx) }()
 	go func() { defer wg.Done(); retention.Run(ctx) }()
 	go func() { defer wg.Done(); seedRunner.Run(ctx) }()
 	go func() { defer wg.Done(); activationRunner.Run(ctx) }()
+	go func() { defer wg.Done(); journeyRunner.Run(ctx) }()
 	go func() {
 		defer wg.Done()
 		if err := consumer.Run(ctx, handler, deadLetter); err != nil {
@@ -234,6 +252,12 @@ func run() error {
 		defer wg.Done()
 		if err := activationConsumer.Run(ctx, activationHandler, deadLetter); err != nil {
 			logger.Error("activation consumer stopped", "error", err.Error())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := journeyEnrollConsumer.Run(ctx, journeyEnrollHandler, deadLetter); err != nil {
+			logger.Error("journey enroll consumer stopped", "error", err.Error())
 		}
 	}()
 	go func() {
@@ -322,6 +346,18 @@ func makeActivationHandler(svc *activation.Service) bus.Handler {
 			return err
 		}
 		return svc.OnMembershipChanged(ctx, mc)
+	}
+}
+
+// makeJourneyEnrollHandler unmarshals segment_membership_changed and enrolls entered
+// profiles into journeys that enter on that segment.
+func makeJourneyEnrollHandler(svc *journey.Service) bus.Handler {
+	return func(ctx context.Context, r bus.Record) error {
+		var mc segment.MembershipChanged
+		if err := json.Unmarshal(r.Value, &mc); err != nil {
+			return err
+		}
+		return svc.EnrollOnMembership(ctx, mc)
 	}
 }
 

@@ -24,6 +24,8 @@ const (
 	PermProfileDelete    = "profile:delete"
 	PermSegmentRead      = "segment:read"
 	PermSegmentWrite     = "segment:write"
+	PermJourneyRead      = "journey:read"
+	PermJourneyWrite     = "journey:write"
 	PermDestinationRead  = "destination:read"
 	PermDestinationWrite = "destination:write"
 	PermActivationRead   = "activation:read"
@@ -39,12 +41,13 @@ const (
 var allPerms = perms(
 	PermSourceRead, PermSourceWrite, PermEventRead, PermEventReplay,
 	PermProfileRead, PermProfileDelete, PermSegmentRead, PermSegmentWrite,
+	PermJourneyRead, PermJourneyWrite,
 	PermDestinationRead, PermDestinationWrite, PermActivationRead,
 	PermDLQRead, PermDLQRetry, PermAuditRead, PermConsentWrite, PermPIIRead, PermAdminWrite,
 )
 
 var readPerms = perms(
-	PermSourceRead, PermEventRead, PermProfileRead, PermSegmentRead,
+	PermSourceRead, PermEventRead, PermProfileRead, PermSegmentRead, PermJourneyRead,
 	PermDestinationRead, PermActivationRead, PermAuditRead, PermDLQRead,
 )
 
@@ -53,7 +56,7 @@ var rolePerms = map[string]map[string]bool{
 	RoleSuperAdmin:  allPerms,
 	RoleTenantAdmin: allPerms,
 	RoleMarketer: union(readPerms, perms(
-		PermSegmentWrite, PermDestinationWrite, PermConsentWrite,
+		PermSegmentWrite, PermJourneyWrite, PermDestinationWrite, PermConsentWrite,
 	)),
 	RoleAnalyst:  readPerms,
 	RoleOperator: union(readPerms, perms(PermDLQRetry, PermEventReplay)),

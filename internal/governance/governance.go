@@ -178,8 +178,9 @@ type DeleteCounts struct {
 	IdentityNodes   int64 `json:"identity_nodes"`
 	BehavioralEvent int64 `json:"behavioral_event"`
 	BehaviorBucket  int64 `json:"profile_behavior_bucket"`
-	PendingEval     int64 `json:"segment_pending_eval"`
-	OutboxEmits     int64 `json:"segment_membership_outbox"`
+	PendingEval        int64 `json:"segment_pending_eval"`
+	OutboxEmits        int64 `json:"segment_membership_outbox"`
+	JourneyEnrollments int64 `json:"journey_enrollment"`
 }
 
 // ErrNotFound is returned when the customer profile does not exist.
@@ -248,6 +249,11 @@ func (s *Service) Delete(ctx context.Context, tenantID uuid.UUID, canonicalUserI
 	// Level-3 behavioral data (behavioral_event.props_json is a second verbatim copy
 	// of raw event PII). Erase it before the profile row, same tx (findings #22, #24).
 	if counts.PendingEval, err = exec(`DELETE FROM segment_pending_eval WHERE tenant_id=$1 AND customer_profile_id=$2`, tenantID, p.ID); err != nil {
+		return DeleteCounts{}, err
+	}
+	// Journey enrollments are profile-keyed with no FK (like segment_pending_eval),
+	// so erase them explicitly before the profile row.
+	if counts.JourneyEnrollments, err = exec(`DELETE FROM journey_enrollment WHERE tenant_id=$1 AND customer_profile_id=$2`, tenantID, p.ID); err != nil {
 		return DeleteCounts{}, err
 	}
 	if counts.BehavioralEvent, err = exec(`DELETE FROM behavioral_event WHERE tenant_id=$1 AND customer_profile_id=$2`, tenantID, p.ID); err != nil {

@@ -177,6 +177,23 @@ func (r *Repo) reparentProfileChildren(ctx context.Context, q querier, tenantID,
 		return fmt.Errorf("reparent memberships: %w", err)
 	}
 
+	// journey_enrollment: single-row per-enrollment state — union onto the survivor,
+	// keeping the survivor's row on conflict (dedup key = journey_id; enrollment_seq
+	// is 0 in Phase 1, so this is the PK). Because position + claim-fence + advance-seq
+	// all live on ONE row, the enrollment moves or is dropped atomically — no
+	// cross-table desync, no orphaned work item. Documented tradeoff: when both
+	// profiles are enrolled in the same journey, the survivor wins and the loser's
+	// mid-flight progress is dropped (same class as segment_membership).
+	if _, err := q.Exec(ctx, `
+		UPDATE journey_enrollment je
+		SET customer_profile_id=$3
+		WHERE je.tenant_id=$1 AND je.customer_profile_id=$2
+		  AND NOT EXISTS (SELECT 1 FROM journey_enrollment s
+		                  WHERE s.tenant_id=$1 AND s.customer_profile_id=$3 AND s.journey_id=je.journey_id)`,
+		tenantID, loserID, survivorID); err != nil {
+		return fmt.Errorf("reparent journey enrollments: %w", err)
+	}
+
 	// activation rows: re-key (idempotency_key is unchanged; no unique on
 	// customer_profile_id). Re-keying instead of deleting keeps pending sends and
 	// the delivery audit trail, and avoids an FK race with an in-flight sender.
@@ -224,6 +241,7 @@ func (r *Repo) reparentProfileChildren(ctx context.Context, q querier, tenantID,
 	for _, sql := range []string{
 		`DELETE FROM customer_profile_history WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM segment_membership WHERE tenant_id=$1 AND customer_profile_id=$2`,
+		`DELETE FROM journey_enrollment WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM customer_consent WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM behavioral_event WHERE tenant_id=$1 AND customer_profile_id=$2`,
 		`DELETE FROM profile_behavior_bucket WHERE tenant_id=$1 AND customer_profile_id=$2`,
