@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/dinhphu28/osscdp/internal/identity"
 )
 
 // ErrNotFound is returned when a profile does not exist.
@@ -312,4 +315,55 @@ func (r *Repo) ListByTrait(ctx context.Context, tenantID uuid.UUID, key, value s
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// ResolveByIdentifier finds profiles by an identifier (namespace "email"/"phone"),
+// matching ANY historical value the person has used — not just the last-write-wins
+// trait column. It resolves through the identity graph: hash the (normalized) input
+// the same way ingestion does, find the identity_node, and follow
+// identity_cluster_member -> customer_profile.identity_cluster_id (the same
+// invariant the identifier inventory in governance.Identifiers relies on). The
+// trait-column match is kept so an email/phone that arrived only inside an event's
+// traits object (and so never became an identity_node) still resolves.
+func (r *Repo) ResolveByIdentifier(ctx context.Context, tenantID uuid.UUID, namespace, rawValue string) ([]Profile, error) {
+	hash := identity.ValueHash(tenantID, namespace, normalizeIdentifier(namespace, rawValue))
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+profileCols+` FROM customer_profile p
+		 WHERE p.tenant_id = $1
+		   AND (
+		     p.traits_json->>$2 = $3
+		     OR p.identity_cluster_id IN (
+		       SELECT m.cluster_id
+		       FROM identity_node n
+		       JOIN identity_cluster_member m
+		         ON m.identity_node_id = n.id AND m.tenant_id = n.tenant_id
+		       WHERE n.tenant_id = $1 AND n.namespace = $2 AND n.value_hash = $4
+		     )
+		   )
+		 ORDER BY p.updated_at DESC LIMIT 100`,
+		tenantID, namespace, rawValue, hash)
+	if err != nil {
+		return nil, fmt.Errorf("resolve profiles by identifier: %w", err)
+	}
+	defer rows.Close()
+	var out []Profile
+	for rows.Next() {
+		p, err := scanProfile(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// normalizeIdentifier canonicalizes an identifier value for hashing so a search
+// hash matches what ingestion stored. Must stay in sync with
+// events.normalizeEmail (internal/events/normalize.go): email is lowercased and
+// trimmed; other namespaces are trimmed only.
+func normalizeIdentifier(namespace, value string) string {
+	if namespace == TraitEmail {
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+	return strings.TrimSpace(value)
 }

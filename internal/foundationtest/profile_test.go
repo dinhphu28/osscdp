@@ -3,6 +3,7 @@ package foundationtest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -444,6 +445,73 @@ func TestProfile_QueryByEmail(t *testing.T) {
 	resolveAndProfile(t, f, idSvc, profSvc, e1)
 
 	got, err := prepo.ListByTrait(ctx, tid, profile.TraitEmail, "find@x.com")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+}
+
+// TestProfile_ResolveByHistoricalIdentifier verifies search resolves a profile by
+// ANY email it has ever used as an identifier, not just the last-write-wins trait
+// value. Regression for the Customer 360 "can only search the last email" bug.
+func TestProfile_ResolveByHistoricalIdentifier(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pub := &reparentPub{}
+	idSvc := identity.NewService(f.pool, pub, bus.TopicIdentityResolved)
+	profSvc := profile.NewService(f.pool, noopPub{}, bus.TopicProfileUpdated)
+	prepo := profile.NewRepo(f.pool)
+	base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	// Same user_id keeps every event on one cluster; each carries a different email
+	// as an identifier, so six identity_node rows accumulate for one profile while
+	// traits_json->>'email' only ever holds the most recent (u.x6).
+	var canonical string
+	for i := 1; i <= 6; i++ {
+		email := fmt.Sprintf("u.x%d@x.com", i)
+		ir := resolveAndUpdate(t, idSvc, pub, profSvc,
+			mergeEnv(t, tid, sid, fmt.Sprintf("e%d", i),
+				events.Identifiers{UserID: "u1", Email: email}, "", base.Add(time.Duration(i)*time.Hour)))
+		canonical = ir.CanonicalUserID
+	}
+
+	// The last (current-trait) email still resolves.
+	last, err := prepo.ResolveByIdentifier(ctx, tid, profile.TraitEmail, "u.x6@x.com")
+	require.NoError(t, err)
+	require.Len(t, last, 1)
+	require.Equal(t, canonical, last[0].CanonicalUserID)
+
+	// The previously-failing case: an EARLIER email resolves via the identity graph.
+	prev, err := prepo.ResolveByIdentifier(ctx, tid, profile.TraitEmail, "u.x1@x.com")
+	require.NoError(t, err)
+	require.Len(t, prev, 1)
+	require.Equal(t, canonical, prev[0].CanonicalUserID)
+
+	// Mixed-case input normalizes to the stored (lowercased) hash.
+	mixed, err := prepo.ResolveByIdentifier(ctx, tid, profile.TraitEmail, "U.X3@X.com")
+	require.NoError(t, err)
+	require.Len(t, mixed, 1)
+	require.Equal(t, canonical, mixed[0].CanonicalUserID)
+
+	// An identifier never ingested resolves to nothing.
+	none, err := prepo.ResolveByIdentifier(ctx, tid, profile.TraitEmail, "nobody@x.com")
+	require.NoError(t, err)
+	require.Empty(t, none)
+}
+
+// TestProfile_ResolveByTraitsOnlyIdentifier verifies the trait-column branch: an
+// email that arrives only inside an event's traits object (never as an identifier,
+// so no identity_node) is still searchable — no regression from the graph rewrite.
+func TestProfile_ResolveByTraitsOnlyIdentifier(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	idSvc, profSvc := newSvcs(f)
+	prepo := profile.NewRepo(f.pool)
+
+	e := profEnv(t, tid, sid, "e1", "page_viewed", "u1", `{"email":"traitonly@x.com"}`, time.Now())
+	resolveAndProfile(t, f, idSvc, profSvc, e)
+
+	got, err := prepo.ResolveByIdentifier(ctx, tid, profile.TraitEmail, "traitonly@x.com")
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 }
