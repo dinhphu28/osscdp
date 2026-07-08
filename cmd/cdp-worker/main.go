@@ -209,6 +209,21 @@ func run() error {
 		cfg.SegmentSweepReclaimTimeout, cfg.SegmentSweepInterval, logger).
 		WithParkPolicy(cfg.SegmentSweepBackoffBase, cfg.SegmentSweepBackoffCap, cfg.SegmentSweepMaxAttempts)
 
+	// Phase 4: event-triggered entry rides the existing profile_updated stream — a
+	// dedicated consumer group enrolls a profile into journeys whose entry_event_name
+	// matches the triggering event. And a seed runner backfills the entry-segment
+	// population of newly created segment-entry journeys (a segment SeedRunner clone).
+	journeyEventConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-journey-event", []string{bus.TopicProfileUpdated}, cfg.MaxRetries, logger)
+	if err != nil {
+		return err
+	}
+	journeyEventConsumer.OnRetry = m.ProcessingRetries.Inc
+	journeyEventHandler := makeJourneyEventHandler(journeySvc)
+	// Metric hooks are intentionally left unset: m.SeedPages/m.SeedJobsDone are the
+	// segment seed metrics; wiring them here would conflate segment and journey backfill
+	// counts. Dedicated journey-seed metrics are a fast follow.
+	journeySeedRunner := journey.NewSeedRunner(journeySvc.Repo(), cfg.SeedJobPagesPerClaim, cfg.SeedJobReclaimTimeout, cfg.SeedJobInterval, logger)
+
 	metricsSrv := &http.Server{
 		Addr:              cfg.MetricsAddr,
 		Handler:           metricsMux(m),
@@ -216,7 +231,7 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(14)
+	wg.Add(16)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
 	go func() { defer wg.Done(); memRelay.Run(ctx) }()
 	go func() { defer wg.Done(); segmentRunner.Run(ctx) }()
@@ -224,6 +239,7 @@ func run() error {
 	go func() { defer wg.Done(); seedRunner.Run(ctx) }()
 	go func() { defer wg.Done(); activationRunner.Run(ctx) }()
 	go func() { defer wg.Done(); journeyRunner.Run(ctx) }()
+	go func() { defer wg.Done(); journeySeedRunner.Run(ctx) }()
 	go func() {
 		defer wg.Done()
 		if err := consumer.Run(ctx, handler, deadLetter); err != nil {
@@ -258,6 +274,12 @@ func run() error {
 		defer wg.Done()
 		if err := journeyEnrollConsumer.Run(ctx, journeyEnrollHandler, deadLetter); err != nil {
 			logger.Error("journey enroll consumer stopped", "error", err.Error())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := journeyEventConsumer.Run(ctx, journeyEventHandler, deadLetter); err != nil {
+			logger.Error("journey event consumer stopped", "error", err.Error())
 		}
 	}()
 	go func() {
@@ -359,6 +381,18 @@ func makeJourneyMembershipHandler(svc *journey.Service) bus.Handler {
 			return err
 		}
 		return svc.OnMembershipChanged(ctx, mc)
+	}
+}
+
+// makeJourneyEventHandler unmarshals profile_updated and enrolls the profile into any
+// journey whose entry_event_name matches the triggering event (event-triggered entry).
+func makeJourneyEventHandler(svc *journey.Service) bus.Handler {
+	return func(ctx context.Context, r bus.Record) error {
+		var pu profile.ProfileUpdated
+		if err := json.Unmarshal(r.Value, &pu); err != nil {
+			return err
+		}
+		return svc.EnrollOnEvent(ctx, pu)
 	}
 }
 

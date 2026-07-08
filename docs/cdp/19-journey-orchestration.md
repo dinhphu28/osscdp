@@ -1,6 +1,6 @@
 # 19 — Journey Orchestration
 
-Status: **Phases 1–3 implemented.** Later phases are designed but not built.
+Status: **Phases 1–4 implemented.** Phase 5 is designed but not built.
 
 A **journey** is a versioned, ordered flow a customer profile *enters* (via segment
 membership) and *advances* through with per-profile state. Phase 1 ships a linear
@@ -137,6 +137,26 @@ windows of any `journey_version` pinned by a live enrollment or the current vers
 an active journey — so a long-wait-then-behavioral-condition journey never evaluates
 over DROP-partitioned `behavioral_event` data.
 
+## Entry modes + backfill (Phase 4)
+
+A journey has exactly **one entry mode** (DB `CHECK` XOR):
+
+- **segment** (`entry_segment_id`) — enter when the profile joins the entry segment
+  (Phases 1–3), via the `segment_membership_changed` consumer.
+- **event** (`entry_event_name`) — enter when the profile emits that event, via a new
+  `-journey-event` consumer group on the existing `TopicProfileUpdated` stream
+  (`EnrollOnEvent` matches `pu.Event.EventName`). Idempotent by the once-only `Enroll`.
+
+**Population backfill.** Creating a *segment*-entry journey enqueues a durable
+`journey_seed_job` in the same tx (a clone of `segment_seed_job`): a `journey.SeedRunner`
+pages the entry segment's **current** active members (keyset cursor on
+`customer_profile_id`, claim-fenced, resumable) and enrolls each — so a journey reaches
+the already-qualified population, not just future joiners. The job snapshots
+`entry_segment_id` + `journey_version`; the page INSERT is gated on the journey still
+being active (archive mid-drain stops admitting) and is `ON CONFLICT DO NOTHING`
+(idempotent with the live membership-entry path). Event-entry journeys have no existing
+population and do not seed.
+
 ## Phase roadmap
 
 1. **(done)** Linear segment-entry `wait → send`; erasure + merge hooks + parked
@@ -147,8 +167,9 @@ over DROP-partitioned `behavioral_event` data.
    forward-DAG `next` targets; `journey_version` metadata + behavioral retention-horizon
    widening. (The conditional "goal step" — exit early on conversion — is expressible as
    a condition whose matching arm targets `len(steps)`.)
-4. Event entry (`TopicProfileUpdated` on an entry event) + `journey_seed_job` backfill
-   (a `segment_seed_job`/`SeedRunner` clone) to enroll the already-qualified population.
+4. **(done)** Event entry (`TopicProfileUpdated` on an entry event, XOR with segment
+   entry) + `journey_seed_job` backfill (a `segment_seed_job`/`SeedRunner` clone) to
+   enroll the already-qualified population.
 5. Lifecycle polish: re-entry (`enrollment_seq` allocation) + per-journey caps + terminal
    retention sweep + richer merge fidelity.
 

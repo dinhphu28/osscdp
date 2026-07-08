@@ -27,18 +27,33 @@ type Repo struct {
 // NewRepo constructs a Repo.
 func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 
-const journeyCols = `id, tenant_id, name, COALESCE(description,''), status, entry_segment_id, exit_on_segment_leave, current_version, created_at, updated_at`
+const journeyCols = `id, tenant_id, name, COALESCE(description,''), status, entry_segment_id, COALESCE(entry_event_name,''), exit_on_segment_leave, current_version, created_at, updated_at`
 
 func scanJourney(row pgx.Row) (Journey, error) {
 	var j Journey
 	err := row.Scan(&j.ID, &j.TenantID, &j.Name, &j.Description, &j.Status,
-		&j.EntrySegmentID, &j.ExitOnSegmentLeave, &j.CurrentVersion, &j.CreatedAt, &j.UpdatedAt)
+		&j.EntrySegmentID, &j.EntryEventName, &j.ExitOnSegmentLeave, &j.CurrentVersion, &j.CreatedAt, &j.UpdatedAt)
 	return j, err
 }
 
-// CreateJourney inserts a journey (status active) with its version-1 definition in
-// one tx. The definition is assumed already validated by the caller.
+// CreateJourney inserts a SEGMENT-entry journey (enter on entry-segment membership) and
+// enqueues a durable population-backfill seed job in the same tx, so the entry segment's
+// current members are enrolled — not just future joiners. The definition is assumed
+// already validated by the caller.
 func (r *Repo) CreateJourney(ctx context.Context, tenantID uuid.UUID, name, description string, entrySegmentID uuid.UUID, exitOnSegmentLeave bool, def Definition) (Journey, error) {
+	return r.create(ctx, tenantID, name, description, &entrySegmentID, "", exitOnSegmentLeave, def)
+}
+
+// CreateEventJourney inserts an EVENT-entry journey (enter when the profile emits
+// entryEventName). Event-entry journeys have no existing population, so no seed job.
+func (r *Repo) CreateEventJourney(ctx context.Context, tenantID uuid.UUID, name, description, entryEventName string, exitOnSegmentLeave bool, def Definition) (Journey, error) {
+	return r.create(ctx, tenantID, name, description, nil, entryEventName, exitOnSegmentLeave, def)
+}
+
+// create inserts a journey (status active) with its version-1 definition in one tx.
+// Exactly one of entrySegmentID / entryEventName must be set (enforced by the DB XOR
+// check). A segment-entry journey also enqueues a backfill seed job in-tx.
+func (r *Repo) create(ctx context.Context, tenantID uuid.UUID, name, description string, entrySegmentID *uuid.UUID, entryEventName string, exitOnSegmentLeave bool, def Definition) (Journey, error) {
 	defJSON, err := json.Marshal(def)
 	if err != nil {
 		return Journey{}, fmt.Errorf("marshal definition: %w", err)
@@ -51,9 +66,9 @@ func (r *Repo) CreateJourney(ctx context.Context, tenantID uuid.UUID, name, desc
 
 	id := uuid.New()
 	_, err = tx.Exec(ctx, `
-		INSERT INTO journey (id, tenant_id, name, description, status, entry_segment_id, exit_on_segment_leave, current_version)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,1)`,
-		id, tenantID, name, nullString(description), StatusActive, entrySegmentID, exitOnSegmentLeave)
+		INSERT INTO journey (id, tenant_id, name, description, status, entry_segment_id, entry_event_name, exit_on_segment_leave, current_version)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1)`,
+		id, tenantID, name, nullString(description), StatusActive, entrySegmentID, nullString(entryEventName), exitOnSegmentLeave)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -67,6 +82,13 @@ func (r *Repo) CreateJourney(ctx context.Context, tenantID uuid.UUID, name, desc
 		VALUES ($1,$2,$3,1,$4,$5,$6)`,
 		uuid.New(), tenantID, id, defJSON, events, int64(maxWindow.Seconds())); err != nil {
 		return Journey{}, fmt.Errorf("insert journey version: %w", err)
+	}
+	// Backfill the entry segment's current population (durable seed job drained by the
+	// journey SeedRunner). Enrollments pin version 1, due now.
+	if entrySegmentID != nil {
+		if err := r.EnqueueSeedJobTx(ctx, tx, tenantID, id, *entrySegmentID, 1, "seed", time.Now().UTC()); err != nil {
+			return Journey{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Journey{}, fmt.Errorf("commit create journey: %w", err)
@@ -155,9 +177,17 @@ func (r *Repo) ListJourneys(ctx context.Context, tenantID uuid.UUID) ([]Journey,
 
 // DeactivateJourney archives a journey (status='archived'): the enrollment consumer
 // stops entering new customers. In-flight enrollments continue on their pinned
-// version (they are drained by the runner, not gated on journey status).
+// version (they are drained by the runner, not gated on journey status). Any pending
+// backfill seed job is dropped in the same tx (mirrors segment.DeactivateSegment) so
+// the seed runner does not keep re-claiming an inert job.
 func (r *Repo) DeactivateJourney(ctx context.Context, tenantID, journeyID uuid.UUID) error {
-	ct, err := r.pool.Exec(ctx,
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ct, err := tx.Exec(ctx,
 		`UPDATE journey SET status=$3, updated_at=now() WHERE tenant_id=$1 AND id=$2`,
 		tenantID, journeyID, StatusArchived)
 	if err != nil {
@@ -165,6 +195,13 @@ func (r *Repo) DeactivateJourney(ctx context.Context, tenantID, journeyID uuid.U
 	}
 	if ct.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM journey_seed_job WHERE tenant_id=$1 AND journey_id=$2`, tenantID, journeyID); err != nil {
+		return fmt.Errorf("drop journey seed job: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit deactivate journey: %w", err)
 	}
 	return nil
 }
@@ -190,11 +227,22 @@ func (r *Repo) GetVersion(ctx context.Context, tenantID, journeyID uuid.UUID, ve
 
 // JourneysEnteringOn returns the active journeys whose entry segment is segmentID.
 func (r *Repo) JourneysEnteringOn(ctx context.Context, tenantID, segmentID uuid.UUID) ([]Journey, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT `+journeyCols+` FROM journey WHERE tenant_id=$1 AND entry_segment_id=$2 AND status=$3`,
-		tenantID, segmentID, StatusActive)
+	return r.journeysWhere(ctx, `tenant_id=$1 AND entry_segment_id=$2 AND status=$3`, tenantID, segmentID, StatusActive)
+}
+
+// JourneysEnteringOnEvent returns the active journeys that enter when a profile emits
+// eventName. Event names are matched exactly (case-sensitive, as ingested).
+func (r *Repo) JourneysEnteringOnEvent(ctx context.Context, tenantID uuid.UUID, eventName string) ([]Journey, error) {
+	if eventName == "" {
+		return nil, nil
+	}
+	return r.journeysWhere(ctx, `tenant_id=$1 AND entry_event_name=$2 AND status=$3`, tenantID, eventName, StatusActive)
+}
+
+func (r *Repo) journeysWhere(ctx context.Context, where string, args ...any) ([]Journey, error) {
+	rows, err := r.pool.Query(ctx, `SELECT `+journeyCols+` FROM journey WHERE `+where, args...)
 	if err != nil {
-		return nil, fmt.Errorf("journeys entering on: %w", err)
+		return nil, fmt.Errorf("journeys where: %w", err)
 	}
 	defer rows.Close()
 	var out []Journey

@@ -95,6 +95,37 @@ func (s *Service) EnrollOnMembership(ctx context.Context, mc segment.MembershipC
 	return nil
 }
 
+// EnrollOnEvent is the event-entry path: a profile_updated whose triggering event name
+// matches a journey's entry_event_name enrolls the profile. Idempotent under
+// at-least-once redelivery (Enroll is ON CONFLICT DO NOTHING).
+func (s *Service) EnrollOnEvent(ctx context.Context, pu profile.ProfileUpdated) error {
+	journeys, err := s.repo.JourneysEnteringOnEvent(ctx, pu.TenantID, pu.Event.EventName)
+	if err != nil {
+		return err
+	}
+	if len(journeys) == 0 {
+		return nil
+	}
+	// A redelivered profile_updated may arrive after the profile was erased/merged away;
+	// journey_enrollment has no FK, so enrolling it would leave an orphan row. Skip it
+	// (mirrors segment.Service.Evaluate's vanished-profile guard).
+	if _, err := s.profiles.GetByID(ctx, pu.TenantID, pu.CustomerProfileID); errors.Is(err, profile.ErrNotFound) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	for _, j := range journeys {
+		created, err := s.repo.Enroll(ctx, pu.TenantID, j.ID, pu.CustomerProfileID, j.CurrentVersion, s.now())
+		if err != nil {
+			return err
+		}
+		if created && s.OnEnrolled != nil {
+			s.OnEnrolled()
+		}
+	}
+	return nil
+}
+
 // ExitOnMembership is the exit path: a segment_membership_changed(exited) terminates
 // the profile's active enrollments in journeys that enter on that segment and are
 // configured to exit on segment leave. Idempotent (a redelivered exit finds no active
