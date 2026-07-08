@@ -1,6 +1,6 @@
 # 19 — Journey Orchestration
 
-Status: **Phase 1 implemented.** Later phases are designed but not built.
+Status: **Phases 1–2 implemented.** Later phases are designed but not built.
 
 A **journey** is a versioned, ordered flow a customer profile *enters* (via segment
 membership) and *advances* through with per-profile state. Phase 1 ships a linear
@@ -79,6 +79,25 @@ enrollments/parked` and `…/enrollments/{profileID}/retry`).
 An in-flight enrollment PINS the `journey_version` captured at enroll; a re-authored flow
 (new version, bumped `journey.current_version`) never disturbs a customer mid-wait.
 
+## Exit-on-segment-leave (Phase 2)
+
+A journey created with `exit_on_segment_leave=true` terminates a profile's **active**
+enrollment (`status='exited'`) when the profile *leaves* the entry segment
+(`segment_membership_changed` with `change='exited'`) — so a customer who no longer
+qualifies stops receiving the journey's sends. The `-journey` consumer's
+`OnMembershipChanged` dispatches `entered → enroll`, `exited → exit`. Default `false`
+preserves run-to-completion.
+
+Two correctness properties enforce exit safety:
+
+- **Exit wins in-flight** — `Repo.Advance` gained `AND status='active'`, so an exit that
+  fires while the runner holds a claim causes the concurrent fenced advance to no-op (at
+  most one already-enqueued send goes out).
+- **Once-only re-entry** — `Enroll`'s `ON CONFLICT` targets the enrollment PK
+  (`…, enrollment_seq`), so re-entering the segment after a terminal (completed/exited)
+  enrollment is a clean no-op rather than a primary-key error. Re-entry as a new run is
+  Phase 5 (`enrollment_seq` allocation).
+
 ## Lifecycle integration
 
 - **Erasure** — `governance.Service.Delete` deletes `journey_enrollment` for the profile
@@ -94,7 +113,10 @@ An in-flight enrollment PINS the `journey_version` captured at enroll; a re-auth
 
 1. **(done)** Linear segment-entry `wait → send`; erasure + merge hooks + parked
    admin + runner metrics.
-2. Exit-on-segment-leave (`exited` change) + explicit goal/stop step.
+2. **(done)** Exit-on-segment-leave (`exited` change) + once-only re-entry guard +
+   exit-wins-in-flight advance guard. (A conditional "goal step" — exit early on
+   conversion — is folded into Phase 3, where condition evaluation lands; a stop step in
+   a purely linear flow is just the last step.)
 3. Branching: `condition` (embeds `segment.Rule`, evaluated via `segment.Evaluate` +
    `behavior.Store`) + weighted `split`. **Same phase** widens `behavior.Retention`'s
    horizon to `UNION` `journey_version.max_window_seconds`, so a wait-then-condition

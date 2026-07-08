@@ -32,8 +32,9 @@ type Service struct {
 	sender   Sender
 	now      func() time.Time
 
-	// OnEnrolled is a metric hook (nil-safe), called on a newly created enrollment.
-	OnEnrolled func()
+	// Metric hooks (nil-safe).
+	OnEnrolled func() // a newly created enrollment
+	OnExited   func() // one or more enrollments exited on segment leave
 }
 
 // NewService constructs a Service.
@@ -50,10 +51,23 @@ func (s *Service) WithClock(now func() time.Time) *Service { s.now = now; return
 // Repo exposes the underlying repository (for admin handlers and the runner).
 func (s *Service) Repo() *Repo { return s.repo }
 
+// OnMembershipChanged dispatches a segment membership transition: an 'entered' enrolls
+// the profile; an 'exited' terminates active enrollments of journeys configured to
+// exit on segment leave. Both are idempotent under at-least-once redelivery.
+func (s *Service) OnMembershipChanged(ctx context.Context, mc segment.MembershipChanged) error {
+	switch mc.Change {
+	case segment.ChangeEntered:
+		return s.EnrollOnMembership(ctx, mc)
+	case segment.ChangeExited:
+		return s.ExitOnMembership(ctx, mc)
+	default:
+		return nil
+	}
+}
+
 // EnrollOnMembership is the entry path: a segment_membership_changed(entered) enrolls
 // the profile into every active journey that enters on that segment. Idempotent under
-// at-least-once redelivery (Enroll is ON CONFLICT DO NOTHING). Exit changes are
-// ignored in Phase 1 (exit-on-segment-leave is Phase 2).
+// at-least-once redelivery (Enroll is ON CONFLICT DO NOTHING).
 func (s *Service) EnrollOnMembership(ctx context.Context, mc segment.MembershipChanged) error {
 	if mc.Change != segment.ChangeEntered {
 		return nil
@@ -70,6 +84,24 @@ func (s *Service) EnrollOnMembership(ctx context.Context, mc segment.MembershipC
 		if created && s.OnEnrolled != nil {
 			s.OnEnrolled()
 		}
+	}
+	return nil
+}
+
+// ExitOnMembership is the exit path: a segment_membership_changed(exited) terminates
+// the profile's active enrollments in journeys that enter on that segment and are
+// configured to exit on segment leave. Idempotent (a redelivered exit finds no active
+// enrollment and is a no-op).
+func (s *Service) ExitOnMembership(ctx context.Context, mc segment.MembershipChanged) error {
+	if mc.Change != segment.ChangeExited {
+		return nil
+	}
+	n, err := s.repo.ExitActiveEnrollmentsForSegment(ctx, mc.TenantID, mc.SegmentID, mc.CustomerProfileID)
+	if err != nil {
+		return err
+	}
+	if n > 0 && s.OnExited != nil {
+		s.OnExited()
 	}
 	return nil
 }

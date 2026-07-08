@@ -204,7 +204,7 @@ func run() error {
 		return err
 	}
 	journeyEnrollConsumer.OnRetry = m.ProcessingRetries.Inc
-	journeyEnrollHandler := makeJourneyEnrollHandler(journeySvc)
+	journeyEnrollHandler := makeJourneyMembershipHandler(journeySvc)
 	journeyRunner := journey.NewRunner(journeySvc, cfg.SegmentSweepBatchSize, cfg.SegmentSweepPerTenantCap,
 		cfg.SegmentSweepReclaimTimeout, cfg.SegmentSweepInterval, logger).
 		WithParkPolicy(cfg.SegmentSweepBackoffBase, cfg.SegmentSweepBackoffCap, cfg.SegmentSweepMaxAttempts)
@@ -349,15 +349,16 @@ func makeActivationHandler(svc *activation.Service) bus.Handler {
 	}
 }
 
-// makeJourneyEnrollHandler unmarshals segment_membership_changed and enrolls entered
-// profiles into journeys that enter on that segment.
-func makeJourneyEnrollHandler(svc *journey.Service) bus.Handler {
+// makeJourneyMembershipHandler unmarshals segment_membership_changed and applies it to
+// journeys: 'entered' enrolls the profile; 'exited' terminates active enrollments of
+// journeys configured to exit on segment leave.
+func makeJourneyMembershipHandler(svc *journey.Service) bus.Handler {
 	return func(ctx context.Context, r bus.Record) error {
 		var mc segment.MembershipChanged
 		if err := json.Unmarshal(r.Value, &mc); err != nil {
 			return err
 		}
-		return svc.EnrollOnMembership(ctx, mc)
+		return svc.OnMembershipChanged(ctx, mc)
 	}
 }
 
