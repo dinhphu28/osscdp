@@ -87,6 +87,13 @@ func enteredMC(tid, segID, profileID uuid.UUID, at time.Time) segment.Membership
 	}
 }
 
+func exitedMC(tid, segID, profileID uuid.UUID, at time.Time) segment.MembershipChanged {
+	return segment.MembershipChanged{
+		TenantID: tid, SegmentID: segID, CustomerProfileID: profileID,
+		Change: segment.ChangeExited, ReasonEventID: "x1", ChangedAt: at,
+	}
+}
+
 // TestJourney_LinearWaitThenSend is the Phase-1 end-to-end slice: enter segment ->
 // wait -> send. It also asserts enroll idempotency and send exactly-once.
 func TestJourney_LinearWaitThenSend(t *testing.T) {
@@ -103,7 +110,7 @@ func TestJourney_LinearWaitThenSend(t *testing.T) {
 		{Type: journey.StepSend, DestinationID: destID},
 	}}
 	require.NoError(t, journey.Validate(def))
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
 	require.NoError(t, err)
 
 	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
@@ -164,7 +171,7 @@ func TestJourney_ConsentDeniedSkipsSend(t *testing.T) {
 
 	segID := mkEntrySegment(t, f, tid, "vn")
 	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
 	require.NoError(t, err)
 
 	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
@@ -199,7 +206,7 @@ func TestJourney_StaleRunnerNoDoubleAdvance(t *testing.T) {
 		{Type: journey.StepWait, Duration: "1h"},
 		{Type: journey.StepSend, DestinationID: destID},
 	}}
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
 	require.NoError(t, err)
 
 	repo := journey.NewRepo(f.pool)
@@ -237,7 +244,7 @@ func TestJourney_ErasureRemovesEnrollment(t *testing.T) {
 	destID := mkJourneyDest(t, f, tid, "wh")
 	segID := mkEntrySegment(t, f, tid, "vn")
 	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
-	_, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, def)
+	_, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
 	require.NoError(t, err)
 
 	clk := time.Now().UTC()
@@ -264,7 +271,7 @@ func TestJourney_VersionPinning(t *testing.T) {
 	destV2 := mkJourneyDest(t, f, tid, "wh-v2")
 	segID := mkEntrySegment(t, f, tid, "vn")
 	jrepo := journey.NewRepo(f.pool)
-	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, journey.Definition{Steps: []journey.Step{
+	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, journey.Definition{Steps: []journey.Step{
 		{Type: journey.StepWait, Duration: "1h"},
 		{Type: journey.StepSend, DestinationID: destV1},
 	}})
@@ -276,7 +283,7 @@ func TestJourney_VersionPinning(t *testing.T) {
 	require.NoError(t, svc.EnrollOnMembership(ctx, enteredMC(tid, segID, pid, clk)))
 
 	// Re-author the journey to send to a DIFFERENT destination (mints version 2).
-	_, err = jrepo.UpdateJourney(ctx, tid, j.ID, "", journey.Definition{Steps: []journey.Step{
+	_, err = jrepo.UpdateJourney(ctx, tid, j.ID, "", false, journey.Definition{Steps: []journey.Step{
 		{Type: journey.StepWait, Duration: "1h"},
 		{Type: journey.StepSend, DestinationID: destV2},
 	}})
@@ -306,7 +313,7 @@ func TestJourney_MergeMovesEnrollmentAtomically(t *testing.T) {
 
 	destID := mkJourneyDest(t, f, tid, "wh")
 	segID := mkEntrySegment(t, f, tid, "vn")
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID,
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false,
 		journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}})
 	require.NoError(t, err)
 
@@ -337,4 +344,236 @@ func TestJourney_MergeMovesEnrollmentAtomically(t *testing.T) {
 	// The enrollment moved wholesale to the survivor; the loser has none.
 	require.Equal(t, 1, enrollmentCountForProfile(t, f, tid, survivor.ID))
 	require.Equal(t, 0, enrollmentCountForProfile(t, f, tid, loser.ID))
+}
+
+// --- Phase 2: exit-on-segment-leave ---
+
+// TestJourney_ExitOnSegmentLeave verifies that when a profile leaves the entry segment
+// of an exit-on-leave journey, its active enrollment is terminated and the runner stops
+// advancing it. Exit is idempotent.
+func TestJourney_ExitOnSegmentLeave(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	pid := pu.CustomerProfileID
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepWait, Duration: "1h"},
+		{Type: journey.StepSend, DestinationID: destID},
+	}}
+	// exit_on_segment_leave = true.
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, true, def)
+	require.NoError(t, err)
+	require.True(t, j.ExitOnSegmentLeave)
+
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time { return clk }
+	svc := newJourneySvc(f, nil, now)
+
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+	require.Equal(t, 1, activeEnrollmentCount(t, f, tid))
+
+	// The profile leaves the entry segment → active enrollment is exited.
+	require.NoError(t, svc.OnMembershipChanged(ctx, exitedMC(tid, segID, pid, clk)))
+	_, status := enrollmentState(t, f, tid, j.ID, pid)
+	require.Equal(t, journey.EnrollmentExited, status)
+	require.Equal(t, 0, activeEnrollmentCount(t, f, tid))
+
+	// Idempotent: a redelivered exit is a no-op (no active enrollment left).
+	require.NoError(t, svc.OnMembershipChanged(ctx, exitedMC(tid, segID, pid, clk)))
+
+	// The runner never advances an exited enrollment, so no send is enqueued even after
+	// the wait would have elapsed.
+	clk = clk.Add(2 * time.Hour)
+	n, err := journey.NewRunner(svc, 50, 50, time.Minute, time.Second, testLogger()).WithClock(now).RunOnce(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+	require.Equal(t, 0, taskCount(t, f, tid))
+}
+
+// TestJourney_NoExitWhenFlagOff verifies a journey WITHOUT exit_on_segment_leave keeps
+// running when the profile leaves the entry segment (default run-to-completion).
+func TestJourney_NoExitWhenFlagOff(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	pid := pu.CustomerProfileID
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	require.NoError(t, err)
+
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time { return clk }
+	svc := newJourneySvc(f, nil, now)
+
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+	// Leaving the segment does NOT exit (flag off).
+	require.NoError(t, svc.OnMembershipChanged(ctx, exitedMC(tid, segID, pid, clk)))
+	_, status := enrollmentState(t, f, tid, j.ID, pid)
+	require.Equal(t, journey.EnrollmentActive, status)
+
+	// The runner still advances it to a send.
+	n, err := journey.NewRunner(svc, 50, 50, time.Minute, time.Second, testLogger()).WithClock(now).RunOnce(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.Equal(t, 1, taskCount(t, f, tid))
+}
+
+// TestJourney_OnceOnlyReEntryAfterTerminal verifies re-entering a segment after the
+// enrollment has terminated is a clean no-op (once-only) — not a primary-key error.
+func TestJourney_OnceOnlyReEntryAfterTerminal(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	pid := pu.CustomerProfileID
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	require.NoError(t, err)
+
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time { return clk }
+	svc := newJourneySvc(f, nil, now)
+
+	// Enroll then run to completion (single send step).
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+	_, err = journey.NewRunner(svc, 50, 50, time.Minute, time.Second, testLogger()).WithClock(now).RunOnce(ctx)
+	require.NoError(t, err)
+	_, status := enrollmentState(t, f, tid, j.ID, pid)
+	require.Equal(t, journey.EnrollmentCompleted, status)
+
+	// Re-entering the segment must NOT error and must NOT create a second enrollment.
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+	require.Equal(t, 1, enrollmentCountForProfile(t, f, tid, pid))
+	require.Equal(t, 1, taskCount(t, f, tid))
+}
+
+// TestJourney_ExitWinsRaceWithAdvance verifies the status='active' guard on Advance:
+// an exit that fires while an enrollment is claimed wins — the in-flight advance no-ops.
+func TestJourney_ExitWinsRaceWithAdvance(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	pid := pu.CustomerProfileID
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepWait, Duration: "1h"},
+		{Type: journey.StepSend, DestinationID: destID},
+	}}
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, true, def)
+	require.NoError(t, err)
+
+	repo := journey.NewRepo(f.pool)
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, newJourneySvc(f, nil, func() time.Time { return clk }).OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+
+	// A runner claims the enrollment (fence = clk).
+	rows, err := repo.ClaimDueEnrollments(ctx, clk, 50, 50, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	e := rows[0]
+
+	// Concurrently, the profile leaves the segment: the enrollment is exited while claimed.
+	exited, err := repo.ExitActiveEnrollmentsForSegment(ctx, tid, segID, pid)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), exited)
+
+	// The in-flight advance (captured fence) now writes zero rows — exit wins.
+	ok, err := repo.Advance(ctx, e, clk, 1, clk.Add(time.Hour), journey.EnrollmentActive)
+	require.NoError(t, err)
+	require.False(t, ok, "advance must no-op once the enrollment is exited")
+
+	_, status := enrollmentState(t, f, tid, j.ID, pid)
+	require.Equal(t, journey.EnrollmentExited, status)
+}
+
+// TestJourney_FailDoesNotParkExited verifies FailEnrollment cannot (re-)park an
+// enrollment that a concurrent exit already terminated — the status='active' guard
+// makes the fail a no-op (adversarial-review finding).
+func TestJourney_FailDoesNotParkExited(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	pid := pu.CustomerProfileID
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepWait, Duration: "1h"},
+		{Type: journey.StepSend, DestinationID: destID},
+	}}
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, true, def)
+	require.NoError(t, err)
+
+	repo := journey.NewRepo(f.pool)
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, newJourneySvc(f, nil, func() time.Time { return clk }).OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+
+	// Claim, then the customer leaves the segment (enrollment exited while claimed).
+	rows, err := repo.ClaimDueEnrollments(ctx, clk, 50, 50, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	exited, err := repo.ExitActiveEnrollmentsForSegment(ctx, tid, segID, pid)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), exited)
+
+	// The runner's failure path fires (maxAttempts=1 so it would park an active row):
+	// on the exited row it must no-op — no park, status stays exited.
+	attempts, parked, err := repo.FailEnrollment(ctx, tid, j.ID, pid, 0, clk, "boom", time.Second, time.Minute, 1)
+	require.NoError(t, err)
+	require.False(t, parked, "an exited enrollment must never be parked")
+	require.Equal(t, 0, attempts)
+
+	_, status := enrollmentState(t, f, tid, j.ID, pid)
+	require.Equal(t, journey.EnrollmentExited, status)
+	n, err := repo.ParkedCount(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), n)
+}
+
+// TestJourney_ArchivedJourneyNotExitedOnLeave verifies an archived journey's in-flight
+// enrollments are NOT exited on segment leave — they drain to completion, matching the
+// entry path (active-only) and the DeactivateJourney contract (adversarial-review finding).
+func TestJourney_ArchivedJourneyNotExitedOnLeave(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	pid := pu.CustomerProfileID
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepWait, Duration: "1h"},
+		{Type: journey.StepSend, DestinationID: destID},
+	}}
+	jrepo := journey.NewRepo(f.pool)
+	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, true, def)
+	require.NoError(t, err)
+
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	svc := newJourneySvc(f, nil, func() time.Time { return clk })
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+
+	// Archive the journey, THEN the customer leaves the segment.
+	require.NoError(t, jrepo.DeactivateJourney(ctx, tid, j.ID))
+	require.NoError(t, svc.OnMembershipChanged(ctx, exitedMC(tid, segID, pid, clk)))
+
+	// The enrollment is untouched (archived journeys drain, not exit).
+	_, status := enrollmentState(t, f, tid, j.ID, pid)
+	require.Equal(t, journey.EnrollmentActive, status)
 }

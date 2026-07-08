@@ -47,16 +47,19 @@ type Definition struct {
 
 // Journey is a journey definition head (identity + active version pointer).
 type Journey struct {
-	ID             uuid.UUID  `json:"id"`
-	TenantID       uuid.UUID  `json:"tenant_id"`
-	Name           string     `json:"name"`
-	Description    string     `json:"description"`
-	Status         string     `json:"status"`
-	EntrySegmentID uuid.UUID  `json:"entry_segment_id"`
-	CurrentVersion int        `json:"current_version"`
-	Definition     Definition `json:"definition"` // populated on Get (the current version)
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ID             uuid.UUID `json:"id"`
+	TenantID       uuid.UUID `json:"tenant_id"`
+	Name           string    `json:"name"`
+	Description    string    `json:"description"`
+	Status         string    `json:"status"`
+	EntrySegmentID uuid.UUID `json:"entry_segment_id"`
+	// ExitOnSegmentLeave terminates a profile's active enrollment when it leaves the
+	// entry segment (Phase 2). Default false = run to completion.
+	ExitOnSegmentLeave bool       `json:"exit_on_segment_leave"`
+	CurrentVersion     int        `json:"current_version"`
+	Definition         Definition `json:"definition"` // populated on Get (the current version)
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 // Enrollment is a claimed per-profile state row the runner must advance.

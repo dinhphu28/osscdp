@@ -22,10 +22,11 @@ type Handler struct {
 func NewHandler(repo *Repo) *Handler { return &Handler{repo: repo} }
 
 type createRequest struct {
-	Name           string     `json:"name"`
-	Description     string     `json:"description"`
-	EntrySegmentID uuid.UUID  `json:"entry_segment_id"`
-	Definition     Definition `json:"definition"`
+	Name               string     `json:"name"`
+	Description        string     `json:"description"`
+	EntrySegmentID     uuid.UUID  `json:"entry_segment_id"`
+	ExitOnSegmentLeave bool       `json:"exit_on_segment_leave"`
+	Definition         Definition `json:"definition"`
 }
 
 type listResponse struct {
@@ -69,7 +70,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		apierror.BadRequest(w, "invalid definition: "+err.Error())
 		return
 	}
-	j, err := h.repo.CreateJourney(r.Context(), tenantID, req.Name, req.Description, req.EntrySegmentID, req.Definition)
+	j, err := h.repo.CreateJourney(r.Context(), tenantID, req.Name, req.Description, req.EntrySegmentID, req.ExitOnSegmentLeave, req.Definition)
 	if errors.Is(err, ErrDuplicateName) {
 		apierror.Conflict(w, "journey name already exists for tenant")
 		return
@@ -82,8 +83,9 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateRequest struct {
-	Description string     `json:"description"`
-	Definition  Definition `json:"definition"`
+	Description        string     `json:"description"`
+	ExitOnSegmentLeave bool       `json:"exit_on_segment_leave"`
+	Definition         Definition `json:"definition"`
 }
 
 // Update handles PUT /admin/v1/tenants/{tenantID}/journeys/{journeyID}: mints a new
@@ -107,7 +109,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		apierror.BadRequest(w, "invalid definition: "+err.Error())
 		return
 	}
-	j, err := h.repo.UpdateJourney(r.Context(), tenantID, journeyID, req.Description, req.Definition)
+	j, err := h.repo.UpdateJourney(r.Context(), tenantID, journeyID, req.Description, req.ExitOnSegmentLeave, req.Definition)
 	if errors.Is(err, ErrNotFound) {
 		apierror.NotFound(w, "journey not found")
 		return

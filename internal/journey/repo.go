@@ -27,18 +27,18 @@ type Repo struct {
 // NewRepo constructs a Repo.
 func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 
-const journeyCols = `id, tenant_id, name, COALESCE(description,''), status, entry_segment_id, current_version, created_at, updated_at`
+const journeyCols = `id, tenant_id, name, COALESCE(description,''), status, entry_segment_id, exit_on_segment_leave, current_version, created_at, updated_at`
 
 func scanJourney(row pgx.Row) (Journey, error) {
 	var j Journey
 	err := row.Scan(&j.ID, &j.TenantID, &j.Name, &j.Description, &j.Status,
-		&j.EntrySegmentID, &j.CurrentVersion, &j.CreatedAt, &j.UpdatedAt)
+		&j.EntrySegmentID, &j.ExitOnSegmentLeave, &j.CurrentVersion, &j.CreatedAt, &j.UpdatedAt)
 	return j, err
 }
 
 // CreateJourney inserts a journey (status active) with its version-1 definition in
 // one tx. The definition is assumed already validated by the caller.
-func (r *Repo) CreateJourney(ctx context.Context, tenantID uuid.UUID, name, description string, entrySegmentID uuid.UUID, def Definition) (Journey, error) {
+func (r *Repo) CreateJourney(ctx context.Context, tenantID uuid.UUID, name, description string, entrySegmentID uuid.UUID, exitOnSegmentLeave bool, def Definition) (Journey, error) {
 	defJSON, err := json.Marshal(def)
 	if err != nil {
 		return Journey{}, fmt.Errorf("marshal definition: %w", err)
@@ -51,9 +51,9 @@ func (r *Repo) CreateJourney(ctx context.Context, tenantID uuid.UUID, name, desc
 
 	id := uuid.New()
 	_, err = tx.Exec(ctx, `
-		INSERT INTO journey (id, tenant_id, name, description, status, entry_segment_id, current_version)
-		VALUES ($1,$2,$3,$4,$5,$6,1)`,
-		id, tenantID, name, nullString(description), StatusActive, entrySegmentID)
+		INSERT INTO journey (id, tenant_id, name, description, status, entry_segment_id, exit_on_segment_leave, current_version)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,1)`,
+		id, tenantID, name, nullString(description), StatusActive, entrySegmentID, exitOnSegmentLeave)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -75,7 +75,7 @@ func (r *Repo) CreateJourney(ctx context.Context, tenantID uuid.UUID, name, desc
 
 // UpdateJourney mints a new immutable version (N+1), bumps current_version, and
 // updates the description. In-flight enrollments keep their pinned version.
-func (r *Repo) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID, description string, def Definition) (Journey, error) {
+func (r *Repo) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID, description string, exitOnSegmentLeave bool, def Definition) (Journey, error) {
 	defJSON, err := json.Marshal(def)
 	if err != nil {
 		return Journey{}, fmt.Errorf("marshal definition: %w", err)
@@ -104,8 +104,8 @@ func (r *Repo) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID,
 		return Journey{}, fmt.Errorf("insert journey version: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
-		`UPDATE journey SET current_version=$3, description=$4, updated_at=now() WHERE tenant_id=$1 AND id=$2`,
-		tenantID, journeyID, next, nullString(description)); err != nil {
+		`UPDATE journey SET current_version=$3, description=$4, exit_on_segment_leave=$5, updated_at=now() WHERE tenant_id=$1 AND id=$2`,
+		tenantID, journeyID, next, nullString(description), exitOnSegmentLeave); err != nil {
 		return Journey{}, fmt.Errorf("update journey: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -207,20 +207,48 @@ func (r *Repo) JourneysEnteringOn(ctx context.Context, tenantID, segmentID uuid.
 }
 
 // Enroll idempotently creates a live enrollment pinned to version at current step 0,
-// due now. The partial-unique-active index makes a redelivered entry a no-op and
-// enforces one live enrollment per (journey, profile). Returns whether a row was
-// created.
+// due now. ON CONFLICT on the PK (…, enrollment_seq) makes this ONCE-ONLY: a
+// redelivered entry is a no-op, and — crucially — a re-entry AFTER a terminal
+// (completed/exited) enrollment is also a no-op rather than a primary-key error
+// (enrollment_seq is 0 until Phase 5 allocates a new run). The partial-unique-active
+// index remains an independent invariant (never two active rows). Returns whether a
+// row was created.
 func (r *Repo) Enroll(ctx context.Context, tenantID, journeyID, profileID uuid.UUID, version int, dueAt time.Time) (bool, error) {
 	ct, err := r.pool.Exec(ctx, `
 		INSERT INTO journey_enrollment
 			(tenant_id, journey_id, customer_profile_id, enrollment_seq, journey_version, status, current_step_index, step_seq, due_at)
 		VALUES ($1,$2,$3,0,$4,$5,0,0,$6)
-		ON CONFLICT (tenant_id, journey_id, customer_profile_id) WHERE status='active' DO NOTHING`,
+		ON CONFLICT (tenant_id, journey_id, customer_profile_id, enrollment_seq) DO NOTHING`,
 		tenantID, journeyID, profileID, version, EnrollmentActive, dueAt)
 	if err != nil {
 		return false, fmt.Errorf("enroll: %w", err)
 	}
 	return ct.RowsAffected() == 1, nil
+}
+
+// ExitActiveEnrollmentsForSegment terminates (status='exited') a profile's active
+// enrollments in journeys that (a) enter on segmentID, (b) are ACTIVE, and (c) have
+// exit_on_segment_leave set — used when the profile LEAVES that segment (Phase 2). It
+// clears the claim and dead-letter so no runner touches the row again. A parked-but-
+// still-active enrollment is exited too (the customer no longer qualifies). The
+// journey status='active' filter mirrors the entry path (JourneysEnteringOn) and
+// honors the "archived journeys drain in-flight enrollments to completion" contract
+// (DeactivateJourney): a leave does not exit enrollments of an archived journey.
+// Returns how many enrollments were exited.
+func (r *Repo) ExitActiveEnrollmentsForSegment(ctx context.Context, tenantID, segmentID, profileID uuid.UUID) (int64, error) {
+	ct, err := r.pool.Exec(ctx, `
+		UPDATE journey_enrollment je
+		SET status='exited', claimed_at=NULL, parked_at=NULL, updated_at=now()
+		WHERE je.tenant_id=$1 AND je.customer_profile_id=$2 AND je.status='active'
+		  AND je.journey_id IN (
+		      SELECT id FROM journey
+		      WHERE tenant_id=$1 AND entry_segment_id=$3 AND exit_on_segment_leave=true AND status=$4
+		  )`,
+		tenantID, profileID, segmentID, StatusActive)
+	if err != nil {
+		return 0, fmt.Errorf("exit enrollments on leave: %w", err)
+	}
+	return ct.RowsAffected(), nil
 }
 
 // ClaimDueEnrollments atomically claims up to batchSize due enrollments, fairly across
@@ -270,17 +298,19 @@ func (r *Repo) ClaimDueEnrollments(ctx context.Context, now time.Time, batchSize
 }
 
 // Advance moves a claimed enrollment to newIndex with a new due_at and status. It is a
-// single-table CLAIM-FENCED UPDATE: it applies only if claimed_at still equals the
-// fence AND step_seq equals the expected value (both captured at claim), so a
-// reclaimed slow runner writes zero rows — no rewind, no double-advance. It bumps
-// step_seq, clears the claim, and resets the retry budget. Returns whether it applied.
+// single-table CLAIM-FENCED UPDATE: it applies only if the row is still active AND
+// claimed_at still equals the fence AND step_seq equals the expected value (all
+// captured at claim), so a reclaimed slow runner writes zero rows — no rewind, no
+// double-advance — and a concurrent exit-on-segment-leave that flipped the row to
+// 'exited' WINS (the advance no-ops). It bumps step_seq, clears the claim, and resets
+// the retry budget. Returns whether it applied.
 func (r *Repo) Advance(ctx context.Context, e Enrollment, fence time.Time, newIndex int, newDueAt time.Time, newStatus string) (bool, error) {
 	ct, err := r.pool.Exec(ctx, `
 		UPDATE journey_enrollment SET
 			current_step_index=$5, due_at=$6, status=$7,
 			step_seq=step_seq+1, claimed_at=NULL, attempts=0, last_error=NULL, updated_at=now()
 		WHERE tenant_id=$1 AND journey_id=$2 AND customer_profile_id=$3 AND enrollment_seq=$4
-		  AND claimed_at=$8 AND step_seq=$9`,
+		  AND status='active' AND claimed_at=$8 AND step_seq=$9`,
 		e.TenantID, e.JourneyID, e.CustomerProfileID, e.EnrollmentSeq,
 		newIndex, newDueAt, newStatus, fence, e.StepSeq)
 	if err != nil {
@@ -292,6 +322,9 @@ func (r *Repo) Advance(ctx context.Context, e Enrollment, fence time.Time, newIn
 // FailEnrollment records a failed advance: it bumps attempts, stores the (truncated)
 // error, and either backs the row off exponentially or — once attempts reach
 // maxAttempts — PARKS it. It always clears claimed_at. Clone of segment.Repo.FailPending.
+// The status='active' guard mirrors Advance: a concurrent exit-on-segment-leave that
+// terminated the row WINS, so an exited enrollment is never (re-)parked — the fail
+// no-ops (returns not-parked, no error).
 func (r *Repo) FailEnrollment(ctx context.Context, tenantID, journeyID, profileID uuid.UUID, enrollmentSeq int,
 	now time.Time, errMsg string, base, cap time.Duration, maxAttempts int) (attempts int, parked bool, err error) {
 
@@ -309,9 +342,13 @@ func (r *Repo) FailEnrollment(ctx context.Context, tenantID, journeyID, profileI
 			                  ELSE $5::timestamptz + interval '1 second' * LEAST($9::double precision, $8::double precision * power(2, attempts))
 			             END
 		WHERE tenant_id=$1 AND journey_id=$2 AND customer_profile_id=$3 AND enrollment_seq=$4
+		  AND status='active'
 		RETURNING attempts, parked_at IS NOT NULL`,
 		tenantID, journeyID, profileID, enrollmentSeq, now, errMsg, maxAttempts,
 		int64(base.Seconds()), int64(cap.Seconds())).Scan(&attempts, &parked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil // row concurrently exited/removed — nothing to fail
+	}
 	if err != nil {
 		return 0, false, fmt.Errorf("fail enrollment: %w", err)
 	}
