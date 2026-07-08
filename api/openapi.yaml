@@ -23,6 +23,7 @@ tags:
   - name: Consent
   - name: Governance
   - name: Segments
+  - name: Journeys
   - name: Destinations
   - name: DLQ
   - name: Audit
@@ -722,6 +723,142 @@ paths:
                         type: {type: string}
                         destination_status: {type: string}
 
+  /admin/v1/tenants/{tenantID}/journeys:
+    get:
+      tags: [Journeys]
+      summary: List a tenant's journeys
+      description: "Requires `journey:read`. Heads only (no definition)."
+      parameters: [{$ref: "#/components/parameters/TenantID"}]
+      responses:
+        "200":
+          description: The tenant's journeys
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  journeys: {type: array, items: {$ref: "#/components/schemas/Journey"}}
+        "403": {$ref: "#/components/responses/Forbidden"}
+    post:
+      tags: [Journeys]
+      summary: Create a journey (definition validated; version 1)
+      description: >-
+        Requires `journey:write`. Exactly one of `entry_segment_id` or
+        `entry_event_name` is required. Segment-entry journeys also backfill the entry
+        segment's current members.
+      parameters: [{$ref: "#/components/parameters/TenantID"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, definition]
+              properties:
+                name: {type: string}
+                description: {type: string}
+                entry_segment_id: {type: string, format: uuid}
+                entry_event_name: {type: string}
+                exit_on_segment_leave: {type: boolean}
+                max_enrollments: {type: integer, minimum: 1, description: "Omit / 0 defaults to 1 (once-only)."}
+                definition: {$ref: "#/components/schemas/JourneyDefinition"}
+      responses:
+        "201":
+          description: Created journey
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Journey"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /admin/v1/tenants/{tenantID}/journeys/{journeyID}:
+    get:
+      tags: [Journeys]
+      summary: Get a journey with its current definition
+      description: "Requires `journey:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/JourneyID"}
+      responses:
+        "200":
+          description: The journey
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Journey"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [Journeys]
+      summary: Edit a journey (creates a new version)
+      description: >-
+        Requires `journey:write`. Mints a new immutable version; in-flight enrollments
+        keep their pinned version. Entry mode is immutable.
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/JourneyID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [definition]
+              properties:
+                description: {type: string}
+                exit_on_segment_leave: {type: boolean}
+                max_enrollments: {type: integer, minimum: 1}
+                definition: {$ref: "#/components/schemas/JourneyDefinition"}
+      responses:
+        "200":
+          description: Updated journey
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Journey"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [Journeys]
+      summary: Archive a journey
+      description: >-
+        Requires `journey:write`. Stops new enrollments; in-flight enrollments drain to
+        completion. Any pending backfill seed job is dropped.
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/JourneyID"}
+      responses:
+        "204": {description: Archived}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /admin/v1/tenants/{tenantID}/journeys/{journeyID}/enrollments/parked:
+    get:
+      tags: [Journeys]
+      summary: List a journey's dead-lettered (parked) enrollments
+      description: "Requires `journey:read`."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/JourneyID"}
+      responses:
+        "200":
+          description: Parked enrollments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  parked: {type: array, items: {$ref: "#/components/schemas/ParkedEnrollment"}}
+
+  /admin/v1/tenants/{tenantID}/journeys/{journeyID}/enrollments/{profileID}/retry:
+    post:
+      tags: [Journeys]
+      summary: Retry a parked enrollment
+      description: "Requires `journey:write`. Clears the dead-letter and re-arms the enrollment for an immediate retry."
+      parameters:
+        - {$ref: "#/components/parameters/TenantID"}
+        - {$ref: "#/components/parameters/JourneyID"}
+        - {$ref: "#/components/parameters/ProfileID"}
+      responses:
+        "204": {description: Re-armed}
+        "404": {$ref: "#/components/responses/NotFound"}
+
   /admin/v1/tenants/{tenantID}/destinations:
     get:
       tags: [Destinations]
@@ -1042,6 +1179,16 @@ components:
       in: path
       required: true
       schema: {type: string, format: uuid}
+    JourneyID:
+      name: journeyID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    ProfileID:
+      name: profileID
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
     TokenID:
       name: tokenID
       in: path
@@ -1234,6 +1381,77 @@ components:
         rule: {$ref: "#/components/schemas/Rule"}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+
+    Journey:
+      type: object
+      description: >-
+        A journey enters a profile via exactly one mode (segment membership XOR event)
+        and advances it through a forward-DAG of steps.
+      properties:
+        id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        name: {type: string}
+        description: {type: string}
+        status: {type: string, enum: [draft, active, archived]}
+        entry_segment_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: "Set for segment-entry journeys (null for event-entry)."
+        entry_event_name:
+          type: string
+          nullable: true
+          description: "Set for event-entry journeys (null for segment-entry)."
+        exit_on_segment_leave:
+          type: boolean
+          description: "If true, leaving the entry segment terminates the active enrollment."
+        max_enrollments:
+          type: integer
+          minimum: 1
+          description: "1 = once-only; N>1 allows re-entry after a terminal enrollment, up to N total."
+        current_version: {type: integer}
+        definition: {$ref: "#/components/schemas/JourneyDefinition"}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    JourneyDefinition:
+      type: object
+      description: "Forward-only DAG of steps; branch targets are step indices (> the branching step, <= len; len = complete)."
+      properties:
+        steps: {type: array, items: {$ref: "#/components/schemas/JourneyStep"}}
+
+    JourneyStep:
+      type: object
+      description: "One node; exactly one shape per type."
+      required: [type]
+      properties:
+        type: {type: string, enum: [wait, send, condition, split]}
+        duration: {type: string, description: "wait: e.g. '7d', '24h', '30m'."}
+        destination_id: {type: string, format: uuid, description: "send: target destination."}
+        next: {type: integer, description: "wait/send: explicit forward target (0 = default, index+1)."}
+        condition: {$ref: "#/components/schemas/Rule"}
+        if_true: {type: integer, description: "condition: target when the rule matches."}
+        if_false: {type: integer, description: "condition: target when it does not."}
+        branches: {type: array, items: {$ref: "#/components/schemas/JourneySplitBranch"}}
+
+    JourneySplitBranch:
+      type: object
+      required: [weight, next]
+      properties:
+        weight: {type: integer, minimum: 1, description: "Relative selection weight."}
+        next: {type: integer, description: "Forward step index."}
+
+    ParkedEnrollment:
+      type: object
+      description: "A dead-lettered enrollment awaiting operator retry."
+      properties:
+        journey_id: {type: string, format: uuid}
+        customer_profile_id: {type: string, format: uuid}
+        current_step_index: {type: integer}
+        last_error: {type: string}
+        attempts: {type: integer}
+        due_at: {type: string, format: date-time}
+        parked_at: {type: string, format: date-time}
 
     Destination:
       type: object

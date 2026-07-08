@@ -43,6 +43,19 @@ type Metrics struct {
 	ActivationSkipped     prometheus.Counter
 	ActivationCircuitOpen prometheus.Counter
 
+	// Journey orchestration.
+	JourneyEnrolled            prometheus.Counter
+	JourneyExited              prometheus.Counter
+	JourneyRunnerClaimed       prometheus.Counter
+	JourneyRunnerAdvanced      prometheus.Counter
+	JourneyRunnerError         prometheus.Counter
+	JourneyRunnerParked        prometheus.Counter
+	JourneyRunnerLagSeconds    prometheus.Histogram
+	JourneyRunnerParkedBacklog prometheus.Gauge
+	JourneySeedPages           prometheus.Counter
+	JourneySeedJobsDone        prometheus.Counter
+	JourneyEnrollmentPruned    prometheus.Counter
+
 	// Ingress (cdp-api).
 	EventsReceived    prometheus.Counter
 	EventsValidated   prometheus.Counter
@@ -150,6 +163,42 @@ func New() *Metrics {
 		ActivationCircuitOpen: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "activation_circuit_open_total", Help: "Activation sends deferred by an open circuit breaker.",
 		}),
+		JourneyEnrolled: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "journey_enrolled_total", Help: "Profiles newly enrolled into a journey.",
+		}),
+		JourneyExited: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "journey_exited_total", Help: "Journey enrollments terminated on segment leave.",
+		}),
+		JourneyRunnerClaimed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "journey_runner_claimed_total", Help: "Enrollments claimed by the journey step runner.",
+		}),
+		JourneyRunnerAdvanced: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "journey_runner_advanced_total", Help: "Journey enrollment steps advanced by the runner.",
+		}),
+		JourneyRunnerError: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "journey_runner_error_total", Help: "Journey step advances that errored (backed off for retry).",
+		}),
+		JourneyRunnerParked: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "journey_runner_parked_total", Help: "Journey enrollments dead-lettered after exhausting retries.",
+		}),
+		JourneyRunnerLagSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "journey_runner_lag_seconds",
+			Help: "Seconds between an enrollment's due_at and when the runner claimed it.",
+			// 1s .. ~48 days, mirroring the segment sweeper (day-scale waits stay resolvable).
+			Buckets: prometheus.ExponentialBuckets(1, 4, 12),
+		}),
+		JourneyRunnerParkedBacklog: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "journey_runner_parked_backlog", Help: "Currently dead-lettered (parked) journey enrollments.",
+		}),
+		JourneySeedPages: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "journey_seed_pages_total", Help: "Population-backfill pages drained by the journey seed runner.",
+		}),
+		JourneySeedJobsDone: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "journey_seed_jobs_done_total", Help: "Journey population-backfill jobs fully drained.",
+		}),
+		JourneyEnrollmentPruned: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "journey_enrollment_pruned_total", Help: "Aged terminal journey_enrollment rows pruned by retention.",
+		}),
 		EventsReceived: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "events_received_total", Help: "Events received by ingress.",
 		}),
@@ -167,6 +216,9 @@ func New() *Metrics {
 		m.DLQTotal, m.KafkaPublishFailed, m.ProcessingLagSecond, m.IdentityResolved, m.IdentityMerge,
 		m.ProfileUpdated, m.SegmentEvaluated, m.SegmentMatched, m.StatefulEvaluated, m.StatefulMatched, m.MembershipPublished, m.MembershipPublishFail, m.SweepClaimed, m.SweepTransition, m.SweepError, m.SweepParked, m.SweepLagSeconds, m.PendingBacklog, m.PendingParked, m.BehaviorRetention, m.SchemaDrift, m.SeedPages, m.SeedJobsDone, m.ActivationSent, m.ActivationFailed,
 		m.ActivationSkipped, m.ActivationCircuitOpen,
+		m.JourneyEnrolled, m.JourneyExited, m.JourneyRunnerClaimed, m.JourneyRunnerAdvanced,
+		m.JourneyRunnerError, m.JourneyRunnerParked, m.JourneyRunnerLagSeconds, m.JourneyRunnerParkedBacklog,
+		m.JourneySeedPages, m.JourneySeedJobsDone, m.JourneyEnrollmentPruned,
 		m.EventsReceived, m.EventsValidated, m.EventsRejected, m.EventsRateLimited)
 	return m
 }

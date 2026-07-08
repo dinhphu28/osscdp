@@ -18,4 +18,11 @@ func TestOpenAPISpecIsValid(t *testing.T) {
 	if len(doc.Paths.Map()) == 0 {
 		t.Fatal("spec has no paths")
 	}
+	// The journey admin endpoints must be documented.
+	if doc.Paths.Find("/admin/v1/tenants/{tenantID}/journeys") == nil {
+		t.Fatal("spec is missing the journeys endpoints")
+	}
+	if _, ok := doc.Components.Schemas["Journey"]; !ok {
+		t.Fatal("spec is missing the Journey schema")
+	}
 }

@@ -1131,3 +1131,70 @@ func TestJourney_MergeWithReEntryRows(t *testing.T) {
 		tid, survivor.ID).Scan(&active))
 	require.Equal(t, 1, active, "exactly one active run after merge")
 }
+
+// TestJourney_BehavioralConditionCountInWindow drives a journey condition whose rule has
+// a BEHAVIORAL leaf (count of an event in a window) end-to-end at runtime, evaluated via
+// the real behavior.Store against seeded behavioral_event data. A profile above the
+// threshold takes the send arm; one below completes without a send.
+func TestJourney_BehavioralConditionCountInWindow(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+
+	// condition: count('order_completed') >= 2 in 7d. True arm sends; false arm (target
+	// == len(steps)) completes with no send.
+	rule := segment.Rule{Behavior: &segment.BehaviorSpec{
+		Kind: segment.BehaviorCount, EventName: "order_completed", Window: "7d", Op: segment.OpGte, Value: float64Ptr(2),
+	}}
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepCondition, Condition: &rule, IfTrue: 1, IfFalse: 2},
+		{Type: journey.StepSend, DestinationID: destID},
+	}}
+	require.NoError(t, journey.Validate(def))
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
+	require.NoError(t, err)
+
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time { return clk }
+	// A real behavior store so behavioral leaves actually evaluate (nil would be inert).
+	svc := newJourneySvcStore(f, nil, behavior.NewStore(f.pool), now)
+
+	// seedOrders inserts n 'order_completed' events (+ hourly buckets, which Count reads)
+	// for a profile, anchored inside [due_at-7d, due_at] where due_at == clk (enroll time).
+	seedOrders := func(profileID uuid.UUID, n int) {
+		for i := 0; i < n; i++ {
+			occ := clk.Add(-time.Duration(i+1) * time.Hour)
+			_, err := f.pool.Exec(ctx,
+				`INSERT INTO behavioral_event (tenant_id, customer_profile_id, event_id, event_name, occurred_at)
+				 VALUES ($1,$2,$3,'order_completed',$4)`,
+				tid, profileID, uuid.New().String(), occ)
+			require.NoError(t, err)
+			_, err = f.pool.Exec(ctx,
+				`INSERT INTO profile_behavior_bucket (tenant_id, customer_profile_id, event_name, bucket_start, count, first_at, last_at)
+				 VALUES ($1,$2,'order_completed', date_trunc('hour', $3::timestamptz), 1, $3, $3)
+				 ON CONFLICT (tenant_id, customer_profile_id, event_name, bucket_start)
+				 DO UPDATE SET count = profile_behavior_bucket.count + 1`,
+				tid, profileID, occ)
+			require.NoError(t, err)
+		}
+	}
+
+	puA := seedProfile(t, f, tid, sid, "eA", "product_viewed", "u1", `{"country":"VN"}`)
+	seedOrders(puA.CustomerProfileID, 2) // meets the >=2 threshold -> send arm
+	puB := seedProfile(t, f, tid, sid, "eB", "product_viewed", "u2", `{"country":"VN"}`)
+	seedOrders(puB.CustomerProfileID, 1) // below threshold -> no send
+
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, puA.CustomerProfileID, clk)))
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, puB.CustomerProfileID, clk)))
+	drainJourneyRunner(t, journey.NewRunner(svc, 50, 50, time.Minute, time.Second, testLogger()).WithClock(now))
+
+	// Only profile A (>=2 orders) took the send arm; both enrollments completed.
+	require.Equal(t, 1, taskCount(t, f, tid))
+	require.Equal(t, destID, taskDestForProfile(t, f, tid, puA.CustomerProfileID), "A (2 orders) sends")
+	_, sA := enrollmentState(t, f, tid, j.ID, puA.CustomerProfileID)
+	require.Equal(t, journey.EnrollmentCompleted, sA)
+	_, sB := enrollmentState(t, f, tid, j.ID, puB.CustomerProfileID)
+	require.Equal(t, journey.EnrollmentCompleted, sB)
+}
