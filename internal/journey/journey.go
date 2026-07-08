@@ -74,14 +74,17 @@ type Definition struct {
 	Steps []Step `json:"steps"`
 }
 
-// Journey is a journey definition head (identity + active version pointer).
+// Journey is a journey definition head (identity + active version pointer). A journey
+// has exactly ONE entry mode: EntrySegmentID (enter on segment membership) XOR
+// EntryEventName (enter when the profile emits that event).
 type Journey struct {
-	ID             uuid.UUID `json:"id"`
-	TenantID       uuid.UUID `json:"tenant_id"`
-	Name           string    `json:"name"`
-	Description    string    `json:"description"`
-	Status         string    `json:"status"`
-	EntrySegmentID uuid.UUID `json:"entry_segment_id"`
+	ID             uuid.UUID  `json:"id"`
+	TenantID       uuid.UUID  `json:"tenant_id"`
+	Name           string     `json:"name"`
+	Description    string     `json:"description"`
+	Status         string     `json:"status"`
+	EntrySegmentID *uuid.UUID `json:"entry_segment_id,omitempty"`
+	EntryEventName string     `json:"entry_event_name,omitempty"`
 	// ExitOnSegmentLeave terminates a profile's active enrollment when it leaves the
 	// entry segment (Phase 2). Default false = run to completion.
 	ExitOnSegmentLeave bool       `json:"exit_on_segment_leave"`
@@ -89,6 +92,21 @@ type Journey struct {
 	Definition         Definition `json:"definition"` // populated on Get (the current version)
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
+}
+
+// JourneySeedJob is a durable, resumable population-backfill request the seed runner
+// drains: it pages the entry segment's active members and enrolls each. ClaimedAt is
+// the fence captured at claim (see segment.SeedJob); EntrySegmentID + JourneyVersion
+// are snapshotted at enqueue so the drain is self-contained.
+type JourneySeedJob struct {
+	TenantID       uuid.UUID
+	JourneyID      uuid.UUID
+	EntrySegmentID uuid.UUID
+	JourneyVersion int
+	Reason         string
+	DueAt          time.Time
+	Cursor         uuid.UUID
+	ClaimedAt      time.Time
 }
 
 // Enrollment is a claimed per-profile state row the runner must advance.

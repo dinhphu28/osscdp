@@ -25,6 +25,7 @@ type createRequest struct {
 	Name               string     `json:"name"`
 	Description        string     `json:"description"`
 	EntrySegmentID     uuid.UUID  `json:"entry_segment_id"`
+	EntryEventName     string     `json:"entry_event_name"`
 	ExitOnSegmentLeave bool       `json:"exit_on_segment_leave"`
 	Definition         Definition `json:"definition"`
 }
@@ -62,15 +63,24 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		apierror.BadRequest(w, "name is required")
 		return
 	}
-	if req.EntrySegmentID == uuid.Nil {
-		apierror.BadRequest(w, "entry_segment_id is required")
+	// Exactly one entry mode: segment membership XOR event name.
+	hasSegment := req.EntrySegmentID != uuid.Nil
+	hasEvent := req.EntryEventName != ""
+	if hasSegment == hasEvent {
+		apierror.BadRequest(w, "exactly one of entry_segment_id or entry_event_name is required")
 		return
 	}
 	if err := Validate(req.Definition); err != nil {
 		apierror.BadRequest(w, "invalid definition: "+err.Error())
 		return
 	}
-	j, err := h.repo.CreateJourney(r.Context(), tenantID, req.Name, req.Description, req.EntrySegmentID, req.ExitOnSegmentLeave, req.Definition)
+	var j Journey
+	var err error
+	if hasSegment {
+		j, err = h.repo.CreateJourney(r.Context(), tenantID, req.Name, req.Description, req.EntrySegmentID, req.ExitOnSegmentLeave, req.Definition)
+	} else {
+		j, err = h.repo.CreateEventJourney(r.Context(), tenantID, req.Name, req.Description, req.EntryEventName, req.ExitOnSegmentLeave, req.Definition)
+	}
 	if errors.Is(err, ErrDuplicateName) {
 		apierror.Conflict(w, "journey name already exists for tenant")
 		return

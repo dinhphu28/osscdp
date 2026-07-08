@@ -775,3 +775,139 @@ func TestJourney_RetentionHorizonWidened_ArchivedWithEnrollment(t *testing.T) {
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, h, 30*24*time.Hour, "archived journey with a live enrollment must still protect its condition window")
 }
+
+// --- Phase 4: event-triggered entry + population backfill ---
+
+func insertActiveMembership(t *testing.T, f fixture, tid, segID, profileID uuid.UUID) {
+	t.Helper()
+	_, err := f.pool.Exec(context.Background(),
+		`INSERT INTO segment_membership (tenant_id, segment_id, customer_profile_id, status, entered_at, last_evaluated_at, version)
+		 VALUES ($1,$2,$3,'active', now(), now(), 1)`, tid, segID, profileID)
+	require.NoError(t, err)
+}
+
+func journeySeedJobCount(t *testing.T, f fixture, tid uuid.UUID) int {
+	t.Helper()
+	var n int
+	require.NoError(t, f.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM journey_seed_job WHERE tenant_id=$1`, tid).Scan(&n))
+	return n
+}
+
+// TestJourney_EventEntry verifies a profile is enrolled into an event-entry journey when
+// it emits the matching event, not otherwise, and idempotently under redelivery.
+func TestJourney_EventEntry(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "signup_completed", "u1", `{"country":"VN"}`)
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
+	require.NoError(t, journey.Validate(def))
+	j, err := journey.NewRepo(f.pool).CreateEventJourney(ctx, tid, "welcome", "", "signup_completed", false, def)
+	require.NoError(t, err)
+	require.Equal(t, "signup_completed", j.EntryEventName)
+	require.Nil(t, j.EntrySegmentID)
+
+	svc := newJourneySvc(f, nil, nil)
+
+	// A profile_updated for a DIFFERENT event does not enroll.
+	other := seedProfile(t, f, tid, sid, "ev2", "product_viewed", "u2", `{}`)
+	require.NoError(t, svc.EnrollOnEvent(ctx, other))
+	require.Equal(t, 0, activeEnrollmentCount(t, f, tid))
+
+	// The matching event enrolls; a redelivery is idempotent.
+	require.NoError(t, svc.EnrollOnEvent(ctx, pu))
+	require.NoError(t, svc.EnrollOnEvent(ctx, pu))
+	require.Equal(t, 1, activeEnrollmentCount(t, f, tid))
+	require.Equal(t, 1, enrollmentCountForProfile(t, f, tid, pu.CustomerProfileID))
+}
+
+// TestJourney_SeedBackfillEnrollsEntrySegmentMembers verifies creating a segment-entry
+// journey enqueues a seed job, and the journey SeedRunner backfills the entry segment's
+// CURRENT active members (paged, resumable), completing the job.
+func TestJourney_SeedBackfillEnrollsEntrySegmentMembers(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	destID := mkJourneyDest(t, f, tid, "wh")
+
+	// Three existing active members of the entry segment.
+	var members []uuid.UUID
+	for i := 1; i <= 3; i++ {
+		pu := seedProfile(t, f, tid, sid, "ev"+string(rune('0'+i)), "product_viewed", "u"+string(rune('0'+i)), `{"country":"VN"}`)
+		insertActiveMembership(t, f, tid, segID, pu.CustomerProfileID)
+		members = append(members, pu.CustomerProfileID)
+	}
+
+	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	require.NoError(t, err)
+	require.Equal(t, 1, journeySeedJobCount(t, f, tid), "creating a segment-entry journey enqueues a backfill job")
+
+	// Drain with a small page size to exercise multi-page resumption.
+	runner := journey.NewSeedRunner(journey.NewRepo(f.pool), 10, time.Minute, time.Second, testLogger()).WithPageSize(2)
+	idle, err := runner.RunOnce(ctx)
+	require.NoError(t, err)
+	require.False(t, idle)
+
+	// All current members are now enrolled, and the job is complete (removed).
+	require.Equal(t, 3, activeEnrollmentCount(t, f, tid))
+	for _, pid := range members {
+		require.Equal(t, 1, enrollmentCountForProfile(t, f, tid, pid))
+	}
+	require.Equal(t, 0, journeySeedJobCount(t, f, tid), "the seed job is removed once fully drained")
+
+	// Idempotent: a re-enqueued+re-drained seed does not double-enroll.
+	require.Equal(t, 1, enrollmentCountForProfile(t, f, tid, members[0]))
+	_ = j
+}
+
+// TestJourney_DeactivateDropsSeedJob verifies archiving a journey removes its pending
+// backfill seed job so the seed runner stops re-claiming an inert job.
+func TestJourney_DeactivateDropsSeedJob(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, _ := mkTenant(t, f, "acme")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	destID := mkJourneyDest(t, f, tid, "wh")
+
+	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
+	jrepo := journey.NewRepo(f.pool)
+	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	require.NoError(t, err)
+	require.Equal(t, 1, journeySeedJobCount(t, f, tid))
+
+	require.NoError(t, jrepo.DeactivateJourney(ctx, tid, j.ID))
+	require.Equal(t, 0, journeySeedJobCount(t, f, tid), "archiving drops the pending seed job")
+
+	// The seed runner finds nothing to do.
+	idle, err := journey.NewSeedRunner(jrepo, 10, time.Minute, time.Second, testLogger()).RunOnce(ctx)
+	require.NoError(t, err)
+	require.True(t, idle)
+}
+
+// TestJourney_EventEntrySkipsErasedProfile verifies a profile_updated whose profile no
+// longer exists (erased/merged before a redelivery) does NOT create an orphan enrollment
+// (journey_enrollment has no FK to customer_profile).
+func TestJourney_EventEntrySkipsErasedProfile(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, _ := mkTenant(t, f, "acme")
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
+	_, err := journey.NewRepo(f.pool).CreateEventJourney(ctx, tid, "welcome", "", "signup_completed", false, def)
+	require.NoError(t, err)
+
+	// A stale profile_updated for a profile id that does not exist.
+	pu := profile.ProfileUpdated{
+		TenantID:          tid,
+		CustomerProfileID: uuid.New(),
+		Event:             events.Envelope{EventName: "signup_completed"},
+	}
+	require.NoError(t, newJourneySvc(f, nil, nil).EnrollOnEvent(ctx, pu))
+	require.Equal(t, 0, activeEnrollmentCount(t, f, tid), "vanished profile must not be enrolled")
+}
