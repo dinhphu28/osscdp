@@ -198,7 +198,7 @@ func run() error {
 	// that segment; a step sweeper (segment.Runner clone) advances each enrollment
 	// through its wait/send steps, sending via the activation stack. Reuses the segment
 	// sweep tuning knobs.
-	journeySvc := journey.NewService(pool, profile.NewRepo(pool), activationSvc)
+	journeySvc := journey.NewService(pool, profile.NewRepo(pool), activationSvc, behaviorStore)
 	journeyEnrollConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-journey", []string{bus.TopicSegmentMembershipChanged}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err

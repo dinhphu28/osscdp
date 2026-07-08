@@ -72,14 +72,30 @@ func (r *Retention) Run(ctx context.Context) {
 	}
 }
 
-// effectiveHorizon = max(configured horizon, longest active window + margin), so
-// retention never prunes data an active rule's window still reads.
-func (r *Retention) effectiveHorizon(ctx context.Context) (time.Duration, error) {
+// EffectiveHorizon = max(configured horizon, longest live window + margin), so
+// retention never prunes data a window still reads. Live windows come from BOTH active
+// segments' current versions AND journey_versions that could still evaluate a
+// behavioral condition — i.e. any journey_version pinned by a live enrollment, plus the
+// current version of an active journey (a new enrollment can pin it at any moment).
+// Omitting the journey side would let a long-wait-then-behavioral-condition journey
+// evaluate over already-DROP-partitioned data.
+func (r *Retention) EffectiveHorizon(ctx context.Context) (time.Duration, error) {
 	var maxWin *int64
 	err := r.pool.QueryRow(ctx, `
-		SELECT max(v.max_window_seconds)
-		FROM segment s JOIN segment_version v ON v.id = s.current_version_id
-		WHERE s.status = 'active'`).Scan(&maxWin)
+		SELECT max(w) FROM (
+			SELECT v.max_window_seconds AS w
+			FROM segment s JOIN segment_version v ON v.id = s.current_version_id
+			WHERE s.status = 'active'
+			UNION ALL
+			SELECT v.max_window_seconds AS w
+			FROM journey_version v
+			WHERE EXISTS (SELECT 1 FROM journey_enrollment e
+			              WHERE e.tenant_id = v.tenant_id AND e.journey_id = v.journey_id
+			                AND e.journey_version = v.version AND e.status = 'active')
+			   OR EXISTS (SELECT 1 FROM journey j
+			              WHERE j.tenant_id = v.tenant_id AND j.id = v.journey_id
+			                AND j.status = 'active' AND j.current_version = v.version)
+		) t`).Scan(&maxWin)
 	if err != nil {
 		return r.horizon, fmt.Errorf("max window: %w", err)
 	}
@@ -110,7 +126,7 @@ func (r *Retention) PruneOnce(ctx context.Context, now time.Time) (int, error) {
 	}
 	defer func() { _, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, retentionLockKey) }()
 
-	horizon, err := r.effectiveHorizon(ctx)
+	horizon, err := r.EffectiveHorizon(ctx)
 	if err != nil {
 		return 0, err
 	}

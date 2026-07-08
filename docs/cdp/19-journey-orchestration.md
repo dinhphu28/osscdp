@@ -1,6 +1,6 @@
 # 19 — Journey Orchestration
 
-Status: **Phases 1–2 implemented.** Later phases are designed but not built.
+Status: **Phases 1–3 implemented.** Later phases are designed but not built.
 
 A **journey** is a versioned, ordered flow a customer profile *enters* (via segment
 membership) and *advances* through with per-profile state. Phase 1 ships a linear
@@ -109,18 +109,44 @@ Two correctness properties enforce exit safety:
 - **Retention** — `journey_enrollment` is small and non-partitioned (not on the
   `behavioral_event` DROP-PARTITION path). A terminal-row sweep is Phase 5.
 
+## Branching (Phase 3)
+
+The definition becomes a forward DAG over the (still index-addressed) step array:
+
+- **condition** — embeds a `segment.Rule`, evaluated by `segment.Evaluate` +
+  `behavior.Store` against the profile with no triggering event (`at=now`), routing to
+  `if_true` / `if_false` target indices.
+- **split** — a weighted branch; `splitTarget` hashes a **stable** key
+  (`tenant|journey|profile|enrollment_seq|step_index`, sha256) so at-least-once
+  redelivery / reclaim always routes to the same branch.
+- **`next`** — wait/send steps take an optional explicit forward target (default
+  `index+1`), so two branch arms stay disjoint (each arm jumps past the other).
+
+Branch targets are **forward-only** (strictly greater than the branching step's index,
+`≤ len(steps)`; a target `== len` completes). Forward-only makes every definition an
+acyclic DAG that terminates in `≤ len(steps)` advances — no cycle guard needed. Each
+step commits exactly one claim-fenced `Advance`; condition/split are side-effect-free
+routing that commit their decision atomically **before** any downstream send, so a
+pre-commit re-route on current state can never double-send.
+
+**Version metadata + retention (same phase).** `journey_version` gains
+`referenced_event_names` + `max_window_seconds`, derived at create/update from every
+condition rule via the new exported `segment.AnalyzeRule` (mirrors `segment_version`,
+migration `00023`). `behavior.Retention.EffectiveHorizon` now `UNION`s the journey
+windows of any `journey_version` pinned by a live enrollment or the current version of
+an active journey — so a long-wait-then-behavioral-condition journey never evaluates
+over DROP-partitioned `behavioral_event` data.
+
 ## Phase roadmap
 
 1. **(done)** Linear segment-entry `wait → send`; erasure + merge hooks + parked
    admin + runner metrics.
 2. **(done)** Exit-on-segment-leave (`exited` change) + once-only re-entry guard +
-   exit-wins-in-flight advance guard. (A conditional "goal step" — exit early on
-   conversion — is folded into Phase 3, where condition evaluation lands; a stop step in
-   a purely linear flow is just the last step.)
-3. Branching: `condition` (embeds `segment.Rule`, evaluated via `segment.Evaluate` +
-   `behavior.Store`) + weighted `split`. **Same phase** widens `behavior.Retention`'s
-   horizon to `UNION` `journey_version.max_window_seconds`, so a wait-then-condition
-   journey never reads pruned behavioral data.
+   exit-wins-in-flight advance guard.
+3. **(done)** Branching: `condition` (embeds `segment.Rule`) + weighted `split` +
+   forward-DAG `next` targets; `journey_version` metadata + behavioral retention-horizon
+   widening. (The conditional "goal step" — exit early on conversion — is expressible as
+   a condition whose matching arm targets `len(steps)`.)
 4. Event entry (`TopicProfileUpdated` on an entry event) + `journey_seed_job` backfill
    (a `segment_seed_job`/`SeedRunner` clone) to enroll the already-qualified population.
 5. Lifecycle polish: re-entry (`enrollment_seq` allocation) + per-journey caps + terminal

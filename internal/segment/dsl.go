@@ -41,6 +41,25 @@ func analyzeRule(r Rule) (isStateful, hasStateless bool, events []string, maxWin
 	return
 }
 
+// RuleAnalysis is the exported result of analyzing a rule (see AnalyzeRule). It lets
+// other packages (e.g. journey, which embeds segment.Rule in condition steps) derive
+// the same referenced-event / max-window metadata the segmentation engine uses.
+type RuleAnalysis struct {
+	IsStateful      bool
+	HasStateless    bool
+	ReferencedNames []string
+	MaxWindow       time.Duration
+}
+
+// AnalyzeRule is the exported wrapper over analyzeRule: it returns the referenced
+// event names and largest window across a rule's behavioral leaves. Used by the
+// journey package to populate journey_version metadata and widen the behavioral
+// retention horizon for journey conditions.
+func AnalyzeRule(r Rule) RuleAnalysis {
+	isStateful, hasStateless, events, maxWindow := analyzeRule(r)
+	return RuleAnalysis{IsStateful: isStateful, HasStateless: hasStateless, ReferencedNames: events, MaxWindow: maxWindow}
+}
+
 func collectBehaviorMeta(b *BehaviorSpec, seen map[string]bool, maxWindow *time.Duration) {
 	if b.EventName != "" {
 		seen[b.EventName] = true
