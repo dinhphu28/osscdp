@@ -199,6 +199,8 @@ func run() error {
 	// through its wait/send steps, sending via the activation stack. Reuses the segment
 	// sweep tuning knobs.
 	journeySvc := journey.NewService(pool, profile.NewRepo(pool), activationSvc, behaviorStore)
+	journeySvc.OnEnrolled = m.JourneyEnrolled.Inc
+	journeySvc.OnExited = m.JourneyExited.Inc
 	journeyEnrollConsumer, err := bus.NewConsumer(cfg.KafkaBrokers, cfg.KafkaConsumerGroup+"-journey", []string{bus.TopicSegmentMembershipChanged}, cfg.MaxRetries, logger)
 	if err != nil {
 		return err
@@ -208,6 +210,12 @@ func run() error {
 	journeyRunner := journey.NewRunner(journeySvc, cfg.SegmentSweepBatchSize, cfg.SegmentSweepPerTenantCap,
 		cfg.SegmentSweepReclaimTimeout, cfg.SegmentSweepInterval, logger).
 		WithParkPolicy(cfg.SegmentSweepBackoffBase, cfg.SegmentSweepBackoffCap, cfg.SegmentSweepMaxAttempts)
+	journeyRunner.OnClaimed = m.JourneyRunnerClaimed.Inc
+	journeyRunner.OnAdvanced = m.JourneyRunnerAdvanced.Inc
+	journeyRunner.OnError = m.JourneyRunnerError.Inc
+	journeyRunner.OnSweepLag = m.JourneyRunnerLagSeconds.Observe
+	journeyRunner.OnParked = m.JourneyRunnerParked.Inc
+	journeyRunner.OnParkedBacklog = func(n int) { m.JourneyRunnerParkedBacklog.Set(float64(n)) }
 
 	// Phase 4: event-triggered entry rides the existing profile_updated stream — a
 	// dedicated consumer group enrolls a profile into journeys whose entry_event_name
@@ -219,12 +227,12 @@ func run() error {
 	}
 	journeyEventConsumer.OnRetry = m.ProcessingRetries.Inc
 	journeyEventHandler := makeJourneyEventHandler(journeySvc)
-	// Metric hooks are intentionally left unset: m.SeedPages/m.SeedJobsDone are the
-	// segment seed metrics; wiring them here would conflate segment and journey backfill
-	// counts. Dedicated journey-seed metrics are a fast follow.
 	journeySeedRunner := journey.NewSeedRunner(journeySvc.Repo(), cfg.SeedJobPagesPerClaim, cfg.SeedJobReclaimTimeout, cfg.SeedJobInterval, logger)
+	journeySeedRunner.OnSeededPage = m.JourneySeedPages.Inc
+	journeySeedRunner.OnJobDone = m.JourneySeedJobsDone.Inc
 	// Phase 5: prune aged terminal (completed/exited) enrollments so the table is bounded.
 	journeyRetention := journey.NewRetentionSweeper(journeySvc.Repo(), cfg.JourneyEnrollmentRetention, cfg.JourneyRetentionInterval, logger)
+	journeyRetention.OnPruned = func(n int) { m.JourneyEnrollmentPruned.Add(float64(n)) }
 
 	metricsSrv := &http.Server{
 		Addr:              cfg.MetricsAddr,
