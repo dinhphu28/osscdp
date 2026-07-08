@@ -44,6 +44,11 @@ type Config struct {
 	SeedJobPagesPerClaim  int
 	SeedJobReclaimTimeout time.Duration
 
+	// JourneyEnrollmentRetention prunes terminal (completed/exited) journey_enrollment
+	// rows older than this; JourneyRetentionInterval is the sweep cadence.
+	JourneyEnrollmentRetention time.Duration
+	JourneyRetentionInterval   time.Duration
+
 	RateLimitRPS     float64
 	RateLimitBurst   int
 	CircuitThreshold int
@@ -90,6 +95,9 @@ func Load() (Config, error) {
 		SeedJobInterval:       getEnvDuration("SEED_JOB_INTERVAL", 5*time.Second),
 		SeedJobPagesPerClaim:  getEnvInt("SEED_JOB_PAGES_PER_CLAIM", 10),
 		SeedJobReclaimTimeout: getEnvDuration("SEED_JOB_RECLAIM_TIMEOUT", time.Minute),
+
+		JourneyEnrollmentRetention: getEnvDuration("JOURNEY_ENROLLMENT_RETENTION", 90*24*time.Hour),
+		JourneyRetentionInterval:   getEnvDuration("JOURNEY_RETENTION_INTERVAL", 6*time.Hour),
 
 		RateLimitRPS:       getEnvFloat("RATE_LIMIT_RPS", 50),
 		RateLimitBurst:     getEnvInt("RATE_LIMIT_BURST", 100),

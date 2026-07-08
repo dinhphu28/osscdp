@@ -2,6 +2,7 @@ package foundationtest
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -141,7 +142,7 @@ func TestJourney_LinearWaitThenSend(t *testing.T) {
 		{Type: journey.StepSend, DestinationID: destID},
 	}}
 	require.NoError(t, journey.Validate(def))
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
@@ -202,7 +203,7 @@ func TestJourney_ConsentDeniedSkipsSend(t *testing.T) {
 
 	segID := mkEntrySegment(t, f, tid, "vn")
 	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
@@ -237,7 +238,7 @@ func TestJourney_StaleRunnerNoDoubleAdvance(t *testing.T) {
 		{Type: journey.StepWait, Duration: "1h"},
 		{Type: journey.StepSend, DestinationID: destID},
 	}}
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	repo := journey.NewRepo(f.pool)
@@ -275,7 +276,7 @@ func TestJourney_ErasureRemovesEnrollment(t *testing.T) {
 	destID := mkJourneyDest(t, f, tid, "wh")
 	segID := mkEntrySegment(t, f, tid, "vn")
 	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
-	_, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	_, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	clk := time.Now().UTC()
@@ -302,7 +303,7 @@ func TestJourney_VersionPinning(t *testing.T) {
 	destV2 := mkJourneyDest(t, f, tid, "wh-v2")
 	segID := mkEntrySegment(t, f, tid, "vn")
 	jrepo := journey.NewRepo(f.pool)
-	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, journey.Definition{Steps: []journey.Step{
+	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, 1, journey.Definition{Steps: []journey.Step{
 		{Type: journey.StepWait, Duration: "1h"},
 		{Type: journey.StepSend, DestinationID: destV1},
 	}})
@@ -314,7 +315,7 @@ func TestJourney_VersionPinning(t *testing.T) {
 	require.NoError(t, svc.EnrollOnMembership(ctx, enteredMC(tid, segID, pid, clk)))
 
 	// Re-author the journey to send to a DIFFERENT destination (mints version 2).
-	_, err = jrepo.UpdateJourney(ctx, tid, j.ID, "", false, journey.Definition{Steps: []journey.Step{
+	_, err = jrepo.UpdateJourney(ctx, tid, j.ID, "", false, 1, journey.Definition{Steps: []journey.Step{
 		{Type: journey.StepWait, Duration: "1h"},
 		{Type: journey.StepSend, DestinationID: destV2},
 	}})
@@ -344,7 +345,7 @@ func TestJourney_MergeMovesEnrollmentAtomically(t *testing.T) {
 
 	destID := mkJourneyDest(t, f, tid, "wh")
 	segID := mkEntrySegment(t, f, tid, "vn")
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false,
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1,
 		journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}})
 	require.NoError(t, err)
 
@@ -361,7 +362,7 @@ func TestJourney_MergeMovesEnrollmentAtomically(t *testing.T) {
 	require.NoError(t, err)
 
 	// Enroll the (soon-to-be) loser profile directly into the journey.
-	created, err := journey.NewRepo(f.pool).Enroll(ctx, tid, j.ID, loser.ID, j.CurrentVersion, base.Add(time.Hour))
+	created, err := journey.NewRepo(f.pool).Enroll(ctx, tid, j.ID, loser.ID, j.CurrentVersion, 1, base.Add(time.Hour))
 	require.NoError(t, err)
 	require.True(t, created)
 
@@ -396,7 +397,7 @@ func TestJourney_ExitOnSegmentLeave(t *testing.T) {
 		{Type: journey.StepSend, DestinationID: destID},
 	}}
 	// exit_on_segment_leave = true.
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, true, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, true, 1, def)
 	require.NoError(t, err)
 	require.True(t, j.ExitOnSegmentLeave)
 
@@ -437,7 +438,7 @@ func TestJourney_NoExitWhenFlagOff(t *testing.T) {
 	destID := mkJourneyDest(t, f, tid, "wh")
 	segID := mkEntrySegment(t, f, tid, "vn")
 	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
@@ -469,7 +470,7 @@ func TestJourney_OnceOnlyReEntryAfterTerminal(t *testing.T) {
 	destID := mkJourneyDest(t, f, tid, "wh")
 	segID := mkEntrySegment(t, f, tid, "vn")
 	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
@@ -504,7 +505,7 @@ func TestJourney_ExitWinsRaceWithAdvance(t *testing.T) {
 		{Type: journey.StepWait, Duration: "1h"},
 		{Type: journey.StepSend, DestinationID: destID},
 	}}
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, true, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, true, 1, def)
 	require.NoError(t, err)
 
 	repo := journey.NewRepo(f.pool)
@@ -547,7 +548,7 @@ func TestJourney_FailDoesNotParkExited(t *testing.T) {
 		{Type: journey.StepWait, Duration: "1h"},
 		{Type: journey.StepSend, DestinationID: destID},
 	}}
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, true, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, true, 1, def)
 	require.NoError(t, err)
 
 	repo := journey.NewRepo(f.pool)
@@ -593,7 +594,7 @@ func TestJourney_ArchivedJourneyNotExitedOnLeave(t *testing.T) {
 		{Type: journey.StepSend, DestinationID: destID},
 	}}
 	jrepo := journey.NewRepo(f.pool)
-	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, true, def)
+	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, true, 1, def)
 	require.NoError(t, err)
 
 	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
@@ -631,7 +632,7 @@ func TestJourney_ConditionRoutes(t *testing.T) {
 		{Type: journey.StepSend, DestinationID: destB},          // false arm -> 3 (complete)
 	}}
 	require.NoError(t, journey.Validate(def))
-	_, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	_, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
@@ -663,7 +664,7 @@ func TestJourney_ConditionalSkipCompletes(t *testing.T) {
 		{Type: journey.StepSend, DestinationID: destA},
 	}}
 	require.NoError(t, journey.Validate(def))
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
@@ -695,7 +696,7 @@ func TestJourney_VersionMetadataFromCondition(t *testing.T) {
 		{Type: journey.StepSend, DestinationID: destA},
 	}}
 	require.NoError(t, journey.Validate(def))
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	var maxWin int64
@@ -729,7 +730,7 @@ func TestJourney_RetentionHorizonWidened(t *testing.T) {
 		{Type: journey.StepSend, DestinationID: destA, Next: 3},
 		{Type: journey.StepSend, DestinationID: destA},
 	}}
-	_, err = journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	_, err = journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	widened, err := ret.EffectiveHorizon(ctx)
@@ -759,11 +760,11 @@ func TestJourney_RetentionHorizonWidened_ArchivedWithEnrollment(t *testing.T) {
 		{Type: journey.StepSend, DestinationID: destA},
 	}}
 	jrepo := journey.NewRepo(f.pool)
-	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 
 	// Enroll a profile (pins version 1), then ARCHIVE the journey.
-	created, err := jrepo.Enroll(ctx, tid, j.ID, pu.CustomerProfileID, j.CurrentVersion, time.Now().UTC())
+	created, err := jrepo.Enroll(ctx, tid, j.ID, pu.CustomerProfileID, j.CurrentVersion, 1, time.Now().UTC())
 	require.NoError(t, err)
 	require.True(t, created)
 	require.NoError(t, jrepo.DeactivateJourney(ctx, tid, j.ID))
@@ -805,7 +806,7 @@ func TestJourney_EventEntry(t *testing.T) {
 	destID := mkJourneyDest(t, f, tid, "wh")
 	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
 	require.NoError(t, journey.Validate(def))
-	j, err := journey.NewRepo(f.pool).CreateEventJourney(ctx, tid, "welcome", "", "signup_completed", false, def)
+	j, err := journey.NewRepo(f.pool).CreateEventJourney(ctx, tid, "welcome", "", "signup_completed", false, 1, def)
 	require.NoError(t, err)
 	require.Equal(t, "signup_completed", j.EntryEventName)
 	require.Nil(t, j.EntrySegmentID)
@@ -843,7 +844,7 @@ func TestJourney_SeedBackfillEnrollsEntrySegmentMembers(t *testing.T) {
 	}
 
 	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
-	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 	require.Equal(t, 1, journeySeedJobCount(t, f, tid), "creating a segment-entry journey enqueues a backfill job")
 
@@ -876,7 +877,7 @@ func TestJourney_DeactivateDropsSeedJob(t *testing.T) {
 
 	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
 	jrepo := journey.NewRepo(f.pool)
-	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
 	require.NoError(t, err)
 	require.Equal(t, 1, journeySeedJobCount(t, f, tid))
 
@@ -899,7 +900,7 @@ func TestJourney_EventEntrySkipsErasedProfile(t *testing.T) {
 
 	destID := mkJourneyDest(t, f, tid, "wh")
 	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
-	_, err := journey.NewRepo(f.pool).CreateEventJourney(ctx, tid, "welcome", "", "signup_completed", false, def)
+	_, err := journey.NewRepo(f.pool).CreateEventJourney(ctx, tid, "welcome", "", "signup_completed", false, 1, def)
 	require.NoError(t, err)
 
 	// A stale profile_updated for a profile id that does not exist.
@@ -910,4 +911,223 @@ func TestJourney_EventEntrySkipsErasedProfile(t *testing.T) {
 	}
 	require.NoError(t, newJourneySvc(f, nil, nil).EnrollOnEvent(ctx, pu))
 	require.Equal(t, 0, activeEnrollmentCount(t, f, tid), "vanished profile must not be enrolled")
+}
+
+// --- Phase 5: re-entry (max_enrollments) + terminal-row retention ---
+
+// TestJourney_ReEntryAfterTerminal verifies max_enrollments>1 lets a profile re-enter
+// after a terminal enrollment (a fresh enrollment_seq per run), capped at the max.
+func TestJourney_ReEntryAfterTerminal(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	pid := pu.CustomerProfileID
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
+	// max_enrollments = 2: at most two runs per profile.
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 2, def)
+	require.NoError(t, err)
+
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time { return clk }
+	svc := newJourneySvc(f, nil, now)
+	runner := journey.NewRunner(svc, 50, 50, time.Minute, time.Second, testLogger()).WithClock(now)
+
+	// Run 1: enter -> send -> complete.
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+	require.Equal(t, 1, activeEnrollmentCount(t, f, tid))
+	drainJourneyRunner(t, runner)
+	require.Equal(t, 0, activeEnrollmentCount(t, f, tid))
+	require.Equal(t, 1, taskCount(t, f, tid))
+
+	// Re-enter (a new run, seq 1) after the terminal one.
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+	require.Equal(t, 1, activeEnrollmentCount(t, f, tid))
+	require.Equal(t, 2, enrollmentCountForProfile(t, f, tid, pid), "two total runs")
+	drainJourneyRunner(t, runner)
+	require.Equal(t, 2, taskCount(t, f, tid))
+
+	// Third entry is blocked by the cap (2 total already).
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+	require.Equal(t, 0, activeEnrollmentCount(t, f, tid))
+	require.Equal(t, 2, enrollmentCountForProfile(t, f, tid, pid), "capped at max_enrollments=2")
+	_ = j
+}
+
+// TestJourney_ReEntryBlockedWhileActive verifies re-entry is a no-op while an active
+// enrollment exists (never two active runs at once).
+func TestJourney_ReEntryBlockedWhileActive(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	pid := pu.CustomerProfileID
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepWait, Duration: "1h"},
+		{Type: journey.StepSend, DestinationID: destID},
+	}}
+	_, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 5, def)
+	require.NoError(t, err)
+
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	svc := newJourneySvc(f, nil, func() time.Time { return clk })
+
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+	// A second entry while still active (mid-wait) does not create a parallel run.
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+	require.Equal(t, 1, activeEnrollmentCount(t, f, tid))
+	require.Equal(t, 1, enrollmentCountForProfile(t, f, tid, pid))
+}
+
+// TestJourney_RetentionPrunesTerminal verifies the retention sweeper deletes only
+// terminal (completed/exited) enrollments older than the retention age.
+func TestJourney_RetentionPrunesTerminal(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, _ := mkTenant(t, f, "acme")
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
+	jrepo := journey.NewRepo(f.pool)
+	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, 1, def)
+	require.NoError(t, err)
+
+	now := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-100 * 24 * time.Hour) // well past a 24h retention
+	mkEnrollment := func(status string, updatedAt time.Time) uuid.UUID {
+		pid := uuid.New()
+		_, err := f.pool.Exec(ctx, `
+			INSERT INTO journey_enrollment
+				(tenant_id, journey_id, customer_profile_id, enrollment_seq, journey_version, status, current_step_index, step_seq, due_at, updated_at)
+			VALUES ($1,$2,$3,0,1,$4,0,0,$5,$6)`,
+			tid, j.ID, pid, status, now, updatedAt)
+		require.NoError(t, err)
+		return pid
+	}
+	agedDone := mkEnrollment(journey.EnrollmentCompleted, old)   // pruned
+	agedExited := mkEnrollment(journey.EnrollmentExited, old)    // pruned
+	recentDone := mkEnrollment(journey.EnrollmentCompleted, now) // within retention: kept
+	agedActive := mkEnrollment(journey.EnrollmentActive, old)    // active: never pruned
+
+	sweeper := journey.NewRetentionSweeper(jrepo, 24*time.Hour, time.Hour, testLogger()).
+		WithClock(func() time.Time { return now })
+	n, err := sweeper.PruneOnce(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, n, "only the two aged terminal rows are pruned")
+
+	require.Equal(t, 0, enrollmentCountForProfile(t, f, tid, agedDone))
+	require.Equal(t, 0, enrollmentCountForProfile(t, f, tid, agedExited))
+	require.Equal(t, 1, enrollmentCountForProfile(t, f, tid, recentDone), "recent terminal row kept")
+	require.Equal(t, 1, enrollmentCountForProfile(t, f, tid, agedActive), "active row never pruned")
+}
+
+// TestJourney_ConcurrentReEntry verifies concurrent re-entry attempts after a terminal
+// enrollment collapse to EXACTLY ONE new active run (the bare ON CONFLICT DO NOTHING
+// absorbs both the PK collision and the partial-unique-active index) — never two active,
+// never zero.
+func TestJourney_ConcurrentReEntry(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	pid := pu.CustomerProfileID
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
+	jrepo := journey.NewRepo(f.pool)
+	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, 5, def) // re-entry up to 5
+	require.NoError(t, err)
+
+	// First run, then drive it to terminal so a re-entry is eligible.
+	clk := time.Now().UTC()
+	svc := newJourneySvc(f, nil, func() time.Time { return clk })
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, pid, clk)))
+	drainJourneyRunner(t, journey.NewRunner(svc, 50, 50, time.Minute, time.Second, testLogger()).WithClock(func() time.Time { return clk }))
+	require.Equal(t, 0, activeEnrollmentCount(t, f, tid))
+
+	// Fire many concurrent re-entry enrolls for the same profile.
+	const n = 8
+	var wg sync.WaitGroup
+	created := make([]bool, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c, e := jrepo.Enroll(ctx, tid, j.ID, pid, j.CurrentVersion, 5, time.Now().UTC())
+			require.NoError(t, e)
+			created[i] = c
+		}(i)
+	}
+	wg.Wait()
+
+	wins := 0
+	for _, c := range created {
+		if c {
+			wins++
+		}
+	}
+	require.Equal(t, 1, wins, "exactly one concurrent re-entry creates a row")
+	require.Equal(t, 1, activeEnrollmentCount(t, f, tid), "exactly one active run")
+	require.Equal(t, 2, enrollmentCountForProfile(t, f, tid, pid), "one terminal + one new active")
+}
+
+// TestJourney_MergeWithReEntryRows verifies an identity merge does not crash when the
+// loser has MULTIPLE enrollment_seq rows for a journey (Phase 5 re-entry), and holds the
+// documented survivor-wins semantics (loser runs move only when the survivor has none).
+func TestJourney_MergeWithReEntryRows(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+
+	destID := mkJourneyDest(t, f, tid, "wh")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	def := journey.Definition{Steps: []journey.Step{{Type: journey.StepSend, DestinationID: destID}}}
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, 3, def)
+	require.NoError(t, err)
+
+	pub := &reparentPub{}
+	idSvc := identity.NewService(f.pool, pub, bus.TopicIdentityResolved)
+	profSvc := profile.NewService(f.pool, noopPub{}, bus.TopicProfileUpdated)
+	prepo := profile.NewRepo(f.pool)
+	base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	resolveAndUpdate(t, idSvc, pub, profSvc, mergeEnv(t, tid, sid, "e1", events.Identifiers{AnonymousID: "a1"}, "", base))
+	ir2 := resolveAndUpdate(t, idSvc, pub, profSvc, mergeEnv(t, tid, sid, "e2", events.Identifiers{UserID: "u1"}, "", base.Add(time.Hour)))
+	loser, err := prepo.GetByCanonical(ctx, tid, ir2.CanonicalUserID)
+	require.NoError(t, err)
+
+	// The loser has TWO runs for this journey: a completed seq 0 and an active seq 1.
+	for _, run := range []struct {
+		seq    int
+		status string
+	}{{0, journey.EnrollmentCompleted}, {1, journey.EnrollmentActive}} {
+		_, err := f.pool.Exec(ctx, `
+			INSERT INTO journey_enrollment
+				(tenant_id, journey_id, customer_profile_id, enrollment_seq, journey_version, status, current_step_index, step_seq, due_at)
+			VALUES ($1,$2,$3,$4,1,$5,0,0,$6)`,
+			tid, j.ID, loser.ID, run.seq, run.status, base)
+		require.NoError(t, err)
+	}
+
+	// Merge (survivor = older a1, which has NO enrollment for this journey).
+	ir3 := resolveAndUpdate(t, idSvc, pub, profSvc, mergeEnv(t, tid, sid, "e3", events.Identifiers{AnonymousID: "a1", UserID: "u1"}, "", base.Add(2*time.Hour)))
+	require.True(t, ir3.MergeOccurred)
+	survivor, err := prepo.GetByCanonical(ctx, tid, ir3.CanonicalUserID)
+	require.NoError(t, err)
+
+	// Both runs moved to the survivor (survivor had none); no crash, one active.
+	require.Equal(t, 2, enrollmentCountForProfile(t, f, tid, survivor.ID), "both loser runs moved")
+	require.Equal(t, 0, enrollmentCountForProfile(t, f, tid, loser.ID), "loser has none")
+	var active int
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM journey_enrollment WHERE tenant_id=$1 AND customer_profile_id=$2 AND status='active'`,
+		tid, survivor.ID).Scan(&active))
+	require.Equal(t, 1, active, "exactly one active run after merge")
 }

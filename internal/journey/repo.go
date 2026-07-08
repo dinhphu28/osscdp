@@ -27,33 +27,36 @@ type Repo struct {
 // NewRepo constructs a Repo.
 func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 
-const journeyCols = `id, tenant_id, name, COALESCE(description,''), status, entry_segment_id, COALESCE(entry_event_name,''), exit_on_segment_leave, current_version, created_at, updated_at`
+const journeyCols = `id, tenant_id, name, COALESCE(description,''), status, entry_segment_id, COALESCE(entry_event_name,''), exit_on_segment_leave, max_enrollments, current_version, created_at, updated_at`
 
 func scanJourney(row pgx.Row) (Journey, error) {
 	var j Journey
 	err := row.Scan(&j.ID, &j.TenantID, &j.Name, &j.Description, &j.Status,
-		&j.EntrySegmentID, &j.EntryEventName, &j.ExitOnSegmentLeave, &j.CurrentVersion, &j.CreatedAt, &j.UpdatedAt)
+		&j.EntrySegmentID, &j.EntryEventName, &j.ExitOnSegmentLeave, &j.MaxEnrollments, &j.CurrentVersion, &j.CreatedAt, &j.UpdatedAt)
 	return j, err
 }
 
 // CreateJourney inserts a SEGMENT-entry journey (enter on entry-segment membership) and
 // enqueues a durable population-backfill seed job in the same tx, so the entry segment's
-// current members are enrolled — not just future joiners. The definition is assumed
-// already validated by the caller.
-func (r *Repo) CreateJourney(ctx context.Context, tenantID uuid.UUID, name, description string, entrySegmentID uuid.UUID, exitOnSegmentLeave bool, def Definition) (Journey, error) {
-	return r.create(ctx, tenantID, name, description, &entrySegmentID, "", exitOnSegmentLeave, def)
+// current members are enrolled — not just future joiners. maxEnrollments caps re-entry
+// (1 = once-only). The definition is assumed already validated by the caller.
+func (r *Repo) CreateJourney(ctx context.Context, tenantID uuid.UUID, name, description string, entrySegmentID uuid.UUID, exitOnSegmentLeave bool, maxEnrollments int, def Definition) (Journey, error) {
+	return r.create(ctx, tenantID, name, description, &entrySegmentID, "", exitOnSegmentLeave, maxEnrollments, def)
 }
 
 // CreateEventJourney inserts an EVENT-entry journey (enter when the profile emits
 // entryEventName). Event-entry journeys have no existing population, so no seed job.
-func (r *Repo) CreateEventJourney(ctx context.Context, tenantID uuid.UUID, name, description, entryEventName string, exitOnSegmentLeave bool, def Definition) (Journey, error) {
-	return r.create(ctx, tenantID, name, description, nil, entryEventName, exitOnSegmentLeave, def)
+func (r *Repo) CreateEventJourney(ctx context.Context, tenantID uuid.UUID, name, description, entryEventName string, exitOnSegmentLeave bool, maxEnrollments int, def Definition) (Journey, error) {
+	return r.create(ctx, tenantID, name, description, nil, entryEventName, exitOnSegmentLeave, maxEnrollments, def)
 }
 
 // create inserts a journey (status active) with its version-1 definition in one tx.
 // Exactly one of entrySegmentID / entryEventName must be set (enforced by the DB XOR
 // check). A segment-entry journey also enqueues a backfill seed job in-tx.
-func (r *Repo) create(ctx context.Context, tenantID uuid.UUID, name, description string, entrySegmentID *uuid.UUID, entryEventName string, exitOnSegmentLeave bool, def Definition) (Journey, error) {
+func (r *Repo) create(ctx context.Context, tenantID uuid.UUID, name, description string, entrySegmentID *uuid.UUID, entryEventName string, exitOnSegmentLeave bool, maxEnrollments int, def Definition) (Journey, error) {
+	if maxEnrollments < 1 {
+		maxEnrollments = 1
+	}
 	defJSON, err := json.Marshal(def)
 	if err != nil {
 		return Journey{}, fmt.Errorf("marshal definition: %w", err)
@@ -66,9 +69,9 @@ func (r *Repo) create(ctx context.Context, tenantID uuid.UUID, name, description
 
 	id := uuid.New()
 	_, err = tx.Exec(ctx, `
-		INSERT INTO journey (id, tenant_id, name, description, status, entry_segment_id, entry_event_name, exit_on_segment_leave, current_version)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1)`,
-		id, tenantID, name, nullString(description), StatusActive, entrySegmentID, nullString(entryEventName), exitOnSegmentLeave)
+		INSERT INTO journey (id, tenant_id, name, description, status, entry_segment_id, entry_event_name, exit_on_segment_leave, max_enrollments, current_version)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1)`,
+		id, tenantID, name, nullString(description), StatusActive, entrySegmentID, nullString(entryEventName), exitOnSegmentLeave, maxEnrollments)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -96,9 +99,15 @@ func (r *Repo) create(ctx context.Context, tenantID uuid.UUID, name, description
 	return r.GetJourney(ctx, tenantID, id)
 }
 
-// UpdateJourney mints a new immutable version (N+1), bumps current_version, and
-// updates the description. In-flight enrollments keep their pinned version.
-func (r *Repo) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID, description string, exitOnSegmentLeave bool, def Definition) (Journey, error) {
+// UpdateJourney mints a new immutable version (N+1), bumps current_version, and updates
+// the mutable journey-head policy (description, exit_on_segment_leave, max_enrollments).
+// In-flight enrollments keep their pinned version; a changed max_enrollments applies to
+// future enroll decisions only (the cap is on the head, not the version). Entry mode is
+// immutable.
+func (r *Repo) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID, description string, exitOnSegmentLeave bool, maxEnrollments int, def Definition) (Journey, error) {
+	if maxEnrollments < 1 {
+		maxEnrollments = 1
+	}
 	defJSON, err := json.Marshal(def)
 	if err != nil {
 		return Journey{}, fmt.Errorf("marshal definition: %w", err)
@@ -128,8 +137,8 @@ func (r *Repo) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID,
 		return Journey{}, fmt.Errorf("insert journey version: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
-		`UPDATE journey SET current_version=$3, description=$4, exit_on_segment_leave=$5, updated_at=now() WHERE tenant_id=$1 AND id=$2`,
-		tenantID, journeyID, next, nullString(description), exitOnSegmentLeave); err != nil {
+		`UPDATE journey SET current_version=$3, description=$4, exit_on_segment_leave=$5, max_enrollments=$6, updated_at=now() WHERE tenant_id=$1 AND id=$2`,
+		tenantID, journeyID, next, nullString(description), exitOnSegmentLeave, maxEnrollments); err != nil {
 		return Journey{}, fmt.Errorf("update journey: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -256,20 +265,35 @@ func (r *Repo) journeysWhere(ctx context.Context, where string, args ...any) ([]
 	return out, rows.Err()
 }
 
-// Enroll idempotently creates a live enrollment pinned to version at current step 0,
-// due now. ON CONFLICT on the PK (…, enrollment_seq) makes this ONCE-ONLY: a
-// redelivered entry is a no-op, and — crucially — a re-entry AFTER a terminal
-// (completed/exited) enrollment is also a no-op rather than a primary-key error
-// (enrollment_seq is 0 until Phase 5 allocates a new run). The partial-unique-active
-// index remains an independent invariant (never two active rows). Returns whether a
-// row was created.
-func (r *Repo) Enroll(ctx context.Context, tenantID, journeyID, profileID uuid.UUID, version int, dueAt time.Time) (bool, error) {
+// Enroll creates a live enrollment (step 0, pinned to version, due now) for a profile,
+// allocating a fresh enrollment_seq = max(existing)+1. It is a no-op when the profile
+// already has an ACTIVE enrollment (WHERE NOT EXISTS active) or has reached the journey's
+// maxEnrollments total (the re-entry / per-journey cap). This makes:
+//   - maxEnrollments=1  => ONCE-ONLY (the count<1 check admits only a profile with zero
+//     prior enrollments; a redelivered entry or a post-terminal re-entry is a no-op),
+//   - maxEnrollments=N  => up to N total entries, a new run after each terminal one.
+//
+// Concurrency: a bare ON CONFLICT DO NOTHING absorbs BOTH a PK collision (two racing
+// enrolls computing the same seq) and the partial-unique-active index (never two active
+// rows) — exactly one new active enrollment survives a race. Returns whether a row was
+// created.
+func (r *Repo) Enroll(ctx context.Context, tenantID, journeyID, profileID uuid.UUID, version int, maxEnrollments int, dueAt time.Time) (bool, error) {
+	if maxEnrollments < 1 {
+		maxEnrollments = 1
+	}
 	ct, err := r.pool.Exec(ctx, `
 		INSERT INTO journey_enrollment
 			(tenant_id, journey_id, customer_profile_id, enrollment_seq, journey_version, status, current_step_index, step_seq, due_at)
-		VALUES ($1,$2,$3,0,$4,$5,0,0,$6)
-		ON CONFLICT (tenant_id, journey_id, customer_profile_id, enrollment_seq) DO NOTHING`,
-		tenantID, journeyID, profileID, version, EnrollmentActive, dueAt)
+		SELECT $1, $2, $3,
+		       COALESCE((SELECT max(enrollment_seq)+1 FROM journey_enrollment
+		                 WHERE tenant_id=$1 AND journey_id=$2 AND customer_profile_id=$3), 0),
+		       $4, $5, 0, 0, $6
+		WHERE NOT EXISTS (SELECT 1 FROM journey_enrollment
+		                  WHERE tenant_id=$1 AND journey_id=$2 AND customer_profile_id=$3 AND status='active')
+		  AND (SELECT count(*) FROM journey_enrollment
+		       WHERE tenant_id=$1 AND journey_id=$2 AND customer_profile_id=$3) < $7
+		ON CONFLICT DO NOTHING`,
+		tenantID, journeyID, profileID, version, EnrollmentActive, dueAt, maxEnrollments)
 	if err != nil {
 		return false, fmt.Errorf("enroll: %w", err)
 	}

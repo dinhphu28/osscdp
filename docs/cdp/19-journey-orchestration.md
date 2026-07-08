@@ -1,6 +1,6 @@
 # 19 — Journey Orchestration
 
-Status: **Phases 1–4 implemented.** Phase 5 is designed but not built.
+Status: **Phases 1–5 implemented** — the core journey engine is feature-complete.
 
 A **journey** is a versioned, ordered flow a customer profile *enters* (via segment
 membership) and *advances* through with per-profile state. Phase 1 ships a linear
@@ -157,6 +157,26 @@ being active (archive mid-drain stops admitting) and is `ON CONFLICT DO NOTHING`
 (idempotent with the live membership-entry path). Event-entry journeys have no existing
 population and do not seed.
 
+## Re-entry + retention (Phase 5)
+
+- **Re-entry / caps** — `journey.max_enrollments` (default 1 = once-only) caps how many
+  times a profile may enter a journey. `Repo.Enroll` allocates a fresh
+  `enrollment_seq = max+1` per run and is a no-op while an active enrollment exists
+  (`WHERE NOT EXISTS active`) or the total reaches `max_enrollments`
+  (`count < max_enrollments`). Concurrency-safe: a **bare** `ON CONFLICT DO NOTHING`
+  absorbs both a PK collision (two racing enrolls compute the same seq) and the
+  partial-unique-active index (never two active runs) — exactly one survives a race.
+  `max_enrollments=1` reproduces once-only exactly (`count<1` admits only a
+  zero-prior-enrollment profile). Backfill (`SeedJobPage`) stays seq=0 first-entry.
+- **Terminal-row retention** — a `RetentionSweeper` prunes aged terminal
+  (completed/exited) `journey_enrollment` rows in bounded batches
+  (`PruneTerminalEnrollments`), keeping the non-partitioned table bounded. Active rows
+  are never touched.
+
+**Deferred (documented tradeoff):** richer identity-merge fidelity. On merge the survivor
+wins and the loser's mid-journey progress is dropped — the same class of behavior as
+`segment_membership`, so it is acceptable and left as-is.
+
 ## Phase roadmap
 
 1. **(done)** Linear segment-entry `wait → send`; erasure + merge hooks + parked
@@ -170,8 +190,9 @@ population and do not seed.
 4. **(done)** Event entry (`TopicProfileUpdated` on an entry event, XOR with segment
    entry) + `journey_seed_job` backfill (a `segment_seed_job`/`SeedRunner` clone) to
    enroll the already-qualified population.
-5. Lifecycle polish: re-entry (`enrollment_seq` allocation) + per-journey caps + terminal
-   retention sweep + richer merge fidelity.
+5. **(done)** Lifecycle polish: re-entry (`enrollment_seq` allocation) + per-journey caps
+   (`max_enrollments`) + terminal-row retention sweep. (Richer merge fidelity is a
+   documented, deferred tradeoff.)
 
 ## Key files
 
