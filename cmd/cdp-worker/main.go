@@ -223,6 +223,8 @@ func run() error {
 	// segment seed metrics; wiring them here would conflate segment and journey backfill
 	// counts. Dedicated journey-seed metrics are a fast follow.
 	journeySeedRunner := journey.NewSeedRunner(journeySvc.Repo(), cfg.SeedJobPagesPerClaim, cfg.SeedJobReclaimTimeout, cfg.SeedJobInterval, logger)
+	// Phase 5: prune aged terminal (completed/exited) enrollments so the table is bounded.
+	journeyRetention := journey.NewRetentionSweeper(journeySvc.Repo(), cfg.JourneyEnrollmentRetention, cfg.JourneyRetentionInterval, logger)
 
 	metricsSrv := &http.Server{
 		Addr:              cfg.MetricsAddr,
@@ -231,7 +233,7 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(16)
+	wg.Add(17)
 	go func() { defer wg.Done(); rel.Run(ctx) }()
 	go func() { defer wg.Done(); memRelay.Run(ctx) }()
 	go func() { defer wg.Done(); segmentRunner.Run(ctx) }()
@@ -240,6 +242,7 @@ func run() error {
 	go func() { defer wg.Done(); activationRunner.Run(ctx) }()
 	go func() { defer wg.Done(); journeyRunner.Run(ctx) }()
 	go func() { defer wg.Done(); journeySeedRunner.Run(ctx) }()
+	go func() { defer wg.Done(); journeyRetention.Run(ctx) }()
 	go func() {
 		defer wg.Done()
 		if err := consumer.Run(ctx, handler, deadLetter); err != nil {

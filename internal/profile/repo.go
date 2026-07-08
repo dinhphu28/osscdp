@@ -180,13 +180,20 @@ func (r *Repo) reparentProfileChildren(ctx context.Context, q querier, tenantID,
 		return fmt.Errorf("reparent memberships: %w", err)
 	}
 
-	// journey_enrollment: single-row per-enrollment state — union onto the survivor,
-	// keeping the survivor's row on conflict (dedup key = journey_id; enrollment_seq
-	// is 0 in Phase 1, so this is the PK). Because position + claim-fence + advance-seq
-	// all live on ONE row, the enrollment moves or is dropped atomically — no
-	// cross-table desync, no orphaned work item. Documented tradeoff: when both
-	// profiles are enrolled in the same journey, the survivor wins and the loser's
-	// mid-flight progress is dropped (same class as segment_membership).
+	// journey_enrollment: union the loser's enrollments onto the survivor, keyed by
+	// journey_id (NOT enrollment_seq — see below). Because position + claim-fence +
+	// advance-seq all live on ONE row, the enrollment moves or is dropped atomically —
+	// no cross-table desync, no orphaned work item. Documented tradeoff: when both
+	// profiles are enrolled in the same journey, the survivor wins and the loser's runs
+	// are dropped (same class as segment_membership).
+	//
+	// The dedup is per journey_id (any seq), NOT per (journey_id, enrollment_seq): with
+	// Phase 5 re-entry a profile may have multiple seq rows per journey. journey_id-level
+	// dedup moves ALL of the loser's runs only when the survivor has NONE for that journey
+	// (distinct seqs, no PK collision, ≤1 active), and otherwise drops all loser runs.
+	// A seq-level dedup would be WRONG: it could move a loser's active run onto a survivor
+	// that already has an active run for the same journey, violating the
+	// partial-unique-active index and failing the merge.
 	if _, err := q.Exec(ctx, `
 		UPDATE journey_enrollment je
 		SET customer_profile_id=$3

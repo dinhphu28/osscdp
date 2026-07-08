@@ -85,6 +85,9 @@ type Journey struct {
 	Status         string     `json:"status"`
 	EntrySegmentID *uuid.UUID `json:"entry_segment_id,omitempty"`
 	EntryEventName string     `json:"entry_event_name,omitempty"`
+	// MaxEnrollments caps how many times a profile may enter this journey (1 =
+	// once-only; N>1 enables re-entry after a terminal enrollment). See migration 00026.
+	MaxEnrollments int `json:"max_enrollments"`
 	// ExitOnSegmentLeave terminates a profile's active enrollment when it leaves the
 	// entry segment (Phase 2). Default false = run to completion.
 	ExitOnSegmentLeave bool       `json:"exit_on_segment_leave"`

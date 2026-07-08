@@ -27,6 +27,7 @@ type createRequest struct {
 	EntrySegmentID     uuid.UUID  `json:"entry_segment_id"`
 	EntryEventName     string     `json:"entry_event_name"`
 	ExitOnSegmentLeave bool       `json:"exit_on_segment_leave"`
+	MaxEnrollments     int        `json:"max_enrollments"` // 0/1 = once-only; N>1 enables re-entry up to N
 	Definition         Definition `json:"definition"`
 }
 
@@ -74,12 +75,20 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		apierror.BadRequest(w, "invalid definition: "+err.Error())
 		return
 	}
+	if req.MaxEnrollments < 0 {
+		apierror.BadRequest(w, "max_enrollments must not be negative")
+		return
+	}
+	maxEnroll := req.MaxEnrollments
+	if maxEnroll < 1 {
+		maxEnroll = 1 // omitted / 0 defaults to once-only
+	}
 	var j Journey
 	var err error
 	if hasSegment {
-		j, err = h.repo.CreateJourney(r.Context(), tenantID, req.Name, req.Description, req.EntrySegmentID, req.ExitOnSegmentLeave, req.Definition)
+		j, err = h.repo.CreateJourney(r.Context(), tenantID, req.Name, req.Description, req.EntrySegmentID, req.ExitOnSegmentLeave, maxEnroll, req.Definition)
 	} else {
-		j, err = h.repo.CreateEventJourney(r.Context(), tenantID, req.Name, req.Description, req.EntryEventName, req.ExitOnSegmentLeave, req.Definition)
+		j, err = h.repo.CreateEventJourney(r.Context(), tenantID, req.Name, req.Description, req.EntryEventName, req.ExitOnSegmentLeave, maxEnroll, req.Definition)
 	}
 	if errors.Is(err, ErrDuplicateName) {
 		apierror.Conflict(w, "journey name already exists for tenant")
@@ -95,6 +104,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 type updateRequest struct {
 	Description        string     `json:"description"`
 	ExitOnSegmentLeave bool       `json:"exit_on_segment_leave"`
+	MaxEnrollments     int        `json:"max_enrollments"` // 0/1 = once-only; N>1 enables re-entry up to N
 	Definition         Definition `json:"definition"`
 }
 
@@ -119,7 +129,15 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		apierror.BadRequest(w, "invalid definition: "+err.Error())
 		return
 	}
-	j, err := h.repo.UpdateJourney(r.Context(), tenantID, journeyID, req.Description, req.ExitOnSegmentLeave, req.Definition)
+	if req.MaxEnrollments < 0 {
+		apierror.BadRequest(w, "max_enrollments must not be negative")
+		return
+	}
+	maxEnroll := req.MaxEnrollments
+	if maxEnroll < 1 {
+		maxEnroll = 1
+	}
+	j, err := h.repo.UpdateJourney(r.Context(), tenantID, journeyID, req.Description, req.ExitOnSegmentLeave, maxEnroll, req.Definition)
 	if errors.Is(err, ErrNotFound) {
 		apierror.NotFound(w, "journey not found")
 		return

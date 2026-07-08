@@ -84,7 +84,7 @@ func (s *Service) EnrollOnMembership(ctx context.Context, mc segment.MembershipC
 		return err
 	}
 	for _, j := range journeys {
-		created, err := s.repo.Enroll(ctx, mc.TenantID, j.ID, mc.CustomerProfileID, j.CurrentVersion, s.now())
+		created, err := s.repo.Enroll(ctx, mc.TenantID, j.ID, mc.CustomerProfileID, j.CurrentVersion, j.MaxEnrollments, s.now())
 		if err != nil {
 			return err
 		}
@@ -115,7 +115,7 @@ func (s *Service) EnrollOnEvent(ctx context.Context, pu profile.ProfileUpdated) 
 		return err
 	}
 	for _, j := range journeys {
-		created, err := s.repo.Enroll(ctx, pu.TenantID, j.ID, pu.CustomerProfileID, j.CurrentVersion, s.now())
+		created, err := s.repo.Enroll(ctx, pu.TenantID, j.ID, pu.CustomerProfileID, j.CurrentVersion, j.MaxEnrollments, s.now())
 		if err != nil {
 			return err
 		}
