@@ -61,10 +61,11 @@ func (r *Repo) CreateJourney(ctx context.Context, tenantID uuid.UUID, name, desc
 		}
 		return Journey{}, fmt.Errorf("insert journey: %w", err)
 	}
+	events, maxWindow := analyzeDefinition(def)
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO journey_version (id, tenant_id, journey_id, version, definition_json)
-		VALUES ($1,$2,$3,1,$4)`,
-		uuid.New(), tenantID, id, defJSON); err != nil {
+		INSERT INTO journey_version (id, tenant_id, journey_id, version, definition_json, referenced_event_names, max_window_seconds)
+		VALUES ($1,$2,$3,1,$4,$5,$6)`,
+		uuid.New(), tenantID, id, defJSON, events, int64(maxWindow.Seconds())); err != nil {
 		return Journey{}, fmt.Errorf("insert journey version: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -97,10 +98,11 @@ func (r *Repo) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID,
 		return Journey{}, fmt.Errorf("lock journey: %w", err)
 	}
 	next := cur + 1
+	events, maxWindow := analyzeDefinition(def)
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO journey_version (id, tenant_id, journey_id, version, definition_json)
-		VALUES ($1,$2,$3,$4,$5)`,
-		uuid.New(), tenantID, journeyID, next, defJSON); err != nil {
+		INSERT INTO journey_version (id, tenant_id, journey_id, version, definition_json, referenced_event_names, max_window_seconds)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		uuid.New(), tenantID, journeyID, next, defJSON, events, int64(maxWindow.Seconds())); err != nil {
 		return Journey{}, fmt.Errorf("insert journey version: %w", err)
 	}
 	if _, err := tx.Exec(ctx,

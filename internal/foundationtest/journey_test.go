@@ -10,6 +10,7 @@ import (
 
 	"github.com/dinhphu28/osscdp/internal/activation"
 	"github.com/dinhphu28/osscdp/internal/audit"
+	"github.com/dinhphu28/osscdp/internal/behavior"
 	"github.com/dinhphu28/osscdp/internal/bus"
 	"github.com/dinhphu28/osscdp/internal/consent"
 	"github.com/dinhphu28/osscdp/internal/events"
@@ -71,9 +72,39 @@ func taskDestination(t *testing.T, f fixture, tid uuid.UUID) uuid.UUID {
 	return id
 }
 
+func taskDestForProfile(t *testing.T, f fixture, tid, profileID uuid.UUID) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	require.NoError(t, f.pool.QueryRow(context.Background(),
+		`SELECT destination_id FROM activation_task WHERE tenant_id=$1 AND customer_profile_id=$2`, tid, profileID).Scan(&id))
+	return id
+}
+
+// drainJourneyRunner ticks the runner until no enrollment is claimable (condition/split
+// steps are due=now, so a branch takes several ticks to reach its resting step).
+func drainJourneyRunner(t *testing.T, r *journey.Runner) {
+	t.Helper()
+	for i := 0; i < 25; i++ {
+		n, err := r.RunOnce(context.Background())
+		require.NoError(t, err)
+		if n == 0 {
+			return
+		}
+	}
+	t.Fatal("journey runner did not drain in 25 ticks")
+}
+
+func float64Ptr(v float64) *float64 { return &v }
+
 func newJourneySvc(f fixture, consentReader activation.ConsentReader, now func() time.Time) *journey.Service {
+	return newJourneySvcStore(f, consentReader, nil, now)
+}
+
+// newJourneySvcStore builds a journey service with an explicit behavior store (for
+// condition steps). Pass nil store for wait/send-only journeys.
+func newJourneySvcStore(f fixture, consentReader activation.ConsentReader, store segment.BehaviorStore, now func() time.Time) *journey.Service {
 	act := activation.NewService(f.pool, profile.NewRepo(f.pool), consentReader)
-	svc := journey.NewService(f.pool, profile.NewRepo(f.pool), act)
+	svc := journey.NewService(f.pool, profile.NewRepo(f.pool), act, store)
 	if now != nil {
 		svc.WithClock(now)
 	}
@@ -576,4 +607,171 @@ func TestJourney_ArchivedJourneyNotExitedOnLeave(t *testing.T) {
 	// The enrollment is untouched (archived journeys drain, not exit).
 	_, status := enrollmentState(t, f, tid, j.ID, pid)
 	require.Equal(t, journey.EnrollmentActive, status)
+}
+
+// --- Phase 3: branching (condition / split) + retention horizon ---
+
+// TestJourney_ConditionRoutes verifies a condition step routes to different sends based
+// on a (stateless) profile-trait rule, and the forward Next lets the two arms stay
+// disjoint (each profile gets exactly one send, to the branch its rule selected).
+func TestJourney_ConditionRoutes(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	vn := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	us := seedProfile(t, f, tid, sid, "ev2", "product_viewed", "u2", `{"country":"US"}`)
+
+	destA := mkJourneyDest(t, f, tid, "whA")
+	destB := mkJourneyDest(t, f, tid, "whB")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	rule := segment.Rule{Field: "profile.traits.country", Op: segment.OpEq, Value: "VN"}
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepCondition, Condition: &rule, IfTrue: 1, IfFalse: 2},
+		{Type: journey.StepSend, DestinationID: destA, Next: 3}, // true arm jumps past the false arm
+		{Type: journey.StepSend, DestinationID: destB},          // false arm -> 3 (complete)
+	}}
+	require.NoError(t, journey.Validate(def))
+	_, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	require.NoError(t, err)
+
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time { return clk }
+	svc := newJourneySvc(f, nil, now)
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, vn.CustomerProfileID, clk)))
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, us.CustomerProfileID, clk)))
+
+	drainJourneyRunner(t, journey.NewRunner(svc, 50, 50, time.Minute, time.Second, testLogger()).WithClock(now))
+
+	require.Equal(t, 2, taskCount(t, f, tid))
+	require.Equal(t, destA, taskDestForProfile(t, f, tid, vn.CustomerProfileID), "VN routes to the true arm (destA)")
+	require.Equal(t, destB, taskDestForProfile(t, f, tid, us.CustomerProfileID), "US routes to the false arm (destB)")
+}
+
+// TestJourney_ConditionalSkipCompletes verifies a condition whose false arm targets
+// len(steps) completes the enrollment with no send (a conditional-send / goal shape).
+func TestJourney_ConditionalSkipCompletes(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	us := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"US"}`)
+
+	destA := mkJourneyDest(t, f, tid, "whA")
+	segID := mkEntrySegment(t, f, tid, "vn")
+	rule := segment.Rule{Field: "profile.traits.country", Op: segment.OpEq, Value: "VN"}
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepCondition, Condition: &rule, IfTrue: 1, IfFalse: 2}, // false -> 2 == len => complete
+		{Type: journey.StepSend, DestinationID: destA},
+	}}
+	require.NoError(t, journey.Validate(def))
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	require.NoError(t, err)
+
+	clk := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	now := func() time.Time { return clk }
+	svc := newJourneySvc(f, nil, now)
+	require.NoError(t, svc.OnMembershipChanged(ctx, enteredMC(tid, segID, us.CustomerProfileID, clk)))
+	drainJourneyRunner(t, journey.NewRunner(svc, 50, 50, time.Minute, time.Second, testLogger()).WithClock(now))
+
+	require.Equal(t, 0, taskCount(t, f, tid), "US fails the condition and completes with no send")
+	_, status := enrollmentState(t, f, tid, j.ID, us.CustomerProfileID)
+	require.Equal(t, journey.EnrollmentCompleted, status)
+}
+
+// TestJourney_VersionMetadataFromCondition verifies a behavioral condition's window +
+// event name are derived into journey_version metadata (mirrors segment_version).
+func TestJourney_VersionMetadataFromCondition(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, _ := mkTenant(t, f, "acme")
+	destA := mkJourneyDest(t, f, tid, "whA")
+	segID := mkEntrySegment(t, f, tid, "vn")
+
+	rule := segment.Rule{Behavior: &segment.BehaviorSpec{
+		Kind: segment.BehaviorCount, EventName: "order_completed", Window: "30d", Op: segment.OpGte, Value: float64Ptr(1),
+	}}
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepCondition, Condition: &rule, IfTrue: 1, IfFalse: 2},
+		{Type: journey.StepSend, DestinationID: destA, Next: 3},
+		{Type: journey.StepSend, DestinationID: destA},
+	}}
+	require.NoError(t, journey.Validate(def))
+	j, err := journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	require.NoError(t, err)
+
+	var maxWin int64
+	var names []string
+	require.NoError(t, f.pool.QueryRow(ctx,
+		`SELECT max_window_seconds, referenced_event_names FROM journey_version WHERE tenant_id=$1 AND journey_id=$2 AND version=1`,
+		tid, j.ID).Scan(&maxWin, &names))
+	require.Equal(t, int64(30*24*3600), maxWin)
+	require.Contains(t, names, "order_completed")
+}
+
+// TestJourney_RetentionHorizonWidened verifies a journey with a behavioral condition
+// widens the behavioral retention horizon, so its window's data is never pruned early.
+func TestJourney_RetentionHorizonWidened(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, _ := mkTenant(t, f, "acme")
+	destA := mkJourneyDest(t, f, tid, "whA")
+	segID := mkEntrySegment(t, f, tid, "vn")
+
+	ret := behavior.NewRetention(f.pool, time.Hour, time.Hour, testLogger())
+	base, err := ret.EffectiveHorizon(ctx)
+	require.NoError(t, err)
+	require.Less(t, base, 30*24*time.Hour, "baseline horizon should be small before the journey exists")
+
+	rule := segment.Rule{Behavior: &segment.BehaviorSpec{
+		Kind: segment.BehaviorCount, EventName: "order_completed", Window: "30d", Op: segment.OpGte, Value: float64Ptr(1),
+	}}
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepCondition, Condition: &rule, IfTrue: 1, IfFalse: 2},
+		{Type: journey.StepSend, DestinationID: destA, Next: 3},
+		{Type: journey.StepSend, DestinationID: destA},
+	}}
+	_, err = journey.NewRepo(f.pool).CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	require.NoError(t, err)
+
+	widened, err := ret.EffectiveHorizon(ctx)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, widened, 30*24*time.Hour, "journey condition window must widen the retention horizon")
+}
+
+// TestJourney_RetentionHorizonWidened_ArchivedWithEnrollment verifies the retention
+// horizon protects a journey_version pinned by a LIVE enrollment even after the journey
+// is archived (the first EXISTS branch of EffectiveHorizon) — an in-flight enrollment
+// on an archived journey must still be able to read its condition window.
+func TestJourney_RetentionHorizonWidened_ArchivedWithEnrollment(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	tid, sid := mkTenant(t, f, "acme")
+	pu := seedProfile(t, f, tid, sid, "ev1", "product_viewed", "u1", `{"country":"VN"}`)
+	destA := mkJourneyDest(t, f, tid, "whA")
+	segID := mkEntrySegment(t, f, tid, "vn")
+
+	rule := segment.Rule{Behavior: &segment.BehaviorSpec{
+		Kind: segment.BehaviorCount, EventName: "order_completed", Window: "30d", Op: segment.OpGte, Value: float64Ptr(1),
+	}}
+	def := journey.Definition{Steps: []journey.Step{
+		{Type: journey.StepWait, Duration: "1h"},
+		{Type: journey.StepCondition, Condition: &rule, IfTrue: 2, IfFalse: 3},
+		{Type: journey.StepSend, DestinationID: destA, Next: 4},
+		{Type: journey.StepSend, DestinationID: destA},
+	}}
+	jrepo := journey.NewRepo(f.pool)
+	j, err := jrepo.CreateJourney(ctx, tid, "welcome", "", segID, false, def)
+	require.NoError(t, err)
+
+	// Enroll a profile (pins version 1), then ARCHIVE the journey.
+	created, err := jrepo.Enroll(ctx, tid, j.ID, pu.CustomerProfileID, j.CurrentVersion, time.Now().UTC())
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NoError(t, jrepo.DeactivateJourney(ctx, tid, j.ID))
+
+	// Even though the journey is archived, the pinned version's window must still widen
+	// the horizon (the live enrollment could still evaluate the condition).
+	ret := behavior.NewRetention(f.pool, time.Hour, time.Hour, testLogger())
+	h, err := ret.EffectiveHorizon(ctx)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, h, 30*24*time.Hour, "archived journey with a live enrollment must still protect its condition window")
 }

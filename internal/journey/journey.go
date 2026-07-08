@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/dinhphu28/osscdp/internal/segment"
 )
 
 // Journey status values.
@@ -26,21 +28,48 @@ const (
 	EnrollmentExited    = "exited"
 )
 
-// Step types (Phase 1). condition/split land in Phase 3.
+// Step types.
 const (
-	StepWait = "wait"
-	StepSend = "send"
+	StepWait      = "wait"
+	StepSend      = "send"
+	StepCondition = "condition" // Phase 3: branch on a segment.Rule
+	StepSplit     = "split"     // Phase 3: deterministic weighted branch
 )
 
-// Step is one node in a linear journey definition. Exactly one shape is used:
-// a wait (Duration) or a send (DestinationID).
+// SplitBranch is one weighted arm of a split step. Next is the (forward) step index
+// to jump to; Weight is its relative selection weight.
+type SplitBranch struct {
+	Weight int `json:"weight"`
+	Next   int `json:"next"`
+}
+
+// Step is one node in a journey definition. Exactly one shape is used per Type:
+//   - wait:      Duration
+//   - send:      DestinationID
+//   - condition: Condition (a segment.Rule) + IfTrue/IfFalse target indices
+//   - split:     Branches (weighted forward targets)
+//
+// Branch targets (IfTrue/IfFalse/Branches[].Next) are step indices that must be
+// FORWARD (> this step's index) and <= len(steps); a target equal to len(steps) means
+// "complete". Forward-only edges make every definition an acyclic DAG that always
+// terminates. wait/send implicitly advance to index+1.
 type Step struct {
 	Type          string    `json:"type"`
-	Duration      string    `json:"duration,omitempty"`       // wait: "7d","24h","30m" -> segment.ParseWindow
-	DestinationID uuid.UUID `json:"destination_id,omitempty"` // send: an activation destination
+	Duration      string    `json:"duration,omitempty"`       // wait
+	DestinationID uuid.UUID `json:"destination_id,omitempty"` // send
+	// Next is the explicit forward target for a wait/send step (0 = the default,
+	// index+1). Lets a branch arm jump past the other arm so two arms stay disjoint;
+	// a Next equal to len(steps) completes the enrollment.
+	Next      int           `json:"next,omitempty"`
+	Condition *segment.Rule `json:"condition,omitempty"` // condition
+	IfTrue    int           `json:"if_true,omitempty"`   // condition: target when the rule matches
+	IfFalse   int           `json:"if_false,omitempty"`  // condition: target when it does not
+	Branches  []SplitBranch `json:"branches,omitempty"`  // split
 }
 
 // Definition is the ordered step array stored in journey_version.definition_json.
+// Indices are stable within an (immutable) version, so index-based branch targets are
+// safe; in-flight enrollments pin their version.
 type Definition struct {
 	Steps []Step `json:"steps"`
 }
